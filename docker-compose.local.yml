@@ -180,7 +180,7 @@ services:
     restart: unless-stopped
     working_dir: /app
     env_file:
-      - .env
+      - .env.local
     environment:
       - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@db_local:5432/${DB_NAME}
       - REDIS_BROKER_HOST=redis_broker_local
@@ -237,7 +237,7 @@ services:
     working_dir: /app
     user: "1000:1000"
     env_file:
-      - .env
+      - .env.local
     command: >
       sh -c "set -e && python wait_for_db.py &&
               celery -A backend.EchoFlow worker --loglevel=info"
@@ -278,7 +278,7 @@ services:
       sh -c "set -e && python wait_for_db.py &&
               celery -A backend.EchoFlow worker -Q fast_feed --concurrency=2 --loglevel=info"
     env_file:
-      - .env
+      - .env.local
     depends_on:
       db_local:
         condition: service_healthy
@@ -321,7 +321,7 @@ services:
       sh -c "set -e && python wait_for_db.py &&
               celery -A backend.EchoFlow worker -Q heavy_media --pool=prefork --concurrency=2 --loglevel=info"
     env_file:
-      - .env
+      - .env.local
     depends_on:
       db_local:
         condition: service_healthy
@@ -365,7 +365,7 @@ services:
       sh -c "set -e && python wait_for_db.py &&
               celery -A backend.EchoFlow beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler"
     env_file:
-      - .env
+      - .env.local
     depends_on:
       db_local:
         condition: service_healthy

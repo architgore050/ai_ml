@@ -1,6 +1,24 @@
 > **nginx is the only public-facing entrypoint.** It terminates TLS on `:80` (redirect) / `:443` (Django) / `:9443` (MinIO HLS) and forwards plain HTTP to the in-network backends. The `web:8005` and `minio:9000` ports are NOT directly reachable from the host anymore (except `web:8005` which is published as a debug escape hatch). To verify the stack is up: `curl -kI https://localhost/health/`. See [docs/EXPLAIN/docker/05-https-tls-termination.md](docs/EXPLAIN/docker/05-https-tls-termination.md) for the full design.
 # EchoFlow — Agent Quick-Start
 
+> ### ⚠️ Always start a stack the same way you found it
+>
+> `docker-compose.local.yml` **must** be run as
+> `docker compose -f docker-compose.local.yml --env-file .env.local up -d`.
+>
+> - **Omitting `--env-file .env.local`** makes compose interpolate from `.env`,
+>   whose `DB_PASSWORD` differs from the one the Postgres volume was created
+>   with. Every service then dies with `password authentication failed for
+>   user "echoflow"`.
+> - **Running plain `docker compose up`** (or merging `.local.yml` with
+>   `.vps.yml` / `.laptop.yml` when the stack was started with only
+>   `.local.yml`) targets a *different* compose project. Docker Compose's
+>   project name is shared across files in the same directory, so a mismatched
+>   invocation silently rebuilds the network and orphans every running
+>   container. Check with `docker compose ls` before tearing anything down.
+> - The local stack's project is `echoflow` and its network is
+>   `echoflow_default` (bridge `br-ef-local`, `172.29.0.0/16`).
+
 ## Stack
 Django 5.2 / DRF 3.18 · PostgreSQL 16 + pgvector (HNSW) · Redis 7 · Celery + Celery Beat · FFmpeg (HLS) · Vite/React (frontend/) · nginx 1.27 (TLS terminator) · Prometheus + Grafana (observability) · Sentry (errors, ready-to-configure)
 
@@ -315,9 +333,13 @@ docker builder prune                                # CAREFUL — wipes dangling
 | `DJANGO_ALLOWED_HOSTS` | Comma-separated allowed hosts. Must include every host the nginx terminator is reached at (`localhost`, your prod hostname, any Tailscale/CNAMES). Default: `localhost`. |
 | `DJANGO_CORS_ALLOWED_ORIGINS` | Comma-separated **https://** origins. Every browser-reachable origin MUST be `https://` once the terminator is live — `http://` here causes mixed-content / CORS preflight failures. |
 | `PUBLIC_MEDIA_ENDPOINT_URL` | Browser-facing MinIO origin for HLS playback. **Must be `https://`** (e.g. `https://localhost:9443` in dev). `AWS_S3_ENDPOINT_URL` (containers' in-network URL) stays `http://minio:9000`. |
-| `MEDIA_TOKEN_SECRET` | HMAC signing key for HLS playback tokens. Shared between Django (issuance) and the Cloudflare Worker or nginx njs (validation). Generate: `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Must match the Worker secret set via `npx wrangler secret put MEDIA_TOKEN_SECRET`. See `docs/EXPLAIN/storage/04-hls-token-protection.md`. |
+| `MEDIA_TOKEN_SECRET` | HMAC signing key for HLS playback tokens. Shared between Django (issuance) and the Cloudflare Worker (validation). Generate: `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Must match the Worker secret set via `npx wrangler secret put MEDIA_TOKEN_SECRET`. For local dev, `scripts/run-hls-worker-local.sh` generates the Worker's `.dev.vars` from this value so the two cannot drift. See `docs/EXPLAIN/storage/04-hls-token-protection.md`. |
+| `PUBLIC_HLS_ENDPOINT_URL` | Browser-facing HLS origin when it is the **validating edge** (Worker on `media.echoflow.in`, or the Worker behind nginx `:9443`/`:19443` locally). Leave blank with no edge in front. Its presence also sets `HLS_URL_STYLE=edge`. **Must not** be collapsed into `PUBLIC_MEDIA_ENDPOINT_URL`: presigned `uploads/` URLs still need the bucket in the path and the edge serves only `/hls/*`. |
+| `HLS_URL_STYLE` | `edge` → bucket-less `{origin}/hls/...`; `bucket` → `{origin}/{bucket}/hls/...`. Defaults to `edge` when `PUBLIC_HLS_ENDPOINT_URL` is set, else `bucket`. An edge fronting a bucket (R2 custom domain, Worker) does not expose the bucket as a path segment, and the Worker rejects any path not starting `/hls/` — so the bucket-prefixed form 404s there. |
+| `DB_HOST` / `DB_PORT` | Where the **app** connects. `pgbouncer`/`6432` in `docker-compose.yml`; `db_local`/`5432` in `docker-compose.local.yml`. `DATABASE_URL` is built from `DB_USER`/`DB_PASSWORD`/`DB_HOST`/`DB_PORT`/`DB_NAME` by compose — it is deliberately **not** in the env file, because compose does not expand `${...}` there. |
+| `TEST_DB_HOST` / `TEST_DB_PORT` / `TEST_DB_NAME` | Where `conftest.py` reaches Postgres **directly** for the test database. Separate from `DB_HOST`/`DB_PORT` on purpose: pgbouncer whitelists only `DB_NAME`, so `CREATE DATABASE` for the test DB is refused through it. Never point `TEST_DB_HOST` at a non-local host — conftest issues `CREATE`/`DROP DATABASE` and `CREATE EXTENSION` against it. |
 | `MEDIA_TOKEN_TTL_SECONDS` | HLS token time-to-live in seconds. Default `600` (10 min). |
-| `MEDIA_TOKEN_COOKIE_DOMAIN` | Cookie `Domain` attribute for the HLS token cookie. Set to parent domain (e.g. `.echo-flow.in`) for cross-subdomain cookies in production. Leave empty for dev (`localhost`). |
+| `MEDIA_TOKEN_COOKIE_DOMAIN` | Cookie `Domain` attribute for the HLS token cookie. Leave empty for dev (`localhost` rejects domain cookies). **Required** in production when `PUBLIC_HLS_ENDPOINT_URL` is a different host from the API: the cookie is set by `api.` and the media origin is `media.`, so a host-only cookie is never sent and every request 403s. Set the shared parent domain, e.g. `.echoflow.in`. |
 | `SENTRY_DSN` | Optional. When set, the `sentry-sdk` in each process captures uncaught exceptions. Get a DSN from sentry.io (free tier works). |
 | `SENTRY_ENV` | Sentry environment tag (e.g. `production`, `staging`). Default: `production`. |
 | `SENTRY_TRACES_SAMPLE_RATE` | Fraction of requests traced (0.0-1.0). Default: `0.1`. Lower for high-traffic. |
@@ -724,6 +746,32 @@ Durable, repo-specific knowledge. Append a concise entry at the end of each sess
 **Open:**
 - `TestLiveNginxTerminator` fix (probe response body) - tracked in AGENTS.md
 - `makemigrations --check` in CI - tracked in AGENTS.md
+
+---
+
+### 2026-09-28 — local-hls-worker + local-stack-networking
+**Learned:**
+- An R2 *binding* cannot be pointed at MinIO: under `wrangler dev` it is miniflare's local blob store in `.wrangler/state/` and `get()` always returns `null`. `workers/hls-token-worker/src/storage.ts` now selects an S3-over-fetch backend when `MEDIA_S3_ENDPOINT` is set. workerd CAN reach host-published MinIO and honours `Range`.
+- A hand-rolled SigV4 was wrong twice, in OPPOSITE directions, and both passed every self-written test: it used `sha256("")` where boto3/MinIO want the literal `UNSIGNED-PAYLOAD`, and it put the access key id in the string-to-sign scope (it belongs only in `X-Amz-Credential`). Both surfaced only as 403 from MinIO. **Use `aws4fetch`** — a self-consistent signer validates only itself.
+- `minio_local` is not a legal RFC 1123 hostname. `mc:latest` says `Invalid Request (invalid hostname)` and botocore 1.43 says `ValueError: Invalid endpoint`, so the bucket was never created and Django could not reach storage at all. Fixed with a hyphenated `minio-local` network alias.
+- A top-level `networks:` block in compose does NOT auto-attach services — they go to the implicit `default`. Naming the block `default` is what makes an explicit bridge/subnet take effect. And `bridge.name: br-echoflow-local` was 17 chars vs Linux's 15-char limit, which Docker reports as the very unhelpful `numerical result out of range`.
+- wrangler does NOT hot-reload `.dev.vars` (source files only). `scripts/run-hls-worker-local.sh` regenerates it from `.env.local` on every run so the two secrets cannot drift, and `npm run dev` routes through it.
+- `conftest.py` hardcoded host `db`/port `5432`/`echoflow_test`, so the suite errored at setup everywhere except the main stack (`could not translate host name "db"`). Now env-driven via `DB_HOST`/`DB_PORT`/`TEST_DB_HOST`/`TEST_DB_PORT`/`TEST_DB_NAME`. `DATABASE_URL` is built by compose from those — it cannot live in the env file, since compose does not expand `${...}` there.
+- `PlaybackTokenView` had zero test coverage despite being the token issuer. `test_hls_token.py` + `test_https_termination.py`: 69 passed, 6 skipped.
+- `test_https_listeners_present` passes **vacuously** — its regex matches the commented-out `listen 9443 ssl` in `docker/nginx.conf`. `TestLocalHlsWorkerRouting` reads the local config, where the block is real.
+
+**Changed:**
+- `docker-compose.local.yml`, `docker/nginx.local.conf`, `conftest.py`, `.env.example`, `docker-compose.yml`, `docker-compose.test.yml`
+- `workers/hls-token-worker/`: new `src/storage.ts` + tests, `/healthz`, `aws4fetch` dep, `.dev.vars.example`
+- `backend/EchoFlow/settings.py`, `backend/app/media_urls.py`, `backend/app/views/media.py`
+- New: `scripts/run-hls-worker-local.sh`, `docs/EXPLAIN/storage/05-local-hls-worker-runbook.md`, `docs/EXPLAIN/decisions/2026-09-28-local-hls-worker.md`
+
+**Open:**
+- **No cross-environment parity test**: the R2 backend (prod) and S3 backend (local) never see the same input. Token validation is shared code so the security boundary is covered; the storage fetch is not.
+- `docker-compose.test.yml` cannot start — `docker-compose.yml` references `minio/minio:RELEASE.2025-09-07T16-13-09Z`, which does not exist on Docker Hub. Blocks running the suite in the documented test stack.
+- 4 pre-existing failures unrelated to this work: `test_task_publisher.py::TestFlushTelemetryInvalidation` (3) and `test_feed_license_filter.py::test_fallback_excludes_nc_and_sa` (1). None of those files are in this branch's diff.
+- 8 scraper test modules error on `ai_ml.scrapers.state`, deleted in `5c9c2d6 "removed scraper"` while `scrape_audio.py` and the tests still import it.
+- `celery_media_local` OOMs (2 GB limit, 12 GB host), so HLS output is not produced locally; fixtures are seeded into MinIO directly.
 
 ---
 

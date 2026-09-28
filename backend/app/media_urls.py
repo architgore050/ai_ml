@@ -19,31 +19,39 @@ WHY THIS FILE EXISTS — TWO SEPARATE PROBLEMS SOLVED HERE:
    rejects with 403. One signed URL cannot authorize a stream made of dozens
    of objects — this isn't a MinIO quirk, it's true against real S3 too.
 
-   The fix used by every real HLS-over-object-storage deployment (absent a
-   CDN doing signed-cookie auth at the edge, which covers a whole path
-   prefix instead of one object): the RENDERED/derived stream is
-   public-read. The ORIGINAL uploaded file — the one thing actually worth
-   protecting — stays private. See docker-compose.yml's `minio-init`
-   service, which runs `mc anonymous set download .../hls` to make exactly
-   that split at the bucket-policy level. Because `hls/` is genuinely
-   public per that policy, signing those URLs would be theater — a URL that
-   LOOKS like it expires but doesn't, since the underlying object needs no
-   signature to be readable. That mismatch (looks access-controlled, isn't)
-   is worse than no signature at all, so get_hls_playback_url() below
-   returns a plain public URL, not a presigned one.
+   The fix used by every real HLS-over-object-storage deployment is an edge
+   that does signed-COOKIE auth over a whole path prefix, instead of one
+   object at a time. That is `backend.app.services.hls_token` on the Django
+   side and the Cloudflare Worker (or nginx, locally) on the other: a
+   short-lived HMAC cookie is issued per clip and validated on every /hls/*
+   request, so a single authorization covers a stream made of dozens of
+   objects.
 
-    `uploads/<original>` objects remain genuinely private and still need
-    real presigned URLs — that's what get_signed_media_url() is for, kept
-    separate and unused by anything HLS-related on purpose.
+   The ORIGINAL uploaded file — the one thing actually worth protecting — is a
+   different matter and stays behind a real presigned URL; that is what
+   get_signed_media_url() is for, kept separate and unused by anything
+   HLS-related on purpose.
 
-    HLS TOKEN PROTECTION: As of the token-protection migration, the `hls/`
-    prefix is NO LONGER public-read. Instead, a signed cookie (issued by
-    `backend.app.services.hls_token.generate_playback_token` and consumed
-    by the Cloudflare Worker / nginx njs layer) is validated on every
-    /hls/* request. The `PUBLIC_MEDIA_ENDPOINT_URL` returned here is the
-    origin the browser hits — the cookie validation happens transparently
-    at the edge. See `docs/EXPLAIN/storage/04-hls-token-protection.md`
-    for the full design.
+   HLS TOKEN PROTECTION: the `hls/` prefix is NOT public-read. Nothing runs
+   `mc anonymous set download` on it any more — `minio-init` only creates the
+   bucket and leaves the policy private. (An earlier version of this comment
+   claimed otherwise, and `docker/nginx.conf`'s commented-out :9443 block
+   still does; both are stale.)
+
+   The URL handed to the browser is the EDGE origin, and it is bucket-less —
+   an edge in front of the bucket (an R2 custom domain, or the Worker) does
+   not expose the bucket as a path segment, so `{endpoint}/{bucket}/hls/...`
+   would 404 there. That is not a local-only concern: the Worker rejects
+   anything whose path does not start with `/hls/`, so the bucket-prefixed
+   form is wrong in production too.
+
+    This is why the edge origin is a separate setting,
+    `PUBLIC_HLS_ENDPOINT_URL`, rather than reusing
+    `PUBLIC_MEDIA_ENDPOINT_URL`: presigned `uploads/` URLs still need the
+    bucket in the path and the edge serves nothing but /hls/*, so collapsing
+    the two would break uploads. `HLS_URL_STYLE` picks between the
+    bucket-prefixed and bucket-less forms. See
+    `docs/EXPLAIN/storage/04-hls-token-protection.md` for the full design.
 """
 import boto3
 from django.conf import settings
@@ -53,16 +61,24 @@ def get_hls_playback_url(object_key):
     """Return a browser-playable URL for HLS content (master.m3u8 or
     anything under the same `hls/` prefix). Not signed, on purpose — see
     module docstring for why signing a multi-file HLS stream doesn't work
-    and why `hls/` is bucket-policy public instead.
+    and why the token cookie exists instead.
+
+    Honors `HLS_URL_STYLE`:
+      "edge"   -> {PUBLIC_HLS_ENDPOINT_URL}/{key}            (bucket-less)
+      "bucket" -> {PUBLIC_MEDIA_ENDPOINT_URL}/{bucket}/{key} (path-style)
 
     Returns None if object_key is falsy.
     """
     if not object_key:
         return None
 
+    if settings.HLS_URL_STYLE == "edge":
+        endpoint = (settings.PUBLIC_HLS_ENDPOINT_URL or "").rstrip("/")
+        return f"{endpoint}/{object_key}"
+
     bucket = settings.STORAGES["default"]["OPTIONS"]["bucket_name"]
     endpoint = (settings.PUBLIC_MEDIA_ENDPOINT_URL or "").rstrip("/")
-    # addressing_style is "path" (see STORAGES config) — bucket is a path
+    # addressing_style is "path" (see STORAGES config) — the bucket is a path
     # segment, not a subdomain, which is what MinIO and most non-AWS
     # S3-compatible endpoints require.
     return f"{endpoint}/{bucket}/{object_key}"

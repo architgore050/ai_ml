@@ -558,14 +558,59 @@ assert STORAGES["default"]["OPTIONS"]["region_name"] in ("ap-south-1", "ap-south
 # PUBLIC_MEDIA_ENDPOINT_URL unset and it falls back to AWS_S3_ENDPOINT_URL).
 PUBLIC_MEDIA_ENDPOINT_URL = os.getenv("PUBLIC_MEDIA_ENDPOINT_URL") or os.getenv("AWS_S3_ENDPOINT_URL") or None
 
+# PUBLIC_HLS_ENDPOINT_URL: the origin a BROWSER uses for HLS playlists and
+# segments, which in a token-gated deployment is the validating EDGE (the
+# Cloudflare Worker on media.echoflow.in, or the Worker via nginx on
+# :9443/:19443 locally) — not the object store.
+#
+# This is deliberately a SEPARATE setting from PUBLIC_MEDIA_ENDPOINT_URL and
+# the two must not be collapsed:
+#
+#   PUBLIC_HLS_ENDPOINT_URL    -> edge origin. HLS URLs are BUCKET-LESS,
+#                                 because an edge that fronts the bucket
+#                                 (an R2 custom domain, or the Worker) does
+#                                 not expose the bucket as a path segment.
+#   PUBLIC_MEDIA_ENDPOINT_URL  -> raw storage origin. Presigned `uploads/`
+#                                 URLs need the bucket in the path, and the
+#                                 edge serves nothing but /hls/*.
+#
+# Consequence: setting this to a host OTHER than the one serving the API also
+# requires MEDIA_TOKEN_COOKIE_DOMAIN (below) to be set, or the token cookie
+# will be host-only and never sent to the media host. Those two are a pair.
+#
+# Unset -> falls back to PUBLIC_MEDIA_ENDPOINT_URL, which preserves the
+# previous bucket-prefixed behaviour for deployments with no edge in front.
+PUBLIC_HLS_ENDPOINT_URL = os.getenv("PUBLIC_HLS_ENDPOINT_URL") or PUBLIC_MEDIA_ENDPOINT_URL
+
+# HLS_URL_STYLE: whether the bucket is a path segment in browser-facing HLS
+# URLs. Two shapes exist, and guessing between them is how this broke before:
+#
+#   "bucket" -> {origin}/{bucket}/hls/...   plain S3/MinIO, nothing in front
+#   "edge"   -> {origin}/hls/...            the bucket is fronted by a
+#                                            validating edge (Cloudflare Worker
+#                                            on media.echoflow.in, or the
+#                                            Worker via nginx locally), and
+#                                            such an edge does NOT expose the
+#                                            bucket as a path segment
+#
+# Defaults to "edge" when PUBLIC_HLS_ENDPOINT_URL is set, else "bucket", so
+# existing deployments are unchanged and pointing HLS at an edge is all that
+# is needed. Set it explicitly to override.
+HLS_URL_STYLE = os.getenv("HLS_URL_STYLE") or (
+    "edge" if os.getenv("PUBLIC_HLS_ENDPOINT_URL") else "bucket"
+)
+
 # HLS token protection settings (see docs/EXPLAIN/storage/04-hls-token-protection.md)
 # MEDIA_TOKEN_SECRET: HMAC signing key shared between Django (token issuance)
-#   and the Cloudflare Worker / nginx njs (token validation). Must be identical
-#   or all HLS playback returns 403.
+#   and the Cloudflare Worker (token validation). Must be identical or all HLS
+#   playback returns 403. The Worker fails loudly at /healthz when unset;
+#   it cannot detect a *mismatched* value, so scripts/run-hls-worker-local.sh
+#   generates the Worker's .dev.vars from this same value.
 # MEDIA_TOKEN_TTL_SECONDS: token lifetime in seconds (default 600 = 10 min).
 # MEDIA_TOKEN_COOKIE_DOMAIN: cookie Domain attribute. Leave empty for dev
-#   (localhost does not support domain cookies). Set to parent domain (e.g.
-#   ".echo-flow.in") in prod for cross-subdomain cookie sharing.
+#   (localhost does not support domain cookies). REQUIRED in prod when the
+#   media origin is a different host from the API (api.echoflow.in issuing
+#   for media.echoflow.in) — see the note above.
 MEDIA_TOKEN_SECRET = os.getenv("MEDIA_TOKEN_SECRET", "")
 MEDIA_TOKEN_TTL_SECONDS = int(os.getenv("MEDIA_TOKEN_TTL_SECONDS", "600"))
 MEDIA_TOKEN_COOKIE_DOMAIN = os.getenv("MEDIA_TOKEN_COOKIE_DOMAIN", "")

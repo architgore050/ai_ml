@@ -1,20 +1,35 @@
 """Media playback token issuance endpoint.
 
-Serves short-lived HMAC tokens as HttpOnly cookies for HLS playback.
-The token is validated by the Cloudflare Worker edge
-(``workers/hls-token-worker/``), which fronts the bucket both in
+Serves short-lived HMAC tokens for HLS playback, validated by the Cloudflare
+Worker edge (``workers/hls-token-worker/``), which fronts the bucket both in
 production and -- via the nginx :9443 listener -- in the local stack.
 
-SECURITY: The cookie is HttpOnly, Secure, SameSite=Lax, and expires with
-the token. No token value is exposed to JavaScript — the browser sends the
-cookie automatically on all /hls/* requests to the media endpoint.
+TWO TRANSPORTS, ONE TOKEN.
+
+``Set-Cookie`` (the default, and what the web client uses). The cookie is
+HttpOnly, Secure, SameSite=Lax, and expires with the token. A browser sends
+it automatically on all /hls/* requests to the media endpoint, and no script
+can read it.
+
+``X-EchoFlow-Media-Token`` request header (opt-in, via
+``X-EchoFlow-Client: native``). Native players cannot consume a browser
+cookie — AVPlayer does not read ``NSHTTPCookieStorage`` and ExoPlayer's
+default data source sends no ``Cookie`` header at all — so an RN client has
+no way to obtain the token value from an HttpOnly cookie. It receives the
+same token in the response body and attaches it as a request header on
+every edge request instead. The edge accepts either. See
+``_token_response_body()`` for the full reasoning.
+
+The token itself is identical in both cases: same HMAC, same
+``MEDIA_TOKEN_TTL_SECONDS`` TTL, same per-clip scope, same signature and
+expiry checks at the edge. Only the carrier differs.
 
 DECISION: Token issuance is a separate API call from the clip fetch rather
 than embedded in the clip serializer, because:
-  1. The cookie must be set via Set-Cookie, not JSON body (browsers only
-     auto-send cookies that are set via Set-Cookie headers).
-  2. The frontend only needs the token after deciding to play a clip —
-     issuing it early would create a wider replay window.
+  1. Issuing early would widen the replay window — a token handed out during
+     a feed fetch is valid for clips the user may never open.
+  2. Only one client at a time can usefully be playing a given clip, so
+     there is nothing to gain from pre-issuing.
 """
 from django.conf import settings
 from rest_framework.permissions import IsAuthenticated
@@ -42,8 +57,68 @@ def _extract_clip_key(hls_playlist_url):
     return hls_playlist_url.rsplit("/", 1)[0]
 
 
+# SECURITY: the header a native client sends to opt in to receiving the token
+# value in the response body. See _token_response_body() for why this is
+# opt-in and why the default is unchanged.
+NATIVE_CLIENT_HEADER = "X-EchoFlow-Client"
+NATIVE_CLIENT_VALUE = "native"
+
+
+def _token_response_body(request, token):
+    """Build the JSON body, including the raw token only for native clients.
+
+    THE PROBLEM: the cookie contract is unsatisfiable off-browser.
+
+    ``Set-Cookie`` is honoured by a *browser* cookie jar. The two native
+    players this product uses — AVPlayer on iOS and ExoPlayer/Media3 on
+    Android — are not a browser and have no shared cookie store with the
+    HTTP client that made this request:
+
+      - iOS: ``NSHTTPCookieStorage`` is consulted by ``NSURLSession``, not by
+        ``AVPlayer``. An ``AVPlayerItem`` carries its own header set and
+        does not inherit the app's cookies.
+      - Android: ExoPlayer's default ``DefaultHttpDataSource`` sends no
+        ``Cookie`` header at all. Supplying one requires building a
+        ``ResolvingDataSource`` with an explicit ``DefaultHttpDataSource``,
+        which React Native's audio module does not expose.
+
+    A React Native app also cannot simply read the cookie back out and
+    re-attach it: it is ``HttpOnly``, and ``Secure=True`` means it is dropped
+    outright over the plaintext-HTTP development stack. So a native client
+    has no way to obtain the token *value* at all, and therefore no way to
+    present it.
+
+    THE FIX: the same HMAC token, delivered one more way. The native client
+    sends ``X-EchoFlow-Client: native`` and receives ``{"token": "..."}``; it
+    then attaches it as the ``X-EchoFlow-Media-Token`` request header on
+    every request it makes to the edge, via the player's per-source headers.
+    The validating edge accepts the header alongside the cookie. Same
+    cryptography, same TTL, same per-clip scope, same path check — only the
+    transport differs.
+
+    WHY THIS IS OPT-IN, NOT UNCONDITIONAL: the default body stays
+    ``{"status": "ok"}`` for every request that does not send the header.
+    The token remains a bearer credential, and echoing a bearer credential
+    into a body that a browser-side bug (a logging interceptor, an error
+    reporter capturing response bodies, an XHR wrapper logging JSON) could
+    capture is a real, if small, widening of exposure. `HttpOnly` is
+    specifically the property that stops script from reading it, so
+    overriding that default should require the caller to say it is a native
+    stack, not arrive as a side effect of adding a field.
+
+    A caller that forges the header from a browser gains nothing: the token
+    is already scoped to the single clip the user was served, and the edge
+    validates scope, expiry and signature exactly as it does for a cookie.
+    This is a transport change, not a privilege change.
+    """
+    body = {"status": "ok"}
+    if request.headers.get(NATIVE_CLIENT_HEADER) == NATIVE_CLIENT_VALUE:
+        body["token"] = token
+    return body
+
+
 class PlaybackTokenView(APIView):
-    """Issue a short-lived HLS playback token cookie for a specific clip.
+    """Issue a short-lived HLS playback token for a specific clip.
 
     Endpoint: ``GET /media/playback-token/<uuid:clip_id>/``
 
@@ -52,8 +127,10 @@ class PlaybackTokenView(APIView):
     handled separately in ShareViewSet; this endpoint gates on feed
     visibility.)
 
-    Response: JSON ``{"status": "ok"}`` with the token set as an HttpOnly
-    cookie named ``ef_hls_token``.
+    Response: ``{"status": "ok"}``, plus ``{"token": "..."}`` when the caller
+    sent ``X-EchoFlow-Client: native``. The token is *always* also set as an
+    HttpOnly ``ef_hls_token`` cookie, so a native client is not forced to
+    give up the cookie path and the web client is not changed at all.
     """
 
     permission_classes = [IsAuthenticated]
@@ -103,7 +180,7 @@ class PlaybackTokenView(APIView):
         )
 
         ttl = settings.MEDIA_TOKEN_TTL_SECONDS
-        response = Response({"status": "ok"})
+        response = Response(_token_response_body(request, token))
         response.set_cookie(
             key=COOKIE_NAME,
             value=token,

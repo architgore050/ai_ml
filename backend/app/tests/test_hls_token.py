@@ -557,3 +557,154 @@ class TestPlaybackTokenView:
         response = authed.get(self.url(clip.id))
         assert response.status_code == 409
         assert "ef_hls_token" not in response.cookies
+
+
+# ---------------------------------------------------------------------------
+# Native transport
+#
+# A React Native client cannot use the cookie. AVPlayer (iOS) does not read
+# NSHTTPCookieStorage, and ExoPlayer's DefaultHttpDataSource (Android) sends
+# no Cookie header at all. The token is also HttpOnly and Secure, so the app
+# cannot read it back out of the cookie jar either. Without a second
+# transport there is no way for a mobile client to present a credential.
+#
+# These tests pin the opt-in: the token appears in the body ONLY for a caller
+# that declares itself native, the cookie is still set either way, and the
+# body token is the same credential the edge already validates.
+# ---------------------------------------------------------------------------
+
+# Passed as WSGI extra kwargs, NOT as APIClient's second positional argument:
+# that position is `data`, which for a GET becomes the query string, so
+# `client.get(url, HEADERS)` silently sends `?HTTP_X_ECHOFLOW_CLIENT=native`
+# and the view never sees a header at all.
+NATIVE_HEADERS = {"HTTP_X_ECHOFLOW_CLIENT": "native"}
+
+
+class TestNativeTokenTransport:
+    @pytest.fixture
+    def user(self, django_user_model):
+        return django_user_model.objects.create_user(
+            username="native", email="native@example.com", password="pw-probe-123"
+        )
+
+    @pytest.fixture
+    def ready_clip(self, user):
+        from backend.app.models import AudioClip
+
+        return AudioClip.objects.create(
+            creator=user,
+            title="native probe",
+            moderation_approved=True,
+            status="ready",
+            hls_playlist_url="hls/00000000-0000-0000-0000-00000000000a/master.m3u8",
+        )
+
+    @pytest.fixture
+    def authed(self, user, token_secret, token_ttl):
+        from rest_framework.test import APIClient
+
+        client = APIClient()
+        client.force_authenticate(user=user)
+        return client
+
+    def url(self, clip_id):
+        return f"/media/playback-token/{clip_id}/"
+
+    def test_native_client_receives_the_token_in_the_body(self, authed, ready_clip):
+        response = authed.get(self.url(ready_clip.id), **NATIVE_HEADERS)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body.get("token"), "native client was not given the token value"
+
+    def test_body_token_is_the_same_credential_as_the_cookie(
+        self, authed, ready_clip
+    ):
+        """The two transports must not diverge.
+
+        If these ever differ, a client that reads the body but the edge
+        validates something else would 403 on every segment — and a client
+        that reads the cookie but validates the body would 403 too. Pinning
+        equality is what makes the two interchangeable.
+        """
+        response = authed.get(self.url(ready_clip.id), **NATIVE_HEADERS)
+
+        assert response.json()["token"] == response.cookies["ef_hls_token"].value
+
+    def test_body_token_validates_against_the_clips_own_path(self, authed, ready_clip):
+        """End of the gate for the native transport: the body token must be
+        accepted by the same validator the Worker uses, for this clip's path
+        and rejected for a different clip's."""
+        from backend.app.services.hls_token import validate_playback_token
+
+        token = authed.get(self.url(ready_clip.id), **NATIVE_HEADERS).json()["token"]
+
+        assert validate_playback_token(
+            token, "/hls/00000000-0000-0000-0000-00000000000a/master.m3u8"
+        ) is not None
+        assert validate_playback_token(
+            token, "/hls/00000000-0000-0000-0000-00000000000b/master.m3u8"
+        ) is None
+
+    def test_non_native_client_does_not_receive_the_token_in_the_body(
+        self, authed, ready_clip
+    ):
+        """The default is unchanged. A bearer credential must not start
+        appearing in response bodies for callers that did not ask for it —
+        that is what HttpOnly is for."""
+        response = authed.get(self.url(ready_clip.id))
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        assert "token" not in response.json()
+        # The cookie is still issued, so the web path is untouched.
+        assert "ef_hls_token" in response.cookies
+
+    @pytest.mark.parametrize(
+        "header_value",
+        ["web", "NATIVE", "native ", "ios", "", "browser-native"],
+    )
+    def test_only_the_exact_native_value_opts_in(
+        self, authed, ready_clip, header_value
+    ):
+        """The match is exact and case-sensitive.
+
+        A prefix or case variant must not opt in, otherwise a client whose
+        header handling is sloppy receives a credential in a body it may log.
+        """
+        response = authed.get(
+            self.url(ready_clip.id), **{"HTTP_X_ECHOFLOW_CLIENT": header_value}
+        )
+        assert "token" not in response.json(), f"{header_value!r} was treated as native"
+
+    def test_native_client_still_gets_the_cookie(self, authed, ready_clip):
+        """Opting into the body must not remove the cookie. A native client
+        is allowed to use either; giving it both keeps the web contract
+        intact and makes the change additive rather than a replacement."""
+        response = authed.get(self.url(ready_clip.id), **NATIVE_HEADERS)
+
+        cookie = response.cookies["ef_hls_token"]
+        assert cookie["httponly"] is True
+        assert cookie["secure"] is True
+        assert cookie["samesite"] == "Lax"
+        assert cookie["path"] == "/hls/"
+
+    def test_native_flag_does_not_bypass_moderation(self, authed, ready_clip):
+        """The header is a transport opt-in, not a privilege. An unmoderated
+        clip must stay a 403 for a native caller exactly as for a browser,
+        and must carry neither a token nor a cookie."""
+        ready_clip.moderation_approved = False
+        ready_clip.save(update_fields=["moderation_approved"])
+
+        response = authed.get(self.url(ready_clip.id), **NATIVE_HEADERS)
+
+        assert response.status_code == 403
+        assert "token" not in response.json()
+        assert "ef_hls_token" not in response.cookies
+
+    def test_native_flag_does_not_bypass_authentication(self, ready_clip, token_secret, token_ttl):
+        from rest_framework.test import APIClient
+
+        response = APIClient().get(self.url(ready_clip.id), **NATIVE_HEADERS)
+        assert response.status_code in (401, 403)
+        assert "token" not in response.json()

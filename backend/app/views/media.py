@@ -31,13 +31,18 @@ than embedded in the clip serializer, because:
   2. Only one client at a time can usefully be playing a given clip, so
      there is nothing to gain from pre-issuing.
 """
+import logging
+
 from django.conf import settings
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..models import AudioClip
+from ..services.entitlements import resolve_clip_access
 from ..services.hls_token import generate_playback_token, COOKIE_NAME
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_clip_key(hls_playlist_url):
@@ -122,27 +127,19 @@ class PlaybackTokenView(APIView):
 
     Endpoint: ``GET /media/playback-token/<uuid:clip_id>/``
 
-    Requires authentication.
+    Requires authentication, and the caller must be entitled to the clip —
+    see :func:`backend.app.services.entitlements.resolve_clip_access`, which
+    is the single source of truth for that decision.
 
-    .. warning::
-       This endpoint does **not** yet check that the caller is entitled to
-       the clip. It verifies only ``IsAuthenticated``, that the clip exists,
-       that ``moderation_approved`` is set, and that HLS output exists. A
-       previous version of this docstring claimed "Share-link authorization
-       is handled separately in ShareViewSet; this endpoint gates on feed
-       visibility" — both halves were false (``ShareViewSet`` has no
-       share-link handling, and the feed queryset is not consulted here).
-       The intended check was described in a comment and deferred: "the feed
-       filter is the primary gate -- this endpoint trusts that the frontend
-       only calls it for visible clips."
-
-       Consequence, live since this docstring was written: any authenticated
-       user who learns a clip UUID can mint a token for it, including for
-       ``is_noncommercial`` / ``requires_share_alike`` clips that
-       ``FastFeedViewSet`` deliberately withholds. That is a licensing
-       bypass, not just a privacy gap. Fixed in the entitlement-hardening
-       pass; see the A4/``resolve_clip_access`` item in
-       ``docs/mobile-rebuild-plan.md`` §17.
+    .. note::
+       This docstring previously claimed "Share-link authorization is handled
+       separately in ShareViewSet; this endpoint gates on feed visibility".
+       Neither was true — ``ShareViewSet`` had no share-link handling and the
+       feed queryset was never consulted. Worse, the endpoint authorized on
+       ``moderation_approved`` alone while ``FastFeedViewSet`` also filters
+       ``is_noncommercial`` and ``requires_share_alike``, so any logged-in
+       user could mint a token for an NC/SA clip the feed never served. That
+       was a licensing bypass and is now closed.
 
     Response: ``{"status": "ok"}``, plus ``{"token": "..."}`` when the caller
     sent ``X-EchoFlow-Client: native``. The token is *always* also set as an
@@ -171,23 +168,24 @@ class PlaybackTokenView(APIView):
             )
 
         # SECURITY: Block token issuance for clips the user shouldn't see.
-        # This prevents a user from guessing clip IDs and minting playback
-        # tokens for clips they haven't been served via their feed.
-        # Feed visibility is enforced by FastFeedViewSet; here we do a
-        # lightweight check: the user must have a valid interaction record
-        # (like, skip, telemety) with this clip, OR the clip must be
-        # owned by a user they follow, OR the clip must be in their feed.
-        # For v1, the feed filter is the primary gate — this endpoint trusts
-        # that the frontend only calls it for visible clips.
-        # A future hardening pass can add explicit authorization here.
         #
-        # 2026-09-29: this is no longer hypothetical. The check above is
-        # ABSENT, and it matters beyond privacy — FastFeedViewSet also
-        # filters is_noncommercial=False and requires_share_alike=False, and
-        # none of that is applied here. So a logged-in user can mint a token
-        # for an NC or SA clip that the feed never serves, which is a
-        # licensing bypass. Being fixed by resolve_clip_access(); see the
-        # class docstring. Kept as a comment so the intent is not lost.
+        # 2026-09-29: this check now exists. It previously did not, which was
+        # a licensing bypass — FastFeedViewSet filters
+        # is_noncommercial=False and requires_share_alike=False and this
+        # endpoint applied neither, so any logged-in user could mint a token
+        # for an NC/SA clip the feed never serves. resolve_clip_access() is
+        # the single source of truth; see its docstring for why it
+        # deliberately does not require proof the clip was served.
+        allowed, reason = resolve_clip_access(request.user, clip)
+        if not allowed:
+            logger.warning(
+                "playback token denied: user=%s clip=%s reason=%s",
+                request.user.pk, clip.pk, reason,
+            )
+            return Response(
+                {"detail": "Clip not available."},
+                status=403,
+            )
 
         clip_key = _extract_clip_key(clip.hls_playlist_url)
         if clip_key is None:

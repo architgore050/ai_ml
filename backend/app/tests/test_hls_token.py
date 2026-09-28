@@ -708,3 +708,255 @@ class TestNativeTokenTransport:
         response = APIClient().get(self.url(ready_clip.id), **NATIVE_HEADERS)
         assert response.status_code in (401, 403)
         assert "token" not in response.json()
+
+
+# ---------------------------------------------------------------------------
+# Entitlement: who may be issued a playback token at all
+# ---------------------------------------------------------------------------
+
+class TestPlaybackTokenEntitlement:
+    """PlaybackTokenView must not authorize on `moderation_approved` alone.
+
+    FastFeedViewSet also filters is_noncommercial=False and
+    requires_share_alike=False. Before resolve_clip_access() existed the
+    token endpoint applied neither, so any authenticated user could mint a
+    token for an NC/SA clip the feed never serves. These tests pin the
+    licensing predicate specifically, because that is the part that was
+    actually exploitable.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_throttle_budget(self):
+        """Reset the DRF throttle counters before each test.
+
+        The cache backend is real Redis (``settings.CACHES`` uses
+        ``django_redis.cache.RedisCache``), and ``conftest.py`` does not
+        clear it. So throttle budgets accumulate across the whole suite and
+        persist between runs. Without this, an authorization test can fail
+        because an unrelated test file consumed the shared ``user``
+        (1000/hour) budget — which is exactly what happened: these tests
+        passed in isolation and failed in a larger combined run.
+        """
+        from django.core.cache import cache
+
+        cache.clear()
+        yield
+        cache.clear()
+
+    @pytest.fixture
+    def viewer(self, django_user_model):
+        return django_user_model.objects.create_user(
+            username="viewer", email="viewer@example.com", password="pw-probe-123"
+        )
+
+    @pytest.fixture
+    def author(self, django_user_model):
+        return django_user_model.objects.create_user(
+            username="author", email="author@example.com", password="pw-probe-123"
+        )
+
+    @pytest.fixture
+    def authed(self, viewer, token_secret, token_ttl):
+        from rest_framework.test import APIClient
+
+        client = APIClient()
+        client.force_authenticate(user=viewer)
+        return client
+
+    def make_clip(self, author, **kwargs):
+        from backend.app.models import AudioClip
+
+        defaults = dict(
+            creator=author,
+            title="probe",
+            moderation_approved=True,
+            status="ready",
+            hls_playlist_url="hls/00000000-0000-0000-0000-000000000009/master.m3u8",
+        )
+        defaults.update(kwargs)
+        return AudioClip.objects.create(**defaults)
+
+    def url(self, clip_id):
+        return f"/media/playback-token/{clip_id}/"
+
+    # --- the licensing bypass -------------------------------------------
+
+    @pytest.mark.parametrize("field", ["is_noncommercial", "requires_share_alike"])
+    def test_license_restricted_clip_is_refused_to_a_stranger(
+        self, authed, author, field
+    ):
+        clip = self.make_clip(author, **{field: True})
+        response = authed.get(self.url(clip.id))
+        assert response.status_code == 403
+        # The response must not tell an unauthorised caller which license
+        # the clip carries.
+        assert "noncommercial" not in response.json()["detail"].lower()
+        assert "share_alike" not in response.json()["detail"].lower()
+        assert "token" not in response.json()
+
+    @pytest.mark.parametrize("field", ["is_noncommercial", "requires_share_alike"])
+    def test_owner_may_still_play_their_own_restricted_clip(
+        self, author, token_secret, token_ttl, field
+    ):
+        """NC/SA restrict redistribution; the uploader must hear their own clip."""
+        from rest_framework.test import APIClient
+
+        clip = self.make_clip(author, **{field: True})
+        client = APIClient()
+        client.force_authenticate(user=author)
+        assert client.get(self.url(clip.id)).status_code == 200
+
+    def test_interaction_does_not_launder_a_restricted_clip(
+        self, authed, author, viewer
+    ):
+        """A prior interaction is not a licence to redistribute NC/SA audio."""
+        from backend.app.models import UserInteraction
+
+        clip = self.make_clip(author, is_noncommercial=True)
+        UserInteraction.objects.create(
+            user=viewer,
+            clip=clip,
+            interaction_type="view",
+        )
+        assert authed.get(self.url(clip.id)).status_code == 403
+
+    def test_in_app_share_grants_access_to_a_restricted_clip(
+        self, authed, author, viewer
+    ):
+        from backend.app.models import ShareEvent
+
+        clip = self.make_clip(author, is_noncommercial=True)
+        ShareEvent.objects.create(sender=author, receiver=viewer, clip=clip)
+        assert authed.get(self.url(clip.id)).status_code == 200
+
+    # --- the other access paths ----------------------------------------
+
+    def test_following_the_author_allows_a_license_clean_clip(
+        self, authed, author, viewer
+    ):
+        clip = self.make_clip(author)
+        viewer.following.add(author)
+        assert authed.get(self.url(clip.id)).status_code == 200
+
+    def test_unmoderated_clip_is_refused_even_to_its_owner(
+        self, author, token_secret, token_ttl
+    ):
+        """Existing behaviour preserved: nobody gets a token pre-approval."""
+        from rest_framework.test import APIClient
+
+        clip = self.make_clip(author, moderation_approved=False)
+        client = APIClient()
+        client.force_authenticate(user=author)
+        assert client.get(self.url(clip.id)).status_code == 403
+
+    def test_license_clean_clip_without_any_relationship_is_allowed(
+        self, authed, author
+    ):
+        """Documents the accepted v1 residual, and guards the feed path.
+
+        resolve_clip_access is a licensing gate, not a privacy gate: a
+        moderated, license-clean clip is playable by any authenticated user.
+        That is required, not merely tolerated — feed_pool.py builds both
+        halves of the feed from AudioClip.objects.filter(status='ready')
+        with no creator/following scoping, so most feed clips come from
+        authors the user has no relationship with. Denying those would 403
+        the primary playback path.
+        """
+        assert authed.get(self.url(self.make_clip(author).id)).status_code == 200
+
+    def test_license_restriction_still_applies_when_the_feed_itself_is_empty(
+        self, authed, author
+    ):
+        """The predicate is on the clip, not on feed state.
+
+        Regression guard for the original bug, which was that feed filters
+        were assumed to be the gate. If feed state ever leaks into this
+        decision, a cold/empty feed would make restricted clips playable.
+        """
+        clip = self.make_clip(author, is_noncommercial=True)
+        response = authed.get(self.url(clip.id))
+        assert response.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for resolve_clip_access itself
+# ---------------------------------------------------------------------------
+
+class TestResolveClipAccess:
+    @pytest.fixture
+    def viewer(self, django_user_model):
+        return django_user_model.objects.create_user(
+            username="v", email="v@example.com", password="pw-probe-123"
+        )
+
+    @pytest.fixture
+    def author(self, django_user_model):
+        return django_user_model.objects.create_user(
+            username="a", email="a@example.com", password="pw-probe-123"
+        )
+
+    def clip(self, author, **kwargs):
+        from backend.app.models import AudioClip
+
+        defaults = dict(
+            creator=author,
+            title="t",
+            moderation_approved=True,
+            status="ready",
+            hls_playlist_url="hls/x/master.m3u8",
+        )
+        defaults.update(kwargs)
+        return AudioClip.objects.create(**defaults)
+
+    def test_unmoderated_short_circuits_before_ownership(self, viewer, author):
+        """Owner check must not rescue an unmoderated clip."""
+        from backend.app.services.entitlements import (
+            DENY_NOT_MODERATED,
+            resolve_clip_access,
+        )
+
+        clip = self.clip(author, moderation_approved=False)
+        assert resolve_clip_access(author, clip) == (False, DENY_NOT_MODERATED)
+
+    def test_owner_is_allowed(self, author):
+        from backend.app.services.entitlements import (
+            ACCESS_OWNER,
+            resolve_clip_access,
+        )
+
+        assert resolve_clip_access(author, self.clip(author)) == (True, ACCESS_OWNER)
+
+    def test_stranger_on_clean_clip_is_allowed_with_no_relationship(
+        self, viewer, author
+    ):
+        from backend.app.services.entitlements import (
+            ACCESS_PUBLIC_CLEAN,
+            resolve_clip_access,
+        )
+
+        # A clean clip is allowed outright. Denying it would break the feed,
+        # because feed_pool.py does not scope the pool to a social graph.
+        assert resolve_clip_access(viewer, self.clip(author)) == (
+            True,
+            ACCESS_PUBLIC_CLEAN,
+        )
+
+    def test_stranger_on_restricted_clip_is_denied_with_the_license_reason(
+        self, viewer, author
+    ):
+        from backend.app.services.entitlements import (
+            DENY_LICENSED,
+            resolve_clip_access,
+        )
+
+        clip = self.clip(author, requires_share_alike=True)
+        assert resolve_clip_access(viewer, clip) == (False, DENY_LICENSED)
+
+    def test_is_license_restricted_reads_both_flags(self, author):
+        from backend.app.services.entitlements import is_license_restricted
+
+        assert is_license_restricted(self.clip(author)) is False
+        assert is_license_restricted(self.clip(author, is_noncommercial=True)) is True
+        assert (
+            is_license_restricted(self.clip(author, requires_share_alike=True)) is True
+        )

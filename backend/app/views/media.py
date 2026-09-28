@@ -125,7 +125,22 @@ def _token_response_body(request, token):
 class PlaybackTokenView(APIView):
     """Issue a short-lived HLS playback token for a specific clip.
 
-    Endpoint: ``GET /media/playback-token/<uuid:clip_id>/``
+    Endpoint: ``POST /media/playback-token/<uuid:clip_id>/``
+
+    DECISION: ``POST``, not ``GET``, as of 2026-09-29. Minting a playback
+    credential is a state-changing act and must not be a safe method:
+
+    * A ``GET`` is CSRF-able. Combined with ``SameSite=Lax`` on the
+      ``ef_hls_token`` cookie, a cross-site ``<img>`` or redirect could
+      trigger issuance in a logged-in browser without user intent.
+    * A ``GET`` is prefetchable. Browsers and some proxies prefetch
+      hyperlinks and crawl targets, which would mint tokens nobody asked for
+      and burn rate-limit budget.
+    * A ``GET`` is cacheable by intermediaries, and the response sets a
+      credential cookie. A shared cache must never replay that.
+
+    This is a breaking API change. The only caller,
+    ``sample_frontend2/src/api/client.ts``, was updated in the same commit.
 
     Requires authentication, and the caller must be entitled to the clip —
     see :func:`backend.app.services.entitlements.resolve_clip_access`, which
@@ -150,6 +165,24 @@ class PlaybackTokenView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, clip_id):
+        """Reject GET explicitly rather than 405-ing with no explanation.
+
+        A bare 405 leaves the caller guessing whether it should retry with
+        POST or whether the clip is unavailable. Old clients in the wild
+        still issue GET, so the reason matters during rollout.
+        """
+        return Response(
+            {
+                "detail": (
+                    "Use POST to request a playback token. GET is not "
+                    "accepted because issuing a credential must not be a "
+                    "safe, prefetchable or cacheable method."
+                ),
+            },
+            status=405,
+        )
+
+    def post(self, request, clip_id):
         try:
             clip = AudioClip.objects.get(pk=clip_id)
         except AudioClip.DoesNotExist:

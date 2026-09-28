@@ -528,7 +528,7 @@ The heart of the app. Post-A1/A2 this is short and fully specified.
       exactly that, and it is wrong: the storage origin carries a port and the
       edge is a different host.)
 
-2. App: GET /media/playback-token/{id}/
+2. App: POST /media/playback-token/{id}/
        Authorization: Bearer <access JWT>
        X-EchoFlow-Client: native
    ← 200 {"status":"ok","token":"<b64url-payload>.<b64url-sig>"}

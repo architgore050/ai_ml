@@ -4,7 +4,7 @@
 > cookie, which is correct for the web but was not sufficient on its own.**
 >
 > The cookie route is `Set-Cookie: ef_hls_token` on
-> `GET /media/playback-token/<clip_id>/`, which a browser attaches
+> `POST /media/playback-token/<clip_id>/`, which a browser attaches
 > automatically to every `/hls/*` request.
 >
 > **Native players cannot use it.** `AVPlayer` (iOS) does not read
@@ -225,7 +225,7 @@ Streaming alike.
 **The fix.** One token, two carriers.
 
 ```
-Django  GET /media/playback-token/<id>/
+Django  POST /media/playback-token/<id>/
         request:  Authorization: Bearer <access>
                   X-EchoFlow-Client: native
         response: {"status": "ok", "token": "<b64url-payload>.<b64url-hmac>"}
@@ -292,7 +292,7 @@ API (api.echoflow.in → Cloudflare Tunnel → nginx → gunicorn → Django)
   │
   │ Response: clips with hls_playlist_url: "https://media.echoflow.in/hls/<id>/master.m3u8"
   │
-  │ GET /media/playback-token/<clip_id>/  (JWT authenticated)
+  │ POST /media/playback-token/<clip_id>/ (JWT authenticated)
   │ ←→ Set-Cookie: ef_hls_token=...; Domain=.echoflow.in; Path=/hls/
   ▼
 Browser cookie jar now contains ef_hls_token for media.echoflow.in/hls/

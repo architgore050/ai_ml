@@ -40,7 +40,7 @@ block it. Two are the HLS playback gate; two are configuration.
 
 **Native transport.** One HMAC token, two carriers, **cookie-first**.
 
-- `GET /media/playback-token/<id>/` returns `{"status":"ok"}`, plus
+- `POST /media/playback-token/<id>/` returns `{"status":"ok"}`, plus
   `"token"` when the caller sends `X-EchoFlow-Client: native`. The cookie is
   set unconditionally, so the web client is byte-identical and the change is
   additive.

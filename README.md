@@ -126,7 +126,7 @@ A `robots.txt`-respecting, rate-limited scraper ingests openly-licensed audio fr
 1. **TLS termination** — every client request enters through `nginx:443`, which terminates TLS, sets `X-Forwarded-Proto: https`, and forwards plain HTTP to gunicorn (`web:8000`). `nginx:9443` serves browser HLS segments over HTTPS (mixed-content safety, token-gated).
 2. **Upload** → `POST /clips/` creates an `AudioClip` in `processing` status and enqueues `process_audio_to_hls` via `transaction.on_commit`.
 3. **Process** → Celery (heavy_media queue) extracts acoustic features, transcribes, embeds, tags, and transcodes to ABR HLS. Status flips to `ready`.
-4. **Token issuance** → `GET /media/playback-token/<clip_id>/` (auth required) issues an HMAC-signed `ef_hls_token` cookie (10-min TTL, per-clip scope). The cookie is HttpOnly, Secure, SameSite=Lax, and scoped to `path=/hls/`.
+4. **Token issuance** → `POST /media/playback-token/<clip_id>/` (auth required) issues an HMAC-signed `ef_hls_token` cookie (10-min TTL, per-clip scope). The cookie is HttpOnly, Secure, SameSite=Lax, and scoped to `path=/hls/`.
 5. **Serve feed** → `GET /feed/` pops clip IDs from the user's Redis feed queue; the queue is refilled by the `fast_feed` worker using vector/composite scoring.
 6. **Playback** → HLS.js loads `master.m3u8` from the media endpoint; the browser auto-sends the `ef_hls_token` cookie on all `/hls/*` subrequests. The Cloudflare Worker (prod) or nginx njs (dev) validates the HMAC before proxying to R2/MinIO.
 7. **Engage** → likes/shares/telemetry are recorded as `UserInteraction` rows, incrementing denormalized counters via `F()` expressions.

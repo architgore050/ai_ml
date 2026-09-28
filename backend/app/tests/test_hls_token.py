@@ -470,7 +470,7 @@ class TestPlaybackTokenView:
     def test_issues_the_cookie_with_the_contract_attributes(
         self, authed, ready_clip, settings
     ):
-        response = authed.get(self.url(ready_clip.id))
+        response = authed.post(self.url(ready_clip.id))
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
 
@@ -488,11 +488,11 @@ class TestPlaybackTokenView:
 
     def test_max_age_tracks_media_token_ttl_seconds(self, authed, ready_clip, settings):
         settings.MEDIA_TOKEN_TTL_SECONDS = 60
-        response = authed.get(self.url(ready_clip.id))
+        response = authed.post(self.url(ready_clip.id))
         assert response.cookies["ef_hls_token"]["max-age"] == 60
 
         settings.MEDIA_TOKEN_TTL_SECONDS = 1800
-        response = authed.get(self.url(ready_clip.id))
+        response = authed.post(self.url(ready_clip.id))
         assert response.cookies["ef_hls_token"]["max-age"] == 1800
 
     def test_domain_is_set_when_media_token_cookie_domain_is(
@@ -501,7 +501,7 @@ class TestPlaybackTokenView:
         # Required in production when the media origin is a different host
         # from the API; without it the cookie is host-only and never sent.
         settings.MEDIA_TOKEN_COOKIE_DOMAIN = ".echoflow.in"
-        response = authed.get(self.url(ready_clip.id))
+        response = authed.post(self.url(ready_clip.id))
         assert response.cookies["ef_hls_token"]["domain"] == ".echoflow.in"
 
     def test_issued_cookie_validates_against_the_request_path(
@@ -511,7 +511,7 @@ class TestPlaybackTokenView:
         clip's own path and rejected for a different clip's."""
         from backend.app.services.hls_token import validate_playback_token
 
-        response = authed.get(self.url(ready_clip.id))
+        response = authed.post(self.url(ready_clip.id))
         token = response.cookies["ef_hls_token"].value
 
         assert validate_playback_token(
@@ -524,20 +524,20 @@ class TestPlaybackTokenView:
     def test_requires_authentication(self, user, token_secret, token_ttl, ready_clip):
         from rest_framework.test import APIClient
 
-        response = APIClient().get(self.url(ready_clip.id))
+        response = APIClient().post(self.url(ready_clip.id))
         assert response.status_code in (401, 403)
 
     def test_unknown_clip_is_404(self, authed, token_secret, token_ttl):
         import uuid
 
-        response = authed.get(self.url(uuid.uuid4()))
+        response = authed.post(self.url(uuid.uuid4()))
         assert response.status_code == 404
 
     def test_unmoderated_clip_is_403(self, authed, ready_clip, token_secret, token_ttl):
         ready_clip.moderation_approved = False
         ready_clip.save(update_fields=["moderation_approved"])
 
-        response = authed.get(self.url(ready_clip.id))
+        response = authed.post(self.url(ready_clip.id))
         assert response.status_code == 403
         assert "ef_hls_token" not in response.cookies
 
@@ -554,7 +554,7 @@ class TestPlaybackTokenView:
         )
         assert clip.hls_playlist_url is None
 
-        response = authed.get(self.url(clip.id))
+        response = authed.post(self.url(clip.id))
         assert response.status_code == 409
         assert "ef_hls_token" not in response.cookies
 
@@ -611,7 +611,7 @@ class TestNativeTokenTransport:
         return f"/media/playback-token/{clip_id}/"
 
     def test_native_client_receives_the_token_in_the_body(self, authed, ready_clip):
-        response = authed.get(self.url(ready_clip.id), **NATIVE_HEADERS)
+        response = authed.post(self.url(ready_clip.id), **NATIVE_HEADERS)
 
         assert response.status_code == 200
         body = response.json()
@@ -628,7 +628,7 @@ class TestNativeTokenTransport:
         that reads the cookie but validates the body would 403 too. Pinning
         equality is what makes the two interchangeable.
         """
-        response = authed.get(self.url(ready_clip.id), **NATIVE_HEADERS)
+        response = authed.post(self.url(ready_clip.id), **NATIVE_HEADERS)
 
         assert response.json()["token"] == response.cookies["ef_hls_token"].value
 
@@ -638,7 +638,7 @@ class TestNativeTokenTransport:
         and rejected for a different clip's."""
         from backend.app.services.hls_token import validate_playback_token
 
-        token = authed.get(self.url(ready_clip.id), **NATIVE_HEADERS).json()["token"]
+        token = authed.post(self.url(ready_clip.id), **NATIVE_HEADERS).json()["token"]
 
         assert validate_playback_token(
             token, "/hls/00000000-0000-0000-0000-00000000000a/master.m3u8"
@@ -653,7 +653,7 @@ class TestNativeTokenTransport:
         """The default is unchanged. A bearer credential must not start
         appearing in response bodies for callers that did not ask for it —
         that is what HttpOnly is for."""
-        response = authed.get(self.url(ready_clip.id))
+        response = authed.post(self.url(ready_clip.id))
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
         assert "token" not in response.json()
@@ -681,7 +681,7 @@ class TestNativeTokenTransport:
         """Opting into the body must not remove the cookie. A native client
         is allowed to use either; giving it both keeps the web contract
         intact and makes the change additive rather than a replacement."""
-        response = authed.get(self.url(ready_clip.id), **NATIVE_HEADERS)
+        response = authed.post(self.url(ready_clip.id), **NATIVE_HEADERS)
 
         cookie = response.cookies["ef_hls_token"]
         assert cookie["httponly"] is True
@@ -696,7 +696,7 @@ class TestNativeTokenTransport:
         ready_clip.moderation_approved = False
         ready_clip.save(update_fields=["moderation_approved"])
 
-        response = authed.get(self.url(ready_clip.id), **NATIVE_HEADERS)
+        response = authed.post(self.url(ready_clip.id), **NATIVE_HEADERS)
 
         assert response.status_code == 403
         assert "token" not in response.json()
@@ -705,7 +705,7 @@ class TestNativeTokenTransport:
     def test_native_flag_does_not_bypass_authentication(self, ready_clip, token_secret, token_ttl):
         from rest_framework.test import APIClient
 
-        response = APIClient().get(self.url(ready_clip.id), **NATIVE_HEADERS)
+        response = APIClient().post(self.url(ready_clip.id), **NATIVE_HEADERS)
         assert response.status_code in (401, 403)
         assert "token" not in response.json()
 
@@ -786,7 +786,7 @@ class TestPlaybackTokenEntitlement:
         self, authed, author, field
     ):
         clip = self.make_clip(author, **{field: True})
-        response = authed.get(self.url(clip.id))
+        response = authed.post(self.url(clip.id))
         assert response.status_code == 403
         # The response must not tell an unauthorised caller which license
         # the clip carries.
@@ -804,7 +804,7 @@ class TestPlaybackTokenEntitlement:
         clip = self.make_clip(author, **{field: True})
         client = APIClient()
         client.force_authenticate(user=author)
-        assert client.get(self.url(clip.id)).status_code == 200
+        assert client.post(self.url(clip.id)).status_code == 200
 
     def test_interaction_does_not_launder_a_restricted_clip(
         self, authed, author, viewer
@@ -818,7 +818,7 @@ class TestPlaybackTokenEntitlement:
             clip=clip,
             interaction_type="view",
         )
-        assert authed.get(self.url(clip.id)).status_code == 403
+        assert authed.post(self.url(clip.id)).status_code == 403
 
     def test_in_app_share_grants_access_to_a_restricted_clip(
         self, authed, author, viewer
@@ -827,7 +827,7 @@ class TestPlaybackTokenEntitlement:
 
         clip = self.make_clip(author, is_noncommercial=True)
         ShareEvent.objects.create(sender=author, receiver=viewer, clip=clip)
-        assert authed.get(self.url(clip.id)).status_code == 200
+        assert authed.post(self.url(clip.id)).status_code == 200
 
     # --- the other access paths ----------------------------------------
 
@@ -836,7 +836,7 @@ class TestPlaybackTokenEntitlement:
     ):
         clip = self.make_clip(author)
         viewer.following.add(author)
-        assert authed.get(self.url(clip.id)).status_code == 200
+        assert authed.post(self.url(clip.id)).status_code == 200
 
     def test_unmoderated_clip_is_refused_even_to_its_owner(
         self, author, token_secret, token_ttl
@@ -847,7 +847,7 @@ class TestPlaybackTokenEntitlement:
         clip = self.make_clip(author, moderation_approved=False)
         client = APIClient()
         client.force_authenticate(user=author)
-        assert client.get(self.url(clip.id)).status_code == 403
+        assert client.post(self.url(clip.id)).status_code == 403
 
     def test_license_clean_clip_without_any_relationship_is_allowed(
         self, authed, author
@@ -862,7 +862,7 @@ class TestPlaybackTokenEntitlement:
         authors the user has no relationship with. Denying those would 403
         the primary playback path.
         """
-        assert authed.get(self.url(self.make_clip(author).id)).status_code == 200
+        assert authed.post(self.url(self.make_clip(author).id)).status_code == 200
 
     def test_license_restriction_still_applies_when_the_feed_itself_is_empty(
         self, authed, author
@@ -874,7 +874,7 @@ class TestPlaybackTokenEntitlement:
         decision, a cold/empty feed would make restricted clips playable.
         """
         clip = self.make_clip(author, is_noncommercial=True)
-        response = authed.get(self.url(clip.id))
+        response = authed.post(self.url(clip.id))
         assert response.status_code == 403
 
 
@@ -960,3 +960,66 @@ class TestResolveClipAccess:
         assert (
             is_license_restricted(self.clip(author, requires_share_alike=True)) is True
         )
+
+
+class TestPlaybackTokenMethodContract:
+    """The endpoint must be POST. GET was retired 2026-09-29.
+
+    Minting a credential must not be a safe method: a GET is CSRF-able (the
+    ef_hls_token cookie is SameSite=Lax), prefetchable by browsers and
+    proxies, and cacheable by intermediaries. Any of those mints tokens
+    nobody asked for and burns rate-limit budget.
+    """
+
+    @pytest.fixture
+    def viewer(self, django_user_model):
+        return django_user_model.objects.create_user(
+            username="viewer", email="viewer@example.com", password="pw-probe-123"
+        )
+
+    @pytest.fixture
+    def clip(self, viewer):
+        from backend.app.models import AudioClip
+
+        return AudioClip.objects.create(
+            creator=viewer,
+            title="probe",
+            moderation_approved=True,
+            status="ready",
+            hls_playlist_url="hls/00000000-0000-0000-0000-00000000000f/master.m3u8",
+        )
+
+    @pytest.fixture
+    def authed(self, viewer, token_secret, token_ttl):
+        from rest_framework.test import APIClient
+
+        client = APIClient()
+        client.force_authenticate(user=viewer)
+        return client
+
+    def test_get_is_rejected_and_explains_why(self, authed, clip):
+        response = authed.get(f"/media/playback-token/{clip.id}/")
+        assert response.status_code == 405
+        detail = response.json()["detail"]
+        # An old client needs to know to switch to POST, not to conclude the
+        # clip is unavailable.
+        assert "POST" in detail
+        # And it must not have leaked a token on the way out.
+        assert "ef_hls_token" not in response.cookies
+
+    def test_post_is_accepted(self, authed, clip):
+        response = authed.post(f"/media/playback-token/{clip.id}/")
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        assert "ef_hls_token" in response.cookies
+
+    def test_get_is_rejected_before_any_authorization_work(self, authed, clip):
+        """A 405 must not depend on the clip existing.
+
+        If GET fell through to the entitlement check, a 403 vs 405 would
+        leak whether a given clip UUID is real to an unauthorized caller.
+        """
+        import uuid
+
+        response = authed.get(f"/media/playback-token/{uuid.uuid4()}/")
+        assert response.status_code == 405

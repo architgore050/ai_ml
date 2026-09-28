@@ -1470,7 +1470,7 @@ header for native players.
 
 **Web (cookie):**
 
-1. **Before playing any clip**, call `GET /media/playback-token/<clip_id>/`
+1. **Before playing any clip**, call `POST /media/playback-token/<clip_id>/` (POST — a GET would be CSRF-able, prefetchable and cacheable)
    with `Authorization: Bearer <access>` and `credentials: 'include'`.
 2. The backend sets an `HttpOnly` cookie `ef_hls_token` via `Set-Cookie`.
    The frontend **cannot read this cookie** and must not try — it is

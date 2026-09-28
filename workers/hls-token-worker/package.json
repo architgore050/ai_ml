@@ -3,7 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "../../scripts/run-hls-worker-local.sh",
+    "dev:raw": "wrangler dev",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
     "deploy": "wrangler deploy"
   },
   "devDependencies": {

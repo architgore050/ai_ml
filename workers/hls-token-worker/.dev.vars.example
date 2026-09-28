@@ -1,0 +1,59 @@
+# Local dev secrets for `wrangler dev`.
+#
+# COPY THIS FILE TO .dev.vars AND FILL IN THE VALUES — .dev.vars is
+# gitignored and is read automatically by wrangler.
+#
+# You do not have to do that by hand. `scripts/run-hls-worker-local.sh`
+# (also what `npm run dev` invokes) generates .dev.vars from the repo's
+# .env.local, so the two sides cannot drift. Hand-editing is only needed
+# if you want to point the Worker at a non-local S3 endpoint.
+#
+# Why generating it matters: MEDIA_TOKEN_SECRET is shared with Django. If the
+# two values differ, every token is rejected and you get a wall of 403s with
+# no diagnostic — the Worker cannot tell "wrong secret" from "expired token".
+# The Worker now fails loudly at /healthz if MEDIA_TOKEN_SECRET is unset, but
+# it cannot detect a *mismatched* one; only a shared source can.
+
+# --- Token validation (MUST match Django's .env.local exactly) ---
+
+# HMAC signing key shared with backend/app/services/hls_token.py.
+# From .env.local: MEDIA_TOKEN_SECRET
+# Generate: python -c "import secrets; print(secrets.token_urlsafe(32))"
+MEDIA_TOKEN_SECRET=replace-me-with-the-value-from-env-local
+
+# Token lifetime in seconds. Declared for parity with the Django setting;
+# the token's own `exp` claim is what actually gates expiry.
+# From .env.local: MEDIA_TOKEN_TTL_SECONDS
+MEDIA_TOKEN_TTL_SECONDS=600
+
+# --- Local MinIO storage backend ---
+#
+# Setting MEDIA_S3_ENDPOINT is what selects the S3 backend over the R2
+# binding. Under `wrangler dev` the R2 binding is miniflare's local store
+# and is NOT connected to MinIO, so without this the Worker can gate
+# requests but can never serve one.
+#
+# These are the host-published MinIO ports from docker-compose.local.yml
+# (19000/19001), bound to 127.0.0.1. `wrangler dev` runs in the host
+# network namespace, so it reaches MinIO over loopback.
+
+# From .env.local: AWS_S3_ENDPOINT_URL is the IN-NETWORK address
+# (http://minio-local:9000) and is NOT reachable from the host. The Worker
+# needs the host-published port instead.
+MEDIA_S3_ENDPOINT=http://127.0.0.1:19000
+
+# From .env.local: AWS_STORAGE_BUCKET_NAME
+MEDIA_S3_BUCKET=echoflow-media
+
+# From .env.local: AWS_S3_REGION_NAME
+MEDIA_S3_REGION=auto
+
+# From .env.local: AWS_ACCESS_KEY_ID
+MEDIA_S3_ACCESS_KEY_ID=echoflow-dev
+
+# From .env.local: AWS_SECRET_ACCESS_KEY
+MEDIA_S3_SECRET_ACCESS_KEY=echoflow-dev-secret
+
+# NOTE: the R2 binding (wrangler.toml [[r2_buckets]] MEDIA_BUCKET) stays
+# declared and is harmlessly local-only while MEDIA_S3_ENDPOINT is set. In
+# production, MEDIA_S3_ENDPOINT is absent and the binding is used.

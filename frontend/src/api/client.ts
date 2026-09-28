@@ -178,13 +178,38 @@ export async function apiRequest<T = any>(
 // ---------------------------------------------------------------------------
 
 export const authAPI = {
-  async register(username: string, email: string, password: string): Promise<User> {
+  // SECURITY / DPDP §6: consent_accepted and terms_version are REQUIRED by
+  // RegisterSerializer (backend/app/serializers.py:435-436). Omitting them
+  // returns 400, so registration 400'd for every user until this was fixed
+  // (ISSUE-16). termsVersion comes from GET /legal/compliance/ (A1) so that
+  // appending a version to TERMS_VERSIONS does not break every client.
+  async register(
+    username: string,
+    email: string,
+    password: string,
+    termsVersion: string,
+  ): Promise<User> {
     const user = await apiRequest<User>("/auth/register/", {
       method: "POST",
       skipAuth: true,
-      body: JSON.stringify({ username, email, password }),
+      body: JSON.stringify({
+        username,
+        email,
+        password,
+        consent_accepted: true,
+        terms_version: termsVersion,
+      }),
     });
     return user;
+  },
+
+  async getCompliance(): Promise<{
+    terms_versions: string[];
+    current_terms_version: string;
+    privacy_version: string;
+    physical_address: string;
+  }> {
+    return apiRequest("/legal/compliance/", { method: "GET", skipAuth: true });
   },
 
   async login(username: string, password: string): Promise<AuthTokens> {

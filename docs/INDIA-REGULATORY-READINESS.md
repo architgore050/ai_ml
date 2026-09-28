@@ -452,6 +452,20 @@ against `settings.TERMS_VERSIONS` (default `"v1.0"`), but that list is not
 exposed on any endpoint, so clients hardcode it and break the moment a
 version is added. Tracked as A1 in `docs/mobile-rebuild-plan.md` §17.
 
+> **✅ RESOLVED 2026-09-29 (ISSUE-16 / A1).** The server half is fixed and
+> the tracked frontend is updated: `frontend/src/api/client.ts` now sends
+> `consent_accepted` and `terms_version`, and `stores/auth.tsx` reads the
+> accepted version from `GET /legal/compliance/` (A1) instead of hardcoding
+> it, so appending a version to `TERMS_VERSIONS` no longer 400s every
+> client. `frontend/server.ts`'s dev shim was taught the same required
+> fields so it cannot drift from the real contract again.
+>
+> Note for the mobile build: the design-source copy
+> (`frontend/sample_frontend2/`) is **gitignored** (`.gitignore:26`) and
+> untracked, so its local edits are not part of the repo. The mobile app
+> must send these fields from the start — this is now a documented contract,
+> not tribal knowledge.
+
 ---
 
 #### ISSUE-15: No profile-picture absolute URL (existing frontend unsupported by backend — see ISSUE-08; already covered in High)

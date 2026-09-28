@@ -323,11 +323,23 @@ class FeedClipSerializer(serializers.ModelSerializer):
         model = AudioClip
         fields = [
             'id', 'title', 'creator_name', 'category',
-            'hls_playlist_url', 'likes', 'shares', 'skips', 
-            'comment_count', 'is_liked', 'creator_id', 'cover_image'
+            'hls_playlist_url', 'likes', 'shares', 'skips',
+            'comment_count', 'is_liked', 'creator_id', 'cover_image',
+            # A2 (2026-09-29). Both were already columns on AudioClip and
+            # were simply never exposed, so the client had to derive them:
+            # `tags` drives the chip row, and without `duration_ms` the
+            # scrubber has to estimate progress from the player clock, which
+            # drifts and cannot survive a resume. Long-acknowledged gap —
+            # FRONTEND-REQUIREMENTS.md §11.11 and mobile-rebuild-plan.md B5.
+            #
+            # tags is a JSONField, so ModelSerializer renders it as-is; the
+            # DB default is [] and tasks.py writes ["instrumental"] for
+            # vocal-free clips, so the client never has to null-check.
+            'tags', 'duration_ms',
         ]
         read_only_fields = [
-            'likes', 'shares', 'skips', 'comment_count', 'hls_playlist_url', 'is_liked', 'cover_image'
+            'likes', 'shares', 'skips', 'comment_count', 'hls_playlist_url', 'is_liked', 'cover_image',
+            'tags', 'duration_ms',
         ]
 
     def get_hls_playlist_url(self, obj):
@@ -361,12 +373,19 @@ class ShareActionSerializer(serializers.Serializer):
 
 class CommentSerializer(serializers.ModelSerializer):
     author_username = serializers.CharField(source='author.username', read_only=True)
+    # A5 (2026-09-29). The username was exposed but not the id, so a client
+    # could render a comment author as text but could not make them
+    # tappable — there was no way to build a profile route from a comment
+    # list response. Exposing the bare id (not the whole profile) keeps the
+    # endpoint from becoming a user-enumeration surface: the app still has
+    # to call GET /profile/{id}/ for anything richer.
+    author_id = serializers.IntegerField(source='author.id', read_only=True)
     reply_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Comment
-        fields = ['id', 'clip', 'author_username', 'parent', 'text', 'reply_count', 'created_at']
-        read_only_fields = ['id', 'author_username', 'reply_count', 'created_at']
+        fields = ['id', 'clip', 'author_username', 'author_id', 'parent', 'text', 'reply_count', 'created_at']
+        read_only_fields = ['id', 'author_username', 'author_id', 'reply_count', 'created_at']
 
     def get_reply_count(self, obj):
         if not obj.parent_id:
@@ -452,9 +471,15 @@ class RegisterSerializer(serializers.ModelSerializer):
 
     def validate_terms_version(self, value):
         allowed = getattr(settings, 'TERMS_VERSIONS', ['v1.0'])
-        if value not in allowed:
+        # A1 (2026-09-29): settings now strips whitespace when parsing
+        # TERMS_VERSIONS, so a client sending "v1.0" is unaffected. This
+        # strip is belt-and-braces for the *inbound* side: a client that
+        # round-trips a value it read from elsewhere should not 400 over a
+        # trailing space. The error message lists the canonical strings so a
+        # client can correct itself from the 400 alone.
+        if value.strip() not in allowed:
             raise serializers.ValidationError(f"Invalid terms version. Allowed: {allowed}")
-        return value
+        return value.strip()
 
     def validate(self, data):
         # DECISION: If user provides dob and age < 18, require parent_email

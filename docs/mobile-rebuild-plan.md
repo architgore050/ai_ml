@@ -798,18 +798,18 @@ defect with an owner decision required.
 | # | Item | Impact | Priority |
 |---|---|---|---|
 | B4 | `finalize_upload` does not enqueue `process_audio_to_hls`; only `approve-moderation` triggers it, and **any authenticated user can call it on any clip** (unscoped `get_object_or_404`) — a moderation bypass and a compute-abuse vector | The app works around it by calling approve on its own clip | P1 |
-| B5 | `tags` and `duration_ms` absent from `FeedClipSerializer` | No tag chips; scrubber duration must be derived from the player | P1 |
-| B6 | `GET /legal/compliance/` omits `terms_versions`, `privacy_version`, `physical_address` | The app cannot submit a *valid* `terms_version` without hardcoding `v1.0`; IT Rules 2021 R4(4) requires the physical address | P1 |
-| B7 | `CommentSerializer` has no `author_id` | No tappable comment authors | P2 |
+| B5 ✅ | `tags` and `duration_ms` absent from `FeedClipSerializer` | No tag chips; scrubber duration must be derived from the player | P1 |
+| B6 ✅ | `GET /legal/compliance/` omits `terms_versions`, `privacy_version`, `physical_address` | The app cannot submit a *valid* `terms_version` without hardcoding `v1.0`; IT Rules 2021 R4(4) requires the physical address | P1 |
+| B7 ✅ | `CommentSerializer` has no `author_id` | No tappable comment authors | P2 |
 | B8 | `Report` has no `clip` FK and no `report_reason` enum | In-app reporting is decorative; IT Rules 2021 R3(1)(b) requires categorised handling | P2 |
-| B9 | `PlaybackTokenView` has no `throttle_scope` | Draws from the shared 1000/hr `user` bucket; a fast-scrolling feed mints ~1 token per clip | P2 |
+| B9 ✅ | `PlaybackTokenView` has no `throttle_scope` | Draws from the shared 1000/hr `user` bucket; a fast-scrolling feed mints ~1 token per clip | P2 |
 | — | Registration returns no tokens and no `id` | App must follow up with a second `login` call | by design |
 | — | RevenueCat: 6 defects (see D8) | Native IAP impossible | v1.2 |
 | — | `dob` is optional, so the DPDP §9 age gate is bypassed by omission; `minor_consent_verified` has no setter; no telemetry block for unverified minors | Compliance gap | P1 |
 | — | `POST /data-subject/erasure/` never deletes anything but reports "Data erasure process initiated" | False success message; DPDP §12 | P1 |
 | — | `ConsentAudit.ip_address` uses `REMOTE_ADDR` only, so behind nginx it records the proxy IP (`AuditLog` correctly falls back to `HTTP_X_FORWARDED_FOR`; `ConsentAudit` does not) | Weak DPDP §5(1) notice evidence | P2 |
-| — | **`PlaybackTokenView` performs no entitlement check at all** (B9 above is only the throttle). It verifies `IsAuthenticated`, clip exists, `moderation_approved`, and HLS present — nothing else. `FastFeedViewSet` filters `is_noncommercial=False, requires_share_alike=False`; this view applies neither | **Live licensing bypass** — any logged-in user can mint a token for an NC/SA clip the feed deliberately withholds. The intended check exists only as a comment that was deferred ("a future hardening pass can add explicit authorization here"), and the docstring additionally falsely claimed `ShareViewSet` handled share-link auth | **P0** |
-| — | `POST /auth/register/` returns **400 for the design-source frontend**: `sample_frontend2/src/api/client.ts:92` sends only `{email, username, password}`, but `RegisterSerializer` requires `consent_accepted` and `terms_version` (`serializers.py:435-436`). It also omits `dob` | Registration is non-functional, so ISSUE-01's DPDP §6 consent capture is unreachable in practice. Blocks mobile Phase 1 | **P0** |
+| — ✅ | **`PlaybackTokenView` performs no entitlement check at all** (B9 above is only the throttle). It verifies `IsAuthenticated`, clip exists, `moderation_approved`, and HLS present — nothing else. `FastFeedViewSet` filters `is_noncommercial=False, requires_share_alike=False`; this view applies neither | **Live licensing bypass** — any logged-in user can mint a token for an NC/SA clip the feed deliberately withholds. The intended check exists only as a comment that was deferred ("a future hardening pass can add explicit authorization here"), and the docstring additionally falsely claimed `ShareViewSet` handled share-link auth | **P0** |
+| — ✅ | `POST /auth/register/` returns **400 for the design-source frontend**: `sample_frontend2/src/api/client.ts:92` sends only `{email, username, password}`, but `RegisterSerializer` requires `consent_accepted` and `terms_version` (`serializers.py:435-436`). It also omits `dob` | Registration is non-functional, so ISSUE-01's DPDP §6 consent capture is unreachable in practice. Blocks mobile Phase 1 | **P0** |
 
 ---
 

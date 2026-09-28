@@ -27,6 +27,27 @@ class ComplianceContactView(generics.GenericAPIView):
                 'name': getattr(settings, 'NODAL_CONTACT_NAME', 'Not configured'),
                 'email': getattr(settings, 'NODAL_CONTACT_EMAIL', ''),
             },
+            # A1 (2026-09-29): the registration contract has to be
+            # discoverable. RegisterSerializer.terms_version is required and
+            # validated against settings.TERMS_VERSIONS, so a client that
+            # cannot read that list has to hardcode a version and will 400
+            # the day a new one is appended. Publishing it here — on an
+            # AllowAny endpoint that already exists — is what removes the
+            # guesswork. IT Rules 2021 R4(4) also requires the terms/privacy
+            # text to be reachable without an account, so the version list
+            # belongs next to the officer contacts rather than behind auth.
+            'terms_versions': list(getattr(settings, 'TERMS_VERSIONS', ['v1.0'])),
+            'current_terms_version': (
+                # The last entry is the one in force, so appending a version
+                # to TERMS_VERSIONS is the whole deploy step — no second
+                # variable to forget to update.
+                list(getattr(settings, 'TERMS_VERSIONS', ['v1.0']))[-1]
+            ),
+            'privacy_version': getattr(settings, 'PRIVACY_VERSION', 'v1.0'),
+            # Consumer Protection (E-Commerce) Rules 2020 requires a
+            # physical address on the site. Previously read into settings
+            # but served nowhere, so it was configured-and-invisible.
+            'physical_address': getattr(settings, 'PHYSICAL_ADDRESS', ''),
         })
 
 from rest_framework import status

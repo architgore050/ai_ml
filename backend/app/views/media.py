@@ -36,6 +36,7 @@ import logging
 from django.conf import settings
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from ..models import AudioClip
@@ -163,6 +164,14 @@ class PlaybackTokenView(APIView):
     """
 
     permission_classes = [IsAuthenticated]
+    # A3 (2026-09-29). This was previously absent, and ScopedRateThrottle
+    # treats a missing scope as "allow everything" — so the view inherited
+    # the shared `user` (1000/hour) bucket via UserRateThrottle. A user
+    # scrolling a feed mints ~1 token per clip and shares that budget with
+    # every other authenticated endpoint. The rate lives in
+    # DEFAULT_THROTTLE_RATES as 'playback_token'.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'playback_token'
 
     def get(self, request, clip_id):
         """Reject GET explicitly rather than 405-ing with no explanation.

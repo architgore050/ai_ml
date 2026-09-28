@@ -1766,10 +1766,22 @@ For the implementing agent: every endpoint, every response shape.
 
 ```
 AUTH
-  POST /auth/register/         {username, password, email}                  → 201 User (no tokens)
+  POST /auth/register/         {username, password, email,                   → 201 User (no tokens)
+                                consent_accepted, terms_version}             | 400 {<field>: [<err>]}
   POST /auth/login/            {username, password}                         → 200 {access, refresh}
   POST /auth/token/refresh/    {refresh}                                    → 200 {access, refresh (new)}
   POST /auth/logout/           {refresh}                                    → 200/400 {detail}
+  GET  /legal/compliance/      (no auth)                                    → 200 {compliance_officer,
+                                                                          grievance_officer, nodal_contact,
+                                                                          terms_versions: [str],
+                                                                          current_terms_version, privacy_version,
+                                                                          physical_address}
+
+  # A1 (2026-09-29): consent_accepted and terms_version are REQUIRED, and
+  # terms_version is validated against the server's list. Read
+  # current_terms_version from /legal/compliance/ rather than hardcoding —
+  # appending a version to TERMS_VERSIONS otherwise 400s every client.
+  # dob is still optional; making it required is tracked separately (age gate).
 
 FEED
   GET  /feed/                                                                → 200 {next, queue_health, results: FeedClip[]}
@@ -1853,10 +1865,16 @@ In order, to fix the broken pieces and close the most user-visible gaps:
     Settings rows without backend, fake upload processing stages,
     `clip.tags` rendering on cards.
 11. **Backend additions (separate PRs)** —
-    - Add `tags` to `FeedClipSerializer.fields`.
-    - Add `author_id` (or author profile) to `CommentSerializer`.
+    - ~~Add `tags` to `FeedClipSerializer.fields`.~~ **DONE 2026-09-29** (A2).
+    - ~~Add `author_id` to `CommentSerializer`.~~ **DONE 2026-09-29** (A5).
+      Exposes the bare id, not the profile — the client still calls
+      `GET /profile/{id}/` for anything richer.
     - Add a profile-picture URL helper that returns an absolute URL
       (signed if necessary).
+    - ~~Add `duration_ms` to `FeedClipSerializer.fields`.~~ **DONE
+      2026-09-29** (A2), alongside `tags`.
+    - ~~Publish `terms_versions` on `GET /legal/compliance/`.~~ **DONE
+      2026-09-29** (A1), with `privacy_version` and `physical_address`.
 
 ---
 

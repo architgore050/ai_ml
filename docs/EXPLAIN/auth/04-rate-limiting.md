@@ -38,6 +38,13 @@ REST_FRAMEWORK = {
         'grievance':          '10/hour',
         'data_subject':        5/hour,
         'subscription_sync':   '10/hour',
+        # A3 (2026-09-29): POST /media/playback-token/<id>/. The view had
+        # NO throttle_scope, and ScopedRateThrottle allows everything when a
+        # view declares none — so the endpoint was silently unthrottled and
+        # fell through to the shared `user` (1000/hour) bucket, which a
+        # scrolling feed burns at ~1 token per clip. Keyed on the
+        # authenticated user, so it is NAT-safe.
+        'playback_token':      '300/min',
     },
 }
 ```
@@ -158,6 +165,7 @@ Retry-After: 3600  (on 429)
 | `/share/inbox/` | user | `share_poll` | 1000/hr | user | Low (30s polling) |
 | `/feed/` | user | `user` | 1000/hr | user | Medium — **shared** with every other authed call |
 | `/legal/`, `/grievance/`, `/data-subject/` | mixed | `legal` / `grievance` / `data_subject` | 30/hr, 10/hr, 5/hr | IP | Low |
+| `/media/playback-token/<id>/` | user | `playback_token` | 300/min | user | Low (was **unthrottled** — see A3) |
 
 > `/legal/`, `/grievance/` and `/data-subject/` keep IP-keyed limits by
 > design: they are user-initiated, low-frequency and low-volume, so sharing

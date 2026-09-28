@@ -549,7 +549,24 @@ app.get("/api/media/audio/:clip_id.wav", (req: Request, res: Response) => {
 
 // 1. AUTH
 app.post("/auth/register/", (req: Request, res: Response) => {
-  const { username, password, email } = req.body;
+  // consent_accepted / terms_version are required by the real
+  // RegisterSerializer (DPDP §6). Accept and record them so this shim does
+  // not diverge from the backend contract the real client relies on.
+  const { username, password, email, consent_accepted, terms_version } = req.body;
+
+  if (consent_accepted !== true) {
+    res.status(400).json({
+      consent_accepted: ["Consent is required to register."],
+    });
+    return;
+  }
+
+  if (!terms_version) {
+    res.status(400).json({
+      terms_version: ["This field is required."],
+    });
+    return;
+  }
 
   if (!username || !password || !email) {
     res.status(400).json({

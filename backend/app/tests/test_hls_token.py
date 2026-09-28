@@ -17,6 +17,7 @@ import json
 import time
 
 import pytest
+from redis.exceptions import RedisError
 
 
 pytestmark = pytest.mark.django_db
@@ -739,9 +740,18 @@ class TestPlaybackTokenEntitlement:
         """
         from django.core.cache import cache
 
-        cache.clear()
+        # Tolerate Redis being absent or wedged. The entitlement assertions
+        # do not depend on the cache, so a Redis outage should not take
+        # them down with it.
+        try:
+            cache.clear()
+        except RedisError:
+            pytest.skip("redis unavailable in this environment")
         yield
-        cache.clear()
+        try:
+            cache.clear()
+        except RedisError:
+            pass
 
     @pytest.fixture
     def viewer(self, django_user_model):
@@ -1023,3 +1033,67 @@ class TestPlaybackTokenMethodContract:
 
         response = authed.get(f"/media/playback-token/{uuid.uuid4()}/")
         assert response.status_code == 405
+
+
+class TestPlaybackTokenThrottleScope:
+    """A3: the view must declare a scope, or ScopedRateThrottle allows all.
+
+    This is the failure mode AGENTS.md warns about: ScopedRateThrottle reads
+    its scope from the *view* at request time and allows everything when the
+    view does not declare one. The class was listed but had no scope, so the
+    endpoint was silently unthrottled and drew from the shared user bucket.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_throttle_budget(self):
+        """Real Redis backs the throttle cache and conftest.py does not clear
+        it, so budgets accumulate across the suite and persist between runs.
+        See the same fixture in TestPlaybackTokenEntitlement."""
+        from django.core.cache import cache
+
+        cache.clear()
+        yield
+        cache.clear()
+
+    def test_the_view_declares_a_scope(self):
+        from backend.app.views.media import PlaybackTokenView
+
+        assert PlaybackTokenView.throttle_scope == 'playback_token'
+
+    def test_the_scope_has_a_configured_rate(self, settings):
+        from backend.app.views.media import PlaybackTokenView
+
+        rates = settings.REST_FRAMEWORK['DEFAULT_THROTTLE_RATES']
+        assert PlaybackTokenView.throttle_scope in rates
+
+    def test_the_endpoint_is_actually_rate_limited(
+        self, django_user_model, token_secret, token_ttl, settings
+    ):
+        from rest_framework.test import APIClient
+        from backend.app.models import AudioClip
+
+        settings.REST_FRAMEWORK['DEFAULT_THROTTLE_RATES']['playback_token'] = '3/min'
+        user = django_user_model.objects.create_user(
+            username="throttled", email="throttled@example.com", password="pw-probe-123"
+        )
+        clip = AudioClip.objects.create(
+            creator=user,
+            title="probe",
+            moderation_approved=True,
+            status="ready",
+            hls_playlist_url="hls/00000000-0000-0000-0000-00000000000e/master.m3u8",
+        )
+        client = APIClient()
+        client.force_authenticate(user=user)
+
+        codes = []
+        for _ in range(6):
+            try:
+                codes.append(
+                    client.post(f"/media/playback-token/{clip.id}/").status_code
+                )
+            except RedisError as exc:
+                pytest.skip(f"redis unavailable in this environment: {exc}")
+
+        # Without a scope every one of these would be 200.
+        assert 429 in codes, f"endpoint was not throttled: {codes}"

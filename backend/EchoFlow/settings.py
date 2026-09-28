@@ -669,6 +669,16 @@ REST_FRAMEWORK = {
         'grievance': '10/hour',   # GrievanceCreateView (issue-03)
         'data_subject': '5/hour', # DataSubjectAccessView / Erasure (issue-06)
         'subscription_sync': '10/hour',  # manual RevenueCat sync trigger
+        # A3 (2026-09-29): PlaybackTokenView previously declared no
+        # throttle_scope, so ScopedRateThrottle silently allowed everything
+        # and the endpoint fell through to the shared `user` (1000/hour)
+        # bucket — which a scrolling feed burns at ~1 token per clip.
+        # 300/min is sized for a fast scroll (a clip every ~200ms is far
+        # beyond human play rate) while leaving headroom for a user
+        # flipping through a long feed plus retries. Scoped rather than
+        # IP-keyed: the caller is authenticated here, so keying on the
+        # verified principal is both stricter and NAT-safe.
+        'playback_token': '300/min',
     },
 }
 # lets set lifetimes for tokens
@@ -753,7 +763,23 @@ if not DEBUG:
 
 
 # DECISION: Regulatory settings (TERMS_VERSIONS, compliance/grievance/nodal contacts) live in settings.py rather than a DB table so they are env-driven and change without migration. Tradeoff: no audit trail of officer changes (operational, not regulatory requirement); DB table would require migration per change. See models.py Grievance/AuditLog for DB-level audit of grievances and identity.
-TERMS_VERSIONS = os.environ.get('TERMS_VERSIONS', 'v1.0').split(',')
+TERMS_VERSIONS = [
+    v.strip() for v in os.environ.get('TERMS_VERSIONS', 'v1.0').split(',') if v.strip()
+]
+# DECISION: A1 (2026-09-29) — these are now published on
+# GET /legal/compliance/ so clients do not have to hardcode them. The
+# mobile app was previously forced to send "v1.0" and would 400 the moment
+# a version was appended to TERMS_VERSIONS, because
+# RegisterSerializer.validate_terms_version rejects anything not in this
+# list. Publishing the list is what makes the registration contract
+# discoverable instead of tribal knowledge.
+#
+# Strips whitespace and drops empties, because a trailing comma or a stray
+# space in a .env line would otherwise register as a valid version string
+# that no client would ever send. `.strip()` above is the fix; previously
+# "v1.0,v1.1" produced ['v1.0', 'v1.1'] but "v1.0, v1.1" produced
+# ['v1.0', ' v1.1'] — the second silently unusable, so the mismatch was
+# invisible until a user hit an inexplicable 400.
 COMPLIANCE_OFFICER_NAME = os.environ.get('COMPLIANCE_OFFICER_NAME', 'EchoFlow Compliance Officer')
 COMPLIANCE_OFFICER_EMAIL = os.environ.get('COMPLIANCE_OFFICER_EMAIL', 'compliance@echoflow.in')
 GRIEVANCE_OFFICER_NAME = os.environ.get('GRIEVANCE_OFFICER_NAME', 'EchoFlow Grievance Officer')
@@ -761,6 +787,11 @@ GRIEVANCE_OFFICER_EMAIL = os.environ.get('GRIEVANCE_OFFICER_EMAIL', 'grievance@e
 NODAL_CONTACT_NAME = os.environ.get('NODAL_CONTACT_NAME', 'EchoFlow Nodal Contact')
 NODAL_CONTACT_EMAIL = os.environ.get('NODAL_CONTACT_EMAIL', 'nodal@echoflow.in')
 PHYSICAL_ADDRESS = os.environ.get('PHYSICAL_ADDRESS', '')
+# Which policy/terms text is currently in force. Distinct from the list of
+# everything ever published: a client must show the current one at
+# registration, while the full list is needed to interpret historical
+# ConsentAudit rows.
+PRIVACY_VERSION = os.environ.get('PRIVACY_VERSION', 'v1.0')
 
 # --- RevenueCat (Pro subscription management) ---
 # SECURE: REVENUECAT_SECRET_KEY is backend-only. Never expose this to the

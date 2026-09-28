@@ -363,6 +363,47 @@ class FeedClipSerializer(serializers.ModelSerializer):
             user=request.user, clip=obj, interaction_type='like', is_active=True
         ).exists()
 
+class PublicClipSerializer(serializers.ModelSerializer):
+    """Metadata for a shared clip, visible without authentication.
+
+    A4 (2026-09-29). Deliberately NOT ``FeedClipSerializer``: that one is the
+    signed-in feed contract and carries engagement counters, ``is_liked`` (a
+    per-viewer value that is meaningless with no viewer), and
+    ``hls_playlist_url``. The public view previously reused it, so an
+    unauthenticated caller could read a clip's like/skip/share/comment
+    counts and the per-viewer field.
+
+    Omitted on purpose:
+
+    * ``hls_playlist_url`` — the media is token-gated, so publishing the URL
+      to an unauthenticated caller leaks nothing useful and invites the
+      "just share the HLS link" pattern that a previous frontend already
+      implemented. Playback is authorised separately, on an explicit play
+      intent, via ``POST /clips/{id}/play/``.
+    * ``likes`` / ``shares`` / ``skips`` / ``comment_count`` — engagement
+      data is not needed to render a share card, and it is the kind of
+      figure that is scraped.
+    * ``is_liked`` — viewer-specific; always false without a session.
+    * ``creator_id`` — the display name is enough to attribute the clip, and
+      omitting the id keeps this from being a user-id oracle.
+    """
+
+    creator_name = serializers.CharField(source="creator.username", read_only=True)
+
+    class Meta:
+        model = AudioClip
+        fields = ["id", "title", "creator_name", "category", "duration_ms", "tags", "cover_image"]
+        read_only_fields = fields
+
+    def get_cover_image(self, obj):
+        if not obj.cover_image:
+            return None
+        request = self.context.get("request")
+        if request:
+            return request.build_absolute_uri(obj.cover_image.url)
+        return None
+
+
 class SkipActionSerializer(serializers.Serializer):
     listen_duration_ms = serializers.IntegerField(min_value=0, required=True)
     reel_position_ms = serializers.IntegerField(min_value=0, required=True)

@@ -450,6 +450,21 @@ This aligns the frontend with the backend's `OwnProfileSerializer` contract.
 2. ~~Update `ShareModal` to generate `https://<host>/public/clips/{id}` (or the HLS URL directly if public playback is the goal). Given that HLS playback URLs are already absolute HTTPS (`media_urls.get_hls_playback_url`), copying the HLS URL (`clip.hls_playlist_url`) is the fastest fix~~ — **WITHDRAWN 2026-09-29.** This step was written when HLS was public-read. Since `2026-09-28` HLS is token-gated, so the "fastest fix" produces a link that 403s for every recipient. The replacement is a share-token exchange (`POST /public/clips/{id}/play/`) tracked as A4 in `docs/mobile-rebuild-plan.md` §17.
 3. Add a route `/clip/{id}` that redirects to `/public/clips/{id}` or embeds the player. Note there is currently **no deployed web frontend** — nginx serves only the Django API (`server_name _` → `proxy_pass http://django_backend`) and `frontend/` contains samples only. Until a web app exists, the share target should be a content-negotiated OG page (for WhatsApp/Slack unfurls) rather than an embedded player.
 
+> **✅ RESOLVED 2026-09-29.** The share link works in both directions now.
+> `POST /clips/{id}/share-link/` mints a 30-day token, `GET /clips/{id}/public/`
+> serves an Open Graph card (JSON for API clients), and
+> `POST /clips/{id}/play/` exchanges the share token for an ordinary 600s
+> media token on an explicit play intent. Neither branch of
+> `ShareModal.tsx:24` is broken any more.
+>
+> A share token is an ordinary media token with a longer TTL, not a new token
+> type — see `docs/EXPLAIN/decisions/2026-09-29-share-pipeline.md` for why the
+> separate-token design was dropped after reading the payload schema.
+>
+> **Residual:** there is no per-link revocation (no row to revoke); a takedown
+> takes effect within the token's 30-day life, not immediately. The
+> app-vs-web landing route is deferred until `app.echoflow.in` exists.
+
 ---
 
 ### 2.3 Medium Priority (should fix post-launch; no launch-blocker but serious)

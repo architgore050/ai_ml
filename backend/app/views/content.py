@@ -3,23 +3,90 @@
 Stage 2 (relational-to-event-driven plan): the transaction.on_commit
 dispatch into Celery is owned by services.uploads.finalize_upload.
 """
+import logging
+
+from django.conf import settings
+from django.http import HttpResponse
+from django.utils.html import escape
 from rest_framework import viewsets, permissions, parsers, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
+from ..media_urls import get_hls_playback_url
 from ..models import AudioClip, Report, TakedownRequest
+from ..serializers import AudioUploadSerializer, FeedClipSerializer, PublicClipSerializer
 from ..services import content_moderation as moderation_svc
 from ..services import uploads as uploads_svc
+from ..services.hls_token import COOKIE_NAME, generate_playback_token, verify_token
 
-from ..models import AudioClip
-from ..serializers import AudioUploadSerializer, FeedClipSerializer
-from ..services import uploads as uploads_svc
+logger = logging.getLogger(__name__)
+
+
+def _wants_json(request) -> bool:
+    """True when the caller is an API client rather than a browser/unfurl.
+
+    Deliberately conservative: HTML is served only when the client did not
+    ask for JSON. An unfurl sends no ``Accept: application/json``, so it gets
+    the card; a mobile app or fetch() sends one and gets JSON.
+    """
+    accept = (request.META.get("HTTP_ACCEPT") or "").lower()
+    if "application/json" in accept:
+        return True
+    # A browser navigation to the URL directly.
+    if "text/html" in accept or "application/xhtml+xml" in accept:
+        return False
+    # No Accept at all (curl default) — treat as a machine.
+    return not accept
+
+
+def _render_share_card(data: dict, request) -> str:
+    """Minimal Open Graph page for a shared clip.
+
+    A4 (2026-09-29). Not a web app — just enough for a chat client to render
+    a legible card. Every interpolated value goes through ``escape``: the
+    title is user-supplied free text and this is an unauthenticated page, so
+    an unescaped title would be stored XSS against whoever opens the link.
+    """
+    title = escape(str(data.get("title") or "EchoFlow clip"))
+    creator = escape(str(data.get("creator_name") or ""))
+    description = escape(
+        f"{data.get('category') or 'audio'} clip by {creator}".strip()
+    )
+    # A relative cover path is useless to a remote unfurler, so only emit the
+    # tag when we have an absolute URL.
+    image = data.get("cover_image")
+    image_tag = (
+        f'<meta property="og:image" content="{escape(str(image))}">' if image else ""
+    )
+    url = request.build_absolute_uri(request.path)
+    return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>{title}</title>
+<meta name="description" content="{description}">
+<meta property="og:type" content="music.song">
+<meta property="og:title" content="{title}">
+<meta property="og:description" content="{description}">
+<meta property="og:url" content="{escape(url)}">
+{image_tag}
+<meta name="robots" content="noindex">
+</head><body>
+<h1>{title}</h1>
+<p>{description}</p>
+</body></html>"""
 
 
 class AudioUploadViewSet(viewsets.ModelViewSet):
     # SECURITY: 20 uploads/hour/user prevents storage-abuse DoS. Each upload
     # is up to 100 MB (AudioUploadSerializer.MAX_SIZE), so default DRF
     # 1000/hour/user would let one account push 100 GB/hour.
+    #
+    # A4 (2026-09-29): this scope used to apply to *every* action on the
+    # viewset, which was wrong for all of them. A shared clip's landing page
+    # was capped at 20 views/hour (a link opened in a chat client, or a link
+    # preview, 429s), and the play exchange was throttled as though it were an
+    # upload. Per-action scopes now dispatch below, matching the pattern in
+    # ClipInteractionViewSet and ShareViewSet.
     throttle_scope = 'upload'
     queryset = AudioClip.objects.all()
     serializer_class = AudioUploadSerializer
@@ -50,6 +117,33 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
         # For moderation endpoints, operators may need broader access.
         # We keep user-scoped by default but allow override for actions.
         return AudioClip.objects.filter(creator=self.request.user)
+
+    @property
+    def throttle_scope(self):
+        """Route each action to a rate that matches what it actually does.
+
+        Before A4 every action inherited ``upload`` (20/hour), which is the
+        right number for pushing 100 MB files and the wrong number for
+        everything else. A shared link's landing page returning 429 after 20
+        views is a broken share feature, and it fails in exactly the way that
+        is hardest to notice: the link works for you, then stops working.
+        """
+        return {
+            'public': 'clip_public',
+            'play': 'clip_play',
+            'share-link': 'share_link',
+            'report': 'clip_report',
+            'approve-moderation': 'clip_approve',
+        }.get(self.action, 'upload')
+
+    def get_throttles(self):
+        # Actions with their own scope need ScopedRateThrottle; `create` and
+        # the plain CRUD actions use the viewset's inherited classes.
+        from rest_framework.throttling import ScopedRateThrottle
+
+        if self.action in ('public', 'play', 'share-link', 'report', 'approve-moderation'):
+            return [ScopedRateThrottle()]
+        return super().get_throttles()
 
     def create(self, request, *args, **kwargs):
         # Pro gating: check daily upload limit for free users BEFORE
@@ -233,10 +327,156 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'], url_path='public', permission_classes=[permissions.AllowAny])
     def public_view(self, request, pk=None):
-        """Public clip view endpoint — ISSUE-14. Only shows approved clips."""
-        # SECURITY / REGULATORY: Filter moderation_approved for public access.
-        # DECISION: Using queryset filter rather than exception — avoids
-        # leaking clip existence via 404 vs 403 distinction.
-        clip = get_object_or_404(AudioClip.objects.filter(moderation_approved=True), pk=pk)
-        serializer = FeedClipSerializer(clip, context={'request': request})
-        return Response(serializer.data)
+        """Shared-clip metadata. Grants no playback credential.
+
+        A4 (2026-09-29). This is the landing surface for a shared link, and it
+        is content-negotiated:
+
+        * ``Accept: application/json`` (or a fetch/XHR) -> reduced JSON
+          metadata, for the app.
+        * anything else (a browser, a chat client unfurling the link) -> a
+          small HTML page carrying Open Graph tags.
+
+        The HTML branch is the reason this works today. There is no deployed
+        web frontend — nginx is ``server_name _`` proxying only to Django, and
+        ``frontend/`` holds samples — so a shared link has no page to land on
+        and the only thing that renders a bare URL is a link unfurl. OG tags
+        are what make the share legible in WhatsApp/Slack/X without building
+        a site first.
+
+        SECURITY: the queryset filter keeps unapproved clips invisible here.
+        Filtering in the queryset rather than raising a 403 deliberately —
+        a 404/403 split would confirm whether a given UUID exists to someone
+        with no entitlement to ask.
+        """
+        clip = get_object_or_404(
+            AudioClip.objects.filter(moderation_approved=True), pk=pk
+        )
+        data = PublicClipSerializer(clip, context={'request': request}).data
+
+        if _wants_json(request):
+            return Response(data)
+        return HttpResponse(_render_share_card(data, request), content_type="text/html")
+
+    @action(detail=True, methods=['post'], url_path='share-link',
+            permission_classes=[permissions.IsAuthenticated])
+    def share_link(self, request, pk=None):
+        """Mint a long-lived share link for a clip (A4).
+
+        Returns a URL carrying ``?s=<token>``. The token is an ordinary HLS
+        playback token for this clip, minted with
+        ``SHARE_TOKEN_TTL_SECONDS`` instead of the 600s media TTL.
+
+        DECISION: no separate share token type, no ``ShareLink`` table, no
+        second secret. A share token is simply a media token with a longer
+        life, and the "exchange" step collapses because
+        ``POST /clips/{id}/play/`` re-mints a short-lived one on the
+        recipient's play intent. Those extra parts bought revocation and a
+        separate namespace, and cost a second code path that must stay in
+        step with the Worker and nginx validators. The trade-off taken instead
+        is that a share token is not individually revocable — bounded by
+        ``exp``, which is why that is 30 days and not forever.
+        """
+        if request.user.is_staff:
+            clip = get_object_or_404(AudioClip, pk=pk)
+        else:
+            clip = get_object_or_404(
+                AudioClip.objects.filter(creator=request.user), pk=pk
+            )
+
+        clip_key = uploads_svc.clip_storage_key(clip)
+        if clip_key is None:
+            # Nothing has been transcoded, so there is no media to grant.
+            return Response(
+                {"detail": "Clip media is not ready."}, status=status.HTTP_409_CONFLICT
+            )
+
+        token = generate_playback_token(
+            user_id=clip.creator_id,
+            clip_key=clip_key,
+            ttl=settings.SHARE_TOKEN_TTL_SECONDS,
+        )
+        relative = f"/clips/{clip.id}/public/?s={token}"
+        base = getattr(settings, "PUBLIC_APP_BASE_URL", "")
+        return Response({
+            "clip_id": clip.id,
+            # Absolute only when a base is configured. Guessing a host here
+            # would emit a plausible-but-wrong link that a client would not
+            # second-guess.
+            "url": f"{base}{relative}" if base else None,
+            "path": relative,
+            "token": token,
+            "expires_in": settings.SHARE_TOKEN_TTL_SECONDS,
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'], url_path='play', permission_classes=[permissions.AllowAny])
+    def play_shared(self, request, pk=None):
+        """Exchange a share token for a short-lived media token (A4).
+
+        This is the "click play" gate the user asked for: nothing is issued
+        until an explicit play intent, so opening a shared link mints no
+        credential at all.
+
+        Authorization is two checks, and the second is the one that matters:
+
+        1. ``verify_token`` proves the ``?s=`` value is one we signed and has
+           not expired.
+        2. ``payload["c"]`` must equal this clip's storage key. Without that,
+           any valid token would unlock any clip — a recipient could take the
+           ``?s=`` from the link they were sent and swap the clip id in the
+           path. This is the "is this actually a reel which was shared to the
+           user" check.
+
+        The caller is anonymous and gets a short TTL, so the long-lived share
+        token never has to be attached to a player.
+        """
+        clip = get_object_or_404(
+            AudioClip.objects.filter(moderation_approved=True), pk=pk
+        )
+        clip_key = uploads_svc.clip_storage_key(clip)
+        if clip_key is None:
+            return Response(
+                {"detail": "Clip media is not ready."}, status=status.HTTP_409_CONFLICT
+            )
+
+        token = request.data.get('s') or request.query_params.get('s')
+        payload = verify_token(token) if token else None
+        if payload is None:
+            return Response(
+                {"detail": "A valid share link is required."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if payload.get("c") != clip_key:
+            # Deliberately the same message as an invalid token. Distinguishing
+            # "expired/invalid" from "valid, but for a different clip" would
+            # confirm that some other clip exists.
+            logger.warning(
+                "share play refused: token scope mismatch clip=%s scope=%s",
+                clip.id, payload.get("c"),
+            )
+            return Response(
+                {"detail": "A valid share link is required."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Anonymous recipient. `u` is unused by every validator (Worker and
+        # nginx both check HMAC, v, exp and the c-prefix only), so 0 is a safe
+        # sentinel rather than a fabricated user id.
+        media_token = generate_playback_token(
+            user_id=0, clip_key=clip_key
+        )
+        response = Response({
+            "status": "ok",
+            "token": media_token,
+            "hls_playlist_url": get_hls_playback_url(clip.hls_playlist_url),
+        })
+        response.set_cookie(
+            key=COOKIE_NAME,
+            value=media_token,
+            max_age=settings.MEDIA_TOKEN_TTL_SECONDS,
+            httponly=True,
+            secure=True,
+            samesite="Lax",
+            path="/hls/",
+        )
+        return response

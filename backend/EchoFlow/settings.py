@@ -613,6 +613,28 @@ HLS_URL_STYLE = os.getenv("HLS_URL_STYLE") or (
 #   for media.echoflow.in) — see the note above.
 MEDIA_TOKEN_SECRET = os.getenv("MEDIA_TOKEN_SECRET", "")
 MEDIA_TOKEN_TTL_SECONDS = int(os.getenv("MEDIA_TOKEN_TTL_SECONDS", "600"))
+# A4 (2026-09-29) — share tokens. A shared link must survive being passed
+# around, so it lives for days; MEDIA_TOKEN_TTL_SECONDS (600s) is sized for
+# a stream currently playing and is deliberately NOT reused here.
+#
+# 30 days is a deliberate middle ground, not "forever". `exp` is the only
+# automatic revocation mechanism this design has: when a clip is un-approved
+# (an ISSUE-04 takedown) or a share is regretted, nothing else invalidates a
+# token already in someone's hand. At 600s that self-heals in minutes; at
+# forever it never does. 30 days keeps a shared link useful while bounding
+# the exposure window, at no extra implementation cost.
+SHARE_TOKEN_TTL_SECONDS = int(os.getenv("SHARE_TOKEN_TTL_SECONDS", str(30 * 24 * 3600)))
+# PUBLIC_APP_BASE_URL: the origin that shared clip links point at. Kept
+# separate from PUBLIC_HLS_ENDPOINT_URL because that one is the *media*
+# origin and is deliberately bucket-less/edge-shaped; prepending an API or
+# media base to a share link is a bug the AGENTS.md notes have already been
+# made in two frontends.
+#
+# If unset, the share-link endpoint returns a relative path plus the raw
+# token rather than inventing an absolute URL. Emitting a plausible-looking
+# but wrong absolute link is worse than emitting an obviously incomplete one,
+# because the client would not check.
+PUBLIC_APP_BASE_URL = (os.getenv("PUBLIC_APP_BASE_URL") or "").rstrip("/")
 MEDIA_TOKEN_COOKIE_DOMAIN = os.getenv("MEDIA_TOKEN_COOKIE_DOMAIN", "")
 AUTH_USER_MODEL = 'app.User' # for Custom user model
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
@@ -678,7 +700,22 @@ REST_FRAMEWORK = {
         # flipping through a long feed plus retries. Scoped rather than
         # IP-keyed: the caller is authenticated here, so keying on the
         # verified principal is both stricter and NAT-safe.
-        'playback_token': '300/min',
+        'playback_token':      '300/min',
+        # A4 (2026-09-29). These five actions previously inherited 'upload'
+        # (20/hour) because the viewset declared one scope for everything.
+        # A shared link's landing page 429ing after 20 views is a share
+        # feature that appears to work and then silently stops.
+        #
+        # 'clip_public' is generous and IP-keyed: it is unauthenticated, and
+        # a chat client re-fetches a preview. 'clip_play' is 60/min because a
+        # legitimate recipient presses play once; the cap exists to stop a
+        # harvested share link being used as a token-minting oracle.
+        # 'clip_approve' is tight — it triggers HLS encoding, i.e. compute.
+        'clip_public':         '120/min',
+        'clip_play':           '60/min',
+        'share_link':          '60/hour',
+        'clip_report':         '20/hour',
+        'clip_approve':        '20/hour',
     },
 }
 # lets set lifetimes for tokens

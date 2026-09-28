@@ -42,6 +42,7 @@ from rest_framework.views import APIView
 from ..models import AudioClip
 from ..services.entitlements import resolve_clip_access
 from ..services.hls_token import generate_playback_token, COOKIE_NAME
+from ..services.uploads import clip_storage_key
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +58,16 @@ def _extract_clip_key(hls_playlist_url):
     Returns None for a null/blank value -- the field is ``null=True``, so a
     clip whose HLS processing has not run has None here and ``rsplit`` would
     raise AttributeError, turning a 404 into a 500.
+
+    A4 (2026-09-29): now delegates to
+    ``services.uploads.clip_storage_key`` so the playback endpoint and the
+    share endpoint cannot disagree about a clip's key. The shared version
+    also returns None for a value with no "/" at all, where this would
+    return the bare filename as the prefix — which would produce a token the
+    Worker could never match, failing silently as broken playback rather than
+    as a 409.
     """
-    if not hls_playlist_url:
-        return None
-    return hls_playlist_url.rsplit("/", 1)[0]
+    return clip_storage_key(AudioClip(hls_playlist_url=hls_playlist_url))
 
 
 # SECURITY: the header a native client sends to opt in to receiving the token

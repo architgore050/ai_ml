@@ -70,27 +70,45 @@ def _ttl_seconds() -> int:
     return int(getattr(settings, "MEDIA_TOKEN_TTL_SECONDS", 600))
 
 
-def generate_playback_token(user_id: int, clip_key: str) -> str:
-    """Generate a short-lived, per-clip HMAC token for HLS playback.
+def generate_playback_token(
+    user_id: int, clip_key: str, ttl: int | None = None
+) -> str:
+    """Generate an HMAC playback token for a clip's HLS output.
 
     Args:
-        user_id: The authenticated Django user's ID. Bound into the token
-            so the validator can confirm the user is still authorized
-            (though the Worker/nginx only checks HMAC + expiry + scope,
-            not live user state — that is enforced at the API issuance step).
+        user_id: The Django user's ID, or 0 for a token issued to an
+            anonymous share recipient. The Worker and nginx never read this
+            field (they check HMAC, ``v``, ``exp`` and the ``c`` prefix
+            only), so 0 is a safe sentinel — see the share pipeline.
         clip_key: The object storage key prefix for this clip's HLS output.
-            Example: "hls/abc-123-def-456". This is the
-            clip.hls_playlist_url with the trailing "master.m3u8" stripped.
+            Example: "hls/abc-123-def-456".
+        ttl: Override for the token lifetime, in seconds. ``None`` uses
+            ``MEDIA_TOKEN_TTL_SECONDS`` (600s), which is correct for a user
+            who is watching *now*.
+
+            A4 (2026-09-29): the share pipeline needs a much longer lifetime
+            — a link shared on Monday must still open on Saturday. Adding a
+            per-call override is what lets that happen without touching the
+            payload format, and therefore without touching the Cloudflare
+            Worker or the nginx njs validator. The schema is unchanged
+            (``{"c", "exp", "iat", "u", "v"}``), so the three implementations
+            that must agree still agree.
+
+            SECURITY: the two lifetimes are deliberately different objects —
+            a short one for a stream in progress, a long one for a capability
+            that is handed to someone else. Do not "simplify" by making both
+            long; see docs/EXPLAIN/storage/04-hls-token-protection.md on why
+            ``exp`` is the only automatic revocation mechanism.
 
     Returns:
         Token string: ``base64url(payload).base64url(signature)``
     """
     now = int(time.time())
-    ttl = _ttl_seconds()
+    effective_ttl = _ttl_seconds() if ttl is None else int(ttl)
     payload = {
         "u": user_id,
         "c": clip_key,
-        "exp": now + ttl,
+        "exp": now + effective_ttl,
         "iat": now,
         "v": TOKEN_VERSION,
     }
@@ -168,6 +186,80 @@ def validate_playback_token(token: str, request_path: str) -> dict | None:
     # The request path must start with "/<clip_key>/".
     expected_prefix = "/" + payload["c"] + "/"
     if not request_path.startswith(expected_prefix):
+        return None
+
+    return payload
+
+
+def verify_token(token: str) -> dict | None:
+    """Verify signature, version and expiry, and return the payload.
+
+    This is :func:`validate_playback_token` minus the path-prefix check, and
+    it exists for callers that need to *inspect* a token rather than authorise
+    a request for it.
+
+    A4 (2026-09-29): the share pipeline needs this. ``POST
+    /public/clips/{id}/play/`` receives a share token as a query parameter
+    and must confirm two things before minting a short-lived media token for
+    an anonymous caller:
+
+    1. the token is genuinely one we signed, and has not expired; and
+    2. it was issued *for this clip* — i.e. ``payload["c"]`` is the
+       ``hls/<clip_id>`` key of the clip in the URL.
+
+    Without (2), any valid token would unlock any clip: a recipient could
+    take the ``?s=`` value from the link they were sent and rewrite the clip
+    id in the path. That is the whole "is this actually a reel which was
+    shared to the user" check, and it is a string comparison, not new crypto.
+
+    SECURITY: the caller must compare the returned ``c`` against the clip it
+    intends to serve. This function does not do it, because it has no idea
+    what "the clip" means.
+    """
+    if not token or "." not in token:
+        return None
+
+    parts = token.split(".")
+    if len(parts) != 2:
+        return None
+
+    payload_b64, sig_b64 = parts
+
+    try:
+        received_sig = _b64url_decode(sig_b64)
+    except Exception:
+        return None
+
+    expected_sig = hmac.new(
+        _get_secret(),
+        payload_b64.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+
+    if not hmac.compare_digest(expected_sig, received_sig):
+        return None
+
+    try:
+        payload_json = _b64url_decode(payload_b64)
+        payload = json.loads(payload_json)
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    if payload.get("v") != TOKEN_VERSION:
+        return None
+
+    # KeyError/TypeError guarded: a token signed by us but malformed would
+    # otherwise raise out of an authorization path and turn into a 500.
+    try:
+        if int(time.time()) > int(payload["exp"]):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if not isinstance(payload.get("c"), str) or not payload["c"]:
         return None
 
     return payload

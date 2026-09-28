@@ -31,30 +31,25 @@ pytestmark = pytest.mark.django_db
 ADULT_DOB = "1990-01-01"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_throttles(clear_throttle_cache):
+    """Reset DRF throttle counters. See conftest.clear_throttle_cache.
+
+    Autouse because the authorization assertions below make authenticated
+    requests whose budget is shared with every other test in the process, and
+    a Redis-backed budget that persists between runs can otherwise fail these
+    tests for reasons unrelated to the code.
+    """
+    yield
+
+
+
 # ---------------------------------------------------------------------------
 # A1 — the registration contract must be discoverable
 # ---------------------------------------------------------------------------
 
 class TestComplianceEndpointPublishesTermsVersions:
     """``GET /legal/compliance/`` must expose what registration validates."""
-
-    @pytest.fixture(autouse=True)
-    def _clear_throttle_budget(self):
-        """/legal/compliance/ is `legal`-scoped at 30/hour, and the throttle
-        cache is real Redis that conftest.py never clears — so this class
-        exhausts its own budget partway through and starts 429ing. A
-        contract test must not fail on accumulated rate-limit state."""
-        from django.core.cache import cache
-
-        try:
-            cache.clear()
-        except RedisError:
-            pytest.skip("redis unavailable in this environment")
-        yield
-        try:
-            cache.clear()
-        except RedisError:
-            pass
 
     @pytest.fixture
     def client_(self):

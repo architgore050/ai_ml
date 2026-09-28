@@ -1810,6 +1810,26 @@ UPLOADS
   POST /clips/{id}/approve-moderation/  (empty body)                           → 200 {status: "approved", ...}
                                                                               | 400 {status: "rejected", reason}
 
+SHARE (A4, 2026-09-29)
+  POST /clips/{id}/share-link/  (empty body, owner or staff)                   → 201 {clip_id, url, path, token, expires_in}
+                                                                              | 409 {detail}  (no media yet)
+  GET  /clips/{id}/public/     Accept: application/json                       → 200 PublicClip
+                                                                              | 404
+  GET  /clips/{id}/public/     Accept: text/html                              → 200 text/html (Open Graph card)
+  POST /clips/{id}/play/       {s} or ?s=<share token>   (NO auth)            → 200 {status, token, hls_playlist_url}
+                                                                              | 403 {detail}  | 404 | 409
+
+  # A4: a share token is an ordinary media token with a 30-day TTL, NOT a
+  # separate token type. Opening a shared link mints NOTHING — playback
+  # requires the explicit play call above, which re-checks moderation and the
+  # NC/SA license filter at play time, then issues a normal 600s media token.
+  # `url` is null when PUBLIC_APP_BASE_URL is unset; use `path` and prefix it
+  # yourself rather than assuming a host.
+  # Do NOT hand out the share token to a player: exchange it for a media token
+  # instead, so the 30-day credential is never attached to a player.
+  # PublicClip is deliberately minimal: no likes/shares/skips/comment_count,
+  # no is_liked, no hls_playlist_url, no creator_id.
+
   # B4 (2026-09-29): report_reason is REQUIRED and validated against
   # Report.REPORT_REASONS: obscene, hate_speech, violence, csam, terrorism,
   # copyright, impersonation, privacy, spam, other. content is required — an

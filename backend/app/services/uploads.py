@@ -50,6 +50,27 @@ def finalize_upload(clip: AudioClip) -> None:
         clip.save(update_fields=["moderation_approved"])
 
 
+def clip_storage_key(clip: AudioClip) -> str | None:
+    """Return the ``hls/<clip_id>`` object-storage prefix for a clip.
+
+    Returns None when HLS output has not been produced (not transcoded yet, or
+    pruned by ``cleanup_orphan_hls``) — in which case there is no media to
+    grant a token for, and callers should answer 409 rather than minting a
+    token for a key that resolves to nothing.
+
+    Shared by the playback-token and share endpoints so "the storage key for
+    this clip" has exactly one definition. ``media.views._extract_clip_key``
+    performed this same derivation independently; A4 collapsed the two by
+    having the view import from here, rather than letting a third copy appear.
+    """
+    key = (clip.hls_playlist_url or "").strip()
+    if not key:
+        return None
+    # Stored value is the object key, e.g. "hls/<uuid>/master.m3u8". Strip the
+    # filename to get the prefix the token's `c` field binds to.
+    return key.rsplit("/", 1)[0] if "/" in key else None
+
+
 def trigger_hls_processing(clip: AudioClip) -> None:
     """Enqueue HLS processing for an approved clip.
 

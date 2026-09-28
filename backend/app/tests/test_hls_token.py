@@ -23,6 +23,19 @@ from redis.exceptions import RedisError
 pytestmark = pytest.mark.django_db
 
 
+@pytest.fixture(autouse=True)
+def _isolate_throttles(clear_throttle_cache):
+    """Reset DRF throttle counters. See conftest.clear_throttle_cache.
+
+    Autouse because the authorization assertions below make authenticated
+    requests whose budget is shared with every other test in the process, and
+    a Redis-backed budget that persists between runs can otherwise fail these
+    tests for reasons unrelated to the code.
+    """
+    yield
+
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -726,33 +739,6 @@ class TestPlaybackTokenEntitlement:
     actually exploitable.
     """
 
-    @pytest.fixture(autouse=True)
-    def _clear_throttle_budget(self):
-        """Reset the DRF throttle counters before each test.
-
-        The cache backend is real Redis (``settings.CACHES`` uses
-        ``django_redis.cache.RedisCache``), and ``conftest.py`` does not
-        clear it. So throttle budgets accumulate across the whole suite and
-        persist between runs. Without this, an authorization test can fail
-        because an unrelated test file consumed the shared ``user``
-        (1000/hour) budget — which is exactly what happened: these tests
-        passed in isolation and failed in a larger combined run.
-        """
-        from django.core.cache import cache
-
-        # Tolerate Redis being absent or wedged. The entitlement assertions
-        # do not depend on the cache, so a Redis outage should not take
-        # them down with it.
-        try:
-            cache.clear()
-        except RedisError:
-            pytest.skip("redis unavailable in this environment")
-        yield
-        try:
-            cache.clear()
-        except RedisError:
-            pass
-
     @pytest.fixture
     def viewer(self, django_user_model):
         return django_user_model.objects.create_user(
@@ -1043,17 +1029,6 @@ class TestPlaybackTokenThrottleScope:
     view does not declare one. The class was listed but had no scope, so the
     endpoint was silently unthrottled and drew from the shared user bucket.
     """
-
-    @pytest.fixture(autouse=True)
-    def _clear_throttle_budget(self):
-        """Real Redis backs the throttle cache and conftest.py does not clear
-        it, so budgets accumulate across the suite and persist between runs.
-        See the same fixture in TestPlaybackTokenEntitlement."""
-        from django.core.cache import cache
-
-        cache.clear()
-        yield
-        cache.clear()
 
     def test_the_view_declares_a_scope(self):
         from backend.app.views.media import PlaybackTokenView

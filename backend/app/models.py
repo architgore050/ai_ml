@@ -2,7 +2,7 @@ import os
 import uuid
 import logging
 from django.db import models, transaction
-from django.db.models import F
+from django.db.models import F, Q
 from django.conf import settings
 from django.contrib.auth.models import AbstractUser
 from pgvector.django import VectorField
@@ -395,7 +395,61 @@ class Report(models.Model):
     # General regulatory reporting / audit artifact
     title = models.CharField(max_length=200)
     content = models.TextField()
+
+    # B4 (2026-09-29): the report endpoint has always existed, but it created
+    # rows with no link to any clip — so a report was unactionable. An
+    # operator queue cannot triage "content: this is bad" against nothing.
+    #
+    # nullable=True because the model is a general-purpose reporting artifact
+    # (a user can report an account, not just a clip), and because existing
+    # rows predate this column. Not null because for a *clip* report the link
+    # is the point; the view requires it.
+    clip = models.ForeignKey(
+        AudioClip,
+        on_delete=models.CASCADE,
+        related_name='reports',
+        null=True,
+        blank=True,
+    )
+
+    # B4: IT Rules 2021 R3(1)(b) requires categorised handling of complaints,
+    # and a free-text body cannot be triaged. The enum is deliberately aligned
+    # with the IT Rules categories so a report can be routed without reading
+    # the prose. `other` is the escape hatch and REQUIRES content, since an
+    # unlabelled report is unactionable.
+    REPORT_REASONS = [
+        ('obscene', 'Obscene or sexually explicit'),
+        ('hate_speech', 'Hate speech'),
+        ('violence', 'Promotes violence'),
+        ('csam', 'Child sexual abuse material'),
+        ('terrorism', 'Terrorism or extremism'),
+        ('copyright', 'Copyright infringement'),
+        ('impersonation', 'Impersonation'),
+        ('privacy', 'Invasion of privacy'),
+        ('spam', 'Spam or misleading'),
+        ('other', 'Other'),
+    ]
+    report_reason = models.CharField(
+        max_length=20,
+        choices=REPORT_REASONS,
+        default='other',
+    )
+
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='reports')
     status = models.CharField(max_length=20, default='open')
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        # An operator queue lists by clip, most-recent first.
+        indexes = [models.Index(fields=['clip', '-created_at'])]
+        # One report per user per clip. Prevents a single user burying a clip
+        # in duplicate rows, and makes "reported by N users" countable without
+        # deduplicating at read time.
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user', 'clip'],
+                condition=Q(clip__isnull=False),
+                name='unique_report_per_user_per_clip',
+            ),
+        ]
 

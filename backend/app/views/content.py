@@ -24,7 +24,27 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
     queryset = AudioClip.objects.all()
     serializer_class = AudioUploadSerializer
     permission_classes = [permissions.IsAuthenticated]
-    parser_classes = [parsers.MultiPartParser, parsers.FormParser]
+    # B4 (2026-09-29): JSONParser added because the viewset is
+    # multipart-only for uploads, which meant `/clips/{id}/report/` answered
+    # **415 Unsupported Media Type** to every JSON client — the endpoint was
+    # effectively callable only with form data.
+    #
+    # Not scoped to the actions that need it, because per-action parsers
+    # cannot be selected here: `APIView.initialize_request` calls
+    # `get_parsers()`, and `ViewSetMixin.initialize_request` only sets
+    # `self.action` *after* delegating to it, so `self.action` is always None
+    # during parser selection. Reaching for it would silently no-op.
+    #
+    # Safe to add viewset-wide: a JSON body cannot carry a real file, so
+    # `original_file` fails in the serializer ("The submitted data was not a
+    # file data") and a bad upload gets a 400 that names the missing file —
+    # clearer than the 415 it replaces. Size, MIME and magic-byte validation
+    # are unaffected because they only run once a real file is present.
+    parser_classes = [
+        parsers.MultiPartParser,
+        parsers.FormParser,
+        parsers.JSONParser,
+    ]
 
     def get_queryset(self):
         # For moderation endpoints, operators may need broader access.
@@ -121,23 +141,69 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
     def report_clip(self, request, pk=None):
         """User-facing endpoint to report a clip.
 
-        ISSUE-04 / ISSUE-05: Creates a Report linked to the clip.
+        B4 (2026-09-29): this previously created a Report with no link to the
+        clip and no reason, so the report was unactionable — an operator queue
+        could not tell what was reported or triage it. IT Rules 2021 R3(1)(b)
+        requires categorised complaint handling.
+
+        The clip FK and the IT Rules-aligned reason enum are now populated and
+        validated, and duplicate reports from the same user are collapsed
+        (matching the partial unique constraint on the model).
         """
         clip = get_object_or_404(AudioClip, pk=pk)
-        # Create a basic Report instance.
-        # In v1, we accept minimal data from the request.
-        report_title = request.data.get('title', 'User report')
-        report_content = request.data.get('content', '')
-        Report.objects.create(
-            title=report_title,
-            content=report_content,
+
+        reason = request.data.get('report_reason', '')
+        valid_reasons = {code for code, _label in Report.REPORT_REASONS}
+        if reason not in valid_reasons:
+            return Response(
+                {
+                    "report_reason": [
+                        f"Invalid report reason. Allowed: {sorted(valid_reasons)}"
+                    ]
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        content = (request.data.get('content') or '').strip()
+        if not content:
+            # The body is the only free-text a moderator has, so an empty one
+            # is useless. Requiring it also forces the "other" bucket to
+            # carry an explanation.
+            return Response(
+                {"content": ["Please describe the problem."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        title = request.data.get('title') or f"Report: {reason.replace('_', ' ')}"
+
+        # SECURITY: a user must not be able to file a report that is
+        # attributed to somebody else. `user` comes from the token, never the
+        # body. Reported here as well as enforced at the model, because
+        # get_or_create is what makes the duplicate collapse safe.
+        report, created = Report.objects.get_or_create(
             user=request.user,
-            status='open',
+            clip=clip,
+            defaults={
+                'title': title[:200],
+                'content': content,
+                'report_reason': reason,
+                'status': 'open',
+            },
         )
+        if not created:
+            # Append the new detail to the existing report rather than
+            # silently discarding it — the user did tell us something.
+            existing = (report.content or '')
+            separator = '\n\n' if existing else ''
+            report.content = (existing + separator + content)[:4000]
+            report.save(update_fields=['content'])
+
         return Response({
             "status": "reported",
             "message": "Your report has been recorded.",
             "clip_id": clip.id,
+            "report_id": report.id,
+            "duplicate": not created,
         }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['get'], url_path='public', permission_classes=[permissions.AllowAny])

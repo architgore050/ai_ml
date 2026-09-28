@@ -801,7 +801,7 @@ defect with an owner decision required.
 | B5 ✅ | `tags` and `duration_ms` absent from `FeedClipSerializer` | No tag chips; scrubber duration must be derived from the player | P1 |
 | B6 ✅ | `GET /legal/compliance/` omits `terms_versions`, `privacy_version`, `physical_address` | The app cannot submit a *valid* `terms_version` without hardcoding `v1.0`; IT Rules 2021 R4(4) requires the physical address | P1 |
 | B7 ✅ | `CommentSerializer` has no `author_id` | No tappable comment authors | P2 |
-| B8 | `Report` has no `clip` FK and no `report_reason` enum | In-app reporting is decorative; IT Rules 2021 R3(1)(b) requires categorised handling | P2 |
+| B8 ✅ | `Report` has no `clip` FK and no `report_reason` enum | In-app reporting is decorative; IT Rules 2021 R3(1)(b) requires categorised handling | P2 |
 | B9 ✅ | `PlaybackTokenView` has no `throttle_scope` | Draws from the shared 1000/hr `user` bucket; a fast-scrolling feed mints ~1 token per clip | P2 |
 | — | Registration returns no tokens and no `id` | App must follow up with a second `login` call | by design |
 | — | RevenueCat: 6 defects (see D8) | Native IAP impossible | v1.2 |

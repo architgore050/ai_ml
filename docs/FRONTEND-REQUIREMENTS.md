@@ -1805,6 +1805,18 @@ UPLOADS
                                                                               | 400 {<field>: [<err>]}
   PATCH /clips/{id}/       {title?, category?}                                  → 200 AudioUploadSerializer (original_file stripped)
   DEL  /clips/{id}/                                                              → 204
+  POST /clips/{id}/report/   {report_reason, content, title?}                  → 201 {status, clip_id, report_id, duplicate}
+                                                                              | 400 {<field>: [<err>]}
+  POST /clips/{id}/approve-moderation/  (empty body)                           → 200 {status: "approved", ...}
+                                                                              | 400 {status: "rejected", reason}
+
+  # B4 (2026-09-29): report_reason is REQUIRED and validated against
+  # Report.REPORT_REASONS: obscene, hate_speech, violence, csam, terrorism,
+  # copyright, impersonation, privacy, spam, other. content is required — an
+  # empty body gives a moderator nothing. Repeating a report for the same
+  # clip appends to the existing row and returns duplicate: true rather than
+  # creating a second one. JSON is accepted on this endpoint (the viewset is
+  # multipart for uploads, so it previously answered 415 to JSON clients).
 
 INTERACTIONS
   POST /interactions/{id}/toggle-like/        (empty body)                      → 200 {status: "liked"|"unliked"}

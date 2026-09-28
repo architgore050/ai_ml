@@ -295,12 +295,23 @@ def _process_audio_to_hls_impl(self, clip_id, timer):
                 clip.semantic_vector = [0.0] * 384
                 clip.tags = ["instrumental"]
 
-            # ISSUE-04: Run moderation checks on transcript (if exists) and tags.
-            # For v1, we compare transcript_text and tags against blocked phrases.
-            # If moderation fails, mark as rejected and stop HLS processing.
+            # ISSUE-04: Run moderation checks on transcript and tags.
+            # For v1, we compare transcript_text and tags against blocked
+            # phrases. If moderation fails, mark as rejected and stop HLS
+            # processing.
+            #
+            # SEC-FIX (2026-09-29, B2a): this line previously read
+            #     check_transcript_for_prohibited_content(
+            #         transcript_text if 'transcript_text' in locals() else None)
+            # The locals() guard was dead code — transcript_text is assigned
+            # unconditionally 26 lines above on the same try-block, and
+            # transcribe() raising would have jumped to the except clause
+            # rather than reaching here. So the guard could only ever be
+            # True. Kept as a bare name so the actual value being checked is
+            # visible at the call site rather than hidden behind a
+            # conditional that reads as if the value might be missing.
             from ..services import content_moderation as moderation_svc
-            # The transcript_text variable is available in this scope.
-            transcript_approved, transcript_reason = moderation_svc.check_transcript_for_prohibited_content(transcript_text if 'transcript_text' in locals() else None)
+            transcript_approved, transcript_reason = moderation_svc.check_transcript_for_prohibited_content(transcript_text)
             tags_approved, tags_reason = moderation_svc.check_tags_for_prohibited_content(clip.tags)
             if not transcript_approved:
                 logger.error("Moderation rejected clip %s (transcript): %s", clip_id, transcript_reason)

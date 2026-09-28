@@ -177,6 +177,36 @@
 
 ---
 
+> **✅ B2a RESOLVED 2026-09-29 — and the blocklist was the bug, not the
+> wiring.** Two further corrections to the note above, both found by reading
+> the code around it rather than from the audit:
+>
+> 1. **The list was populated, and that was worse than empty.** It held 7
+>    single common words (`violence`, `terrorism`, `extremist`, `obscenity`,
+>    `hate speech`, `csam`, `child sexual`) matched with `\b` boundaries
+>    against raw Whisper output and KeyBERT unigram tags. Verified
+>    false positives: *"a song about violence in the city"*, *"terrorism was
+>    the topic of the podcast today"*, and *"he called it an extremist
+>    policy"* were all **rejected**. On an audio-clip platform the word
+>    "violence" in a lyric is ordinary content. The user got a permanent
+>    rejection with no appeal path. The list is now 4 CSAM-specific
+>    multi-word constructions, where a keyword match is defensible.
+> 2. **A storage failure was recorded as a moderation decision.**
+>    `check_fingerprint_blocklist("")` returned a *rejection*, and
+>    `compute_audio_fingerprint` swallows exceptions and returns `""`. So a
+>    MinIO blip during approve-moderation set `moderation_approved=False`
+>    permanently, with no path back. A missing fingerprint is now
+>    inconclusive, not a verdict. This fail-open is only safe while the
+>    fingerprint set is empty — a test pins that condition explicitly, since
+>    adding an entry must reopen the question.
+>
+> **Still open, and it is the substantive half of ISSUE-04:** a keyword list
+> cannot distinguish *discussing* a topic from *being* the topic, and cannot
+> cover non-English speech. The mechanical checks work; the content decision
+> (what to match, in which languages, and a human review queue) is a policy
+> call that has not been made. IT Act §67B exposure is **not** closed by
+> this change.
+
 #### ISSUE-05: No user-upload license declaration [COMPLETED — Phase A] (AudioUploadSerializer fields + validation; DB persistence verified) (Copyright Act 1957 §19 / §51 / §52)
 
 **Status:** Critical — **copyright infringement liability for every user-uploaded clip**

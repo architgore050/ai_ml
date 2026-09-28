@@ -255,14 +255,59 @@ def build_redis_url(prefix: str) -> str:
         return f"redis://:{encoded_password}@{host}:{port}/0"
     return REDIS_URL
 
+
+def resolve_redis_url(prefix: str) -> str:
+    """Resolve a Redis URL, with an explicit and non-obvious precedence.
+
+    DECISION (2026-09-29): ``{prefix}_HOST`` wins over ``{prefix}_URL``.
+
+    This inverts what the code did before, and the reason is that the old
+    order was actively wrong. Every compose service sets::
+
+        REDIS_BROKER_HOST: redis_broker_local
+        REDIS_BROKER_PORT: 6379
+
+    deliberately, because Redis passwords here contain base64 characters
+    (``+``, ``/``, ``=``) that break Kombo URL parsing — that split exists
+    precisely so the password is URL-encoded at use time. But the
+    assignment read::
+
+        REDIS_BROKER_URL = os.getenv("REDIS_BROKER_URL", build_redis_url("REDIS_BROKER"))
+
+    so a *stale* ``REDIS_BROKER_URL`` left in ``.env.local`` silently
+    overrode the host compose had just specified, defeating the split.
+
+    Consequence found the hard way: the local stack was publishing to a
+    broker belonging to a *different* compose project, so two independent
+    codebases raced for the same ``celery`` queue. Six identical task
+    publishes gave 2 SUCCESS and 4 NotRegistered — the foreign worker wins
+    the coin flip and rejects task names it does not know. That presents as
+    "my new Celery task never runs", which is a very misleading symptom for
+    a stale env var.
+
+    All three shipped env templates set exactly one form, so this changes
+    nothing for them:
+      * ``.env.example``         — neither, relies on HOST/PORT
+      * ``.env.vps.example``     — URL only, no HOST
+      * ``.env.laptop.example``  — URL only, no HOST
+
+    Order: HOST/PORT (compose-managed) > URL (hand-written templates) >
+    ``REDIS_URL`` (single-Redis non-Docker dev).
+    """
+    if os.getenv(f"{prefix}_HOST"):
+        built = build_redis_url(prefix)
+        if built != REDIS_URL:
+            return built
+    return os.getenv(f"{prefix}_URL") or REDIS_URL
+
 # DECISION: Two Redis URLs in Docker (broker vs cache) so a feed-queue spike
 # can't evict queued Celery tasks and vice versa. In Docker compose the broker
 # runs with `--maxmemory-policy noeviction` (can't lose queued tasks) and the
 # cache with `allkeys-lru` (feed queues evictable since refill is idempotent).
 # Non-Docker dev collapses both to REDIS_URL — a single Redis on localhost is
 # fine for one developer.
-REDIS_BROKER_URL = os.getenv("REDIS_BROKER_URL", build_redis_url("REDIS_BROKER"))
-REDIS_CACHE_URL = os.getenv("REDIS_CACHE_URL", build_redis_url("REDIS_CACHE"))
+REDIS_BROKER_URL = resolve_redis_url("REDIS_BROKER")
+REDIS_CACHE_URL = resolve_redis_url("REDIS_CACHE")
 
 # This is how you connect Redis to Django
 CACHES = {

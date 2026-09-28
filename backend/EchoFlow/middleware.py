@@ -15,6 +15,7 @@ Companion: backend.EchoFlow.correlation module (contextvar store).
 """
 import uuid
 
+from .client_ip import get_client_ip
 from .correlation import set_correlation_id, clear_correlation_id
 from .logging_filters import set_audit_identity, clear_audit_identity
 
@@ -35,7 +36,7 @@ class CorrelationIdMiddleware:
         # DECISION: Attach audit identity (user_id, client_ip, path) to every request so the audit log captures complete identity context without relying on view-level hooks. Tradeoff: middleware runs for every request (including static files and 301 redirects), adding a small overhead per request. See models.py:290-312 (AuditLog) for the DB table design and settings.py:569-572 for the log formatter that consumes these fields.
         user_obj = getattr(request, 'user', None)
         request.user_id = getattr(user_obj, 'id', None) if user_obj is not None else None
-        request.client_ip = request.META.get('REMOTE_ADDR') or request.META.get('HTTP_X_FORWARDED_FOR', '').split(',')[0].strip() or None
+        request.client_ip = get_client_ip(request)
         # ISSUE-07 / HACK: Audit identity is set here (before AuthenticationMiddleware runs), so the logging filter records user_id as '-' for logs emitted during request processing. The AuditLog DB entry (written in finally, after auth completes) captures the correct user ID. A production fix should move audit identity update to a process_request hook after AuthenticationMiddleware, or use Django signals (post_auth). Tradeoff: minimal change now vs. complete audit identity in all log lines.
         set_audit_identity(request.user_id, request.client_ip, request.path)
         request.path = request.path

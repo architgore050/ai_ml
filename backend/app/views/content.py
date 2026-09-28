@@ -110,12 +110,37 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
 
         ISSUE-04: Manual moderation approval for v1. After passing,
         HLS processing is triggered.
-        DECISION: Using action on AudioUploadViewSet for simplicity.
-        In production, this should be restricted to staff/admin roles.
+
+        SEC-FIX (2026-09-29, Group C): the lookup was
+        ``get_object_or_404(AudioClip, pk=pk)`` — unscoped, which silently
+        bypassed ``get_queryset()`` (creator-scoped). So **any** authenticated
+        user could approve **any** clip, on someone else's upload. That is a
+        moderation bypass (it is the step that sets moderation_approved and
+        triggers HLS encoding) and a compute-abuse vector, and the old
+        docstring admitted it: "For v1, any authenticated user can approve
+        (simplified)."
+
+        Now owner-or-staff. Owner is permitted because the mobile upload flow
+        self-approves its own clip — that is the current v1 workflow, and
+        denying it would leave uploads permanently stuck in `processing` until
+        a human looked at them.
+
+        HONEST LIMITATION: with the owner allowed, moderation is not a gate.
+        A user can upload, self-approve, and be published after only the
+        keyword checks in services/content_moderation.py run. That is the
+        accepted v1 state, and this change narrows the abuse surface (from
+        anyone to the uploader) without pretending to more. Making it a real
+        gate needs either a human review queue or a classifier — the content
+        decision tracked as ISSUE-04, not a scoping fix.
         """
-        # For v1, any authenticated user can approve (simplified).
-        # A production system should check is_staff or a moderation role.
-        clip = get_object_or_404(AudioClip, pk=pk)
+        if request.user.is_staff:
+            clip = get_object_or_404(AudioClip, pk=pk)
+        else:
+            # 404 rather than 403 for someone else's clip: a 403 would
+            # confirm the clip exists, and UUIDs are the only identifier here.
+            clip = get_object_or_404(
+                AudioClip.objects.filter(creator=request.user), pk=pk
+            )
         approved, reason = moderation_svc.run_moderation_check(clip.id)
         # Reload clip from DB so moderation_approved reflects the update.
         clip.refresh_from_db()

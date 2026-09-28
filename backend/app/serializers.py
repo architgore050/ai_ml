@@ -4,6 +4,7 @@ from rest_framework import serializers
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db.models import Exists, OuterRef
+from backend.EchoFlow.client_ip import get_client_ip
 from .media_urls import get_hls_playback_url, get_signed_media_url
 from .models import AudioClip, UserInteraction, ShareEvent, Comment, ConsentAudit, Grievance, AuditLog
 from rest_framework.validators import UniqueValidator
@@ -576,7 +577,18 @@ class RegisterSerializer(serializers.ModelSerializer):
             user=user,
             terms_version_id=terms_version,
             privacy_version_id='v1.0',
-            ip_address=request.META.get('REMOTE_ADDR') if request else None,
+            # SEC-FIX (2026-09-29, Group C): was
+            # `request.META.get('REMOTE_ADDR')`, which behind nginx is the
+            # nginx container's IP — so every consent record attributed the
+            # notice to the proxy rather than the user. DPDP §5(1) requires
+            # the notice to be attributable, and it also disagreed with
+            # AuditLog's value for the same request, so the two audit
+            # artifacts could not be reconciled.
+            #
+            # Shared helper, because CorrelationIdMiddleware had the same
+            # defect with a subtler shape (REMOTE_ADDR checked *first*, making
+            # its XFF fallback unreachable). See EchoFlow/client_ip.py.
+            ip_address=get_client_ip(request),
             user_agent=request.META.get('HTTP_USER_AGENT', '')[:500] if request else '',
         )
         return user

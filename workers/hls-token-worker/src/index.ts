@@ -1,18 +1,21 @@
 // EchoFlow HLS Token Worker — fetch handler
 //
-// Validates the ef_hls_token cookie on every /hls/* request and proxies
-// to R2 via binding if valid. Handles CORS and OPTIONS preflight internally
-// since R2's bucket CORS policy is bypassed when using a Worker binding
-// (the binding is a server-side call, not an HTTP request from the browser).
+// Validates the ef_hls_token cookie — or, for native players, the
+// X-EchoFlow-Media-Token header carrying the same value — on every /hls/*
+// request, then fetches from storage. Handles CORS and OPTIONS preflight
+// internally since R2's bucket CORS policy is bypassed when using a Worker
+// binding (the binding is a server-side call, not an HTTP request from the
+// browser).
 //
 // Request flow:
-//   Browser → Cloudflare Worker (media.echoflow.in)
+//   Browser  → Cookie: ef_hls_token ─┐
+//   Native   → X-EchoFlow-Media-Token ┴→ Worker (media.echoflow.in)
 //     → validatePlaybackToken() [token.ts]
 //       → getStorage(env).get() [storage.ts — R2 binding in prod,
 //                                 S3/MinIO over SigV4 under `wrangler dev`]
-//         → stream response back to browser with CORS headers
+//         → stream response back to client with CORS headers
 
-import { validatePlaybackToken, extractTokenFromCookie } from "./token";
+import { validatePlaybackToken, extractTokenFromRequest } from "./token";
 import { getStorage, assertTokenSecret, StorageUnavailable, type Env } from "./storage";
 
 export type { Env };
@@ -125,8 +128,16 @@ export default {
     }
 
     // --- Extract and validate token ---
-    const cookieHeader = request.headers.get("Cookie");
-    const token = extractTokenFromCookie(cookieHeader);
+    //
+    // Cookie for the web (HttpOnly, set by the API origin, attached by the
+    // browser automatically); `X-EchoFlow-Media-Token` header for native
+    // players, which have no cookie jar to share with the HTTP client. Both
+    // carry the same HMAC string, so everything below is identical either
+    // way — only the envelope differs.
+    //
+    // Precedence and the reasoning behind it live with the helper:
+    // extractTokenFromRequest() in token.ts.
+    const token = extractTokenFromRequest(request);
 
     if (!token) {
       return errorResponse(403, "Missing playback token", origin, allowed);

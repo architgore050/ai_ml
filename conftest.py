@@ -27,25 +27,57 @@ os.environ.setdefault('REVENUECAT_PUBLIC_KEY', 'test-public-key')
 os.environ.setdefault('REVENUECAT_PROJECT_TOKEN', 'test-project')
 os.environ.setdefault('REVENUECAT_ENTITLEMENT_ID', 'pro')
 os.environ.setdefault('REVENUECAT_SYNC_INTERVAL_MINUTES', '360')
-# Override DATABASE_URL to point directly at the postgres container
-# (bypassing pgbouncer). pgbouncer is configured to whitelist only
-# `echoflow_db`, but the test DB is `echoflow_test`. Direct connection
-# lets pytest create + use `echoflow_test` without pgbouncer blocking.
-# We re-parse the existing URL and swap host/port/db.
+# Point the suite at the TEST database, reached on POSTGRES DIRECTLY.
+#
+# The app goes through pgbouncer (or, in the local stack, straight to
+# `db_local`), but pgbouncer whitelists only DB_NAME, so CREATE DATABASE and
+# CREATE EXTENSION for the test DB are refused through it. That is why
+# TEST_DB_HOST/TEST_DB_PORT exist separately from DB_HOST/DB_PORT rather than
+# being derived by guessing "strip the pgbouncer token off the hostname" --
+# the postgres service is called `db` in one stack and `db_local` in another,
+# and no amount of string surgery on the app's URL knows which.
+#
+# Everything here comes from the environment. Nothing is hardcoded: the
+# service names, the port and the test DB name all differ per stack, and a
+# hardcoded one made the suite unrunnable outside the main compose project
+# ("could not translate host name \"db\"").
 import urllib.parse as _urlparse
+
+
+def _env(name, default=None, required=True):
+    value = os.environ.get(name, default)
+    if not value and required:
+        raise RuntimeError(
+            f'[conftest] {name} is not set. The test harness needs it to reach '
+            f'postgres directly. It is defined in .env / .env.example — see '
+            f'TEST_DB_HOST, TEST_DB_PORT, TEST_DB_NAME.'
+        )
+    return value
+
+
+TEST_DB_NAME = _env('TEST_DB_NAME', 'echoflow_test', required=False)
+TEST_DB_HOST = _env('TEST_DB_HOST', 'db')
+TEST_DB_PORT = _env('TEST_DB_PORT', '5432', required=False)
+
 _existing_url = os.environ.get('DATABASE_URL', '')
 if _existing_url:
     _parsed = _urlparse.urlparse(_existing_url)
-    _new_netloc = _parsed.netloc.replace('pgbouncer:6432', 'db:5432')
-    _new_path = '/echoflow_test'
+    # Keep the credentials from the app's own URL (they are the same role);
+    # replace only host, port and database name.
+    _netloc_host = f'{TEST_DB_HOST}:{TEST_DB_PORT}'
+    if _parsed.username:
+        _netloc_host = (
+            f'{_parsed.username}:{_parsed.password}@{_netloc_host}'
+            if _parsed.password else f'{_parsed.username}@{_netloc_host}'
+        )
     _test_url = _urlparse.urlunparse(
-        _parsed._replace(netloc=_new_netloc, path=_new_path))
+        _parsed._replace(netloc=_netloc_host, path=f'/{TEST_DB_NAME}'))
     os.environ['DATABASE_URL'] = _test_url
     # Also set PG* env vars that some tooling reads directly (bypasses
     # Django's settings cache when subprocesses are spawned).
-    os.environ['PGHOST'] = 'db'
-    os.environ['PGPORT'] = '5432'
-    os.environ['PGDATABASE'] = 'echoflow_test'
+    os.environ['PGHOST'] = TEST_DB_HOST
+    os.environ['PGPORT'] = str(TEST_DB_PORT)
+    os.environ['PGDATABASE'] = TEST_DB_NAME
     print(f'[conftest] DATABASE_URL overridden to: {_test_url}', file=sys.stderr)
 # RevenueCat test defaults (no real API calls in unit tests).
 os.environ.setdefault('REVENUECAT_SECRET_KEY', '')
@@ -69,16 +101,16 @@ django.setup()
 # overrides. We just use Postgres with real migrations.
 import sys as _sys
 print(f'[conftest] BEFORE override: NAME={settings.DATABASES["default"].get("NAME")!r}', file=_sys.stderr)
-if settings.DATABASES['default'].get('NAME') != 'echoflow_test':
+if settings.DATABASES['default'].get('NAME') != TEST_DB_NAME:
     db = settings.DATABASES['default'].copy()
-    db['NAME'] = 'echoflow_test'
+    db['NAME'] = TEST_DB_NAME
     # Also set TEST['NAME'] so pytest-django doesn't re-prefix with 'test_'
     if 'TEST' not in db:
         db['TEST'] = {}
-    db['TEST']['NAME'] = 'echoflow_test'
+    db['TEST']['NAME'] = TEST_DB_NAME
     # Bypass pgbouncer for tests: it whitelists only `echoflow_db`.
-    db['HOST'] = 'db'
-    db['PORT'] = 5432
+    db['HOST'] = TEST_DB_HOST
+    db['PORT'] = TEST_DB_PORT
     settings.DATABASES['default'] = db
 print(f'[conftest] AFTER override: NAME={settings.DATABASES["default"].get("NAME")!r} HOST={settings.DATABASES["default"].get("HOST")!r}', file=sys.stderr)
 
@@ -99,9 +131,9 @@ _orig_config = _dju.config
 def _patched_config(*args, **kwargs):
     result = _orig_config(*args, **kwargs)
     if isinstance(result, dict) and 'HOST' in result:
-        result['HOST'] = 'db'
-        result['PORT'] = 5432
-        result['NAME'] = 'echoflow_test'
+        result['HOST'] = TEST_DB_HOST
+        result['PORT'] = TEST_DB_PORT
+        result['NAME'] = TEST_DB_NAME
     return result
 _dju.config = _patched_config
 
@@ -109,15 +141,15 @@ _dju.config = _patched_config
 # instantiates DatabaseWrapper from the original DATABASES dict at startup;
 # our conftest override of settings.DATABASES doesn't reach into the
 # wrapper's settings_dict. We patch it directly so the wrapper's
-# get_connection_params() returns db:5432/echoflow_test.
+# get_connection_params() returns the TEST_DB_* values.
 from django.db import connection as _default_connection
 _orig_settings_dict = _default_connection.settings_dict
 _default_connection.settings_dict = {
     **_orig_settings_dict,
-    'HOST': 'db',
-    'PORT': 5432,
-    'NAME': 'echoflow_test',
-    'TEST': {**_orig_settings_dict.get('TEST', {}), 'NAME': 'echoflow_test'},
+    'HOST': TEST_DB_HOST,
+    'PORT': TEST_DB_PORT,
+    'NAME': TEST_DB_NAME,
+    'TEST': {**_orig_settings_dict.get('TEST', {}), 'NAME': TEST_DB_NAME},
 }
 # Also reset the cached connection so the next ensure_connection uses
 # the new settings.
@@ -141,7 +173,7 @@ def _install_pgvector_on_template1():
     target_user = db.get('USER', '')
     target_password = db.get('PASSWORD', '')
     target_host = db.get('HOST', '') or 'localhost'
-    target_port = db.get('PORT', '') or 5432
+    target_port = db.get('PORT', '') or TEST_DB_PORT
 
     # Connect to template1 as the test DB user to install pgvector.
     # If that user lacks superuser privileges, fall back to connecting
@@ -149,7 +181,7 @@ def _install_pgvector_on_template1():
     admin_user = target_user or 'postgres'
     admin_password = target_password or ''
     admin_host = target_host or 'localhost'
-    admin_port = target_port or '5432'
+    admin_port = target_port or str(TEST_DB_PORT)
 
     try:
         admin_conn = psycopg2.connect(
@@ -190,7 +222,7 @@ def _create_test_database():
     run tests without manually creating the DB first.
     """
     db = settings.DATABASES['default']
-    test_name = db.get('NAME', 'echoflow_test')
+    test_name = db.get('NAME', TEST_DB_NAME)
     if not test_name:
         return
 
@@ -200,7 +232,7 @@ def _create_test_database():
     target_user = db.get('USER', 'postgres')
     target_password = db.get('PASSWORD', '')
     target_host = db.get('HOST', 'localhost') or 'localhost'
-    target_port = db.get('PORT', 5432) or 5432
+    target_port = db.get('PORT', TEST_DB_PORT) or TEST_DB_PORT
 
     # Connect to the default `postgres` DB to check/create the test DB.
     try:
@@ -245,7 +277,7 @@ def _drop_test_database():
     the DB doesn't exist or we can't connect.
     """
     db = settings.DATABASES['default']
-    test_name = db.get('NAME', 'echoflow_test')
+    test_name = db.get('NAME', TEST_DB_NAME)
     if not test_name:
         return
 
@@ -255,7 +287,7 @@ def _drop_test_database():
     target_user = db.get('USER', 'postgres')
     target_password = db.get('PASSWORD', '')
     target_host = db.get('HOST', 'localhost') or 'localhost'
-    target_port = db.get('PORT', 5432) or 5432
+    target_port = db.get('PORT', TEST_DB_PORT) or TEST_DB_PORT
 
     try:
         admin_conn = psycopg2.connect(

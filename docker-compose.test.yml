@@ -24,7 +24,7 @@ services:
     container_name: echoflow_test_db
     restart: "no"
     environment:
-      POSTGRES_DB: echoflow_test
+      POSTGRES_DB: ${TEST_DB_NAME:-echoflow_test}
       POSTGRES_USER: ${DB_USER:-echoflow}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-testpassword}
     volumes:
@@ -118,7 +118,7 @@ services:
       - .env
     environment:
       - PYTHONPATH=/app
-      - DATABASE_URL=postgresql://${DB_USER:-echoflow}:${DB_PASSWORD:-testpassword}@db:5432/echoflow_test
+      - DATABASE_URL=postgresql://${DB_USER:-echoflow}:${DB_PASSWORD:-testpassword}@${TEST_DB_HOST:-db}:${TEST_DB_PORT:-5432}/${TEST_DB_NAME:-echoflow_test}
       - REDIS_URL=redis://redis_broker:6379/1
       - REDIS_BROKER_URL=redis://redis_broker:6379/0
       - REDIS_CACHE_URL=redis://redis_cache:6379/0

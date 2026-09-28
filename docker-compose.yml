@@ -289,7 +289,7 @@ services:
     env_file:
       - .env
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_URL=${REDIS_URL}
       - REDIS_BROKER_URL=${REDIS_BROKER_URL:-redis://redis_broker:6379/0}
       - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis_cache:6379/0}
@@ -391,7 +391,7 @@ services:
       start_period: 30s
       retries: 3
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_URL=${REDIS_URL}
       - REDIS_BROKER_URL=${REDIS_BROKER_URL:-redis://redis_broker:6379/0}
       - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis_cache:6379/0}
@@ -438,7 +438,7 @@ services:
       redis_cache:
         condition: service_healthy
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_URL=${REDIS_URL}
       - REDIS_BROKER_URL=${REDIS_BROKER_URL:-redis://redis_broker:6379/0}
       - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis_cache:6379/0}
@@ -511,7 +511,7 @@ services:
       minio-init:
         condition: service_completed_successfully
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_URL=${REDIS_URL}
       - REDIS_BROKER_URL=${REDIS_BROKER_URL:-redis://redis_broker:6379/0}
       - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis_cache:6379/0}
@@ -582,7 +582,7 @@ services:
     env_file:
       - .env
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_URL=${REDIS_URL}
       - REDIS_BROKER_URL=${REDIS_BROKER_URL:-redis://redis_broker:6379/0}
       - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis_cache:6379/0}

@@ -201,7 +201,7 @@ services:
     env_file:
       - .env.local
     environment:
-      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@db_local:5432/${DB_NAME}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_BROKER_HOST=redis_broker_local
       - REDIS_BROKER_PORT=6379
       - REDIS_BROKER_PASSWORD=${REDIS_BROKER_PASSWORD}
@@ -282,7 +282,7 @@ services:
       redis_cache_local:
         condition: service_healthy
     environment:
-      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@db_local:5432/${DB_NAME}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_BROKER_HOST=redis_broker_local
       - REDIS_BROKER_PORT=6379
       - REDIS_BROKER_PASSWORD=${REDIS_BROKER_PASSWORD}
@@ -318,7 +318,7 @@ services:
       redis_cache_local:
         condition: service_healthy
     environment:
-      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@db_local:5432/${DB_NAME}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_BROKER_HOST=redis_broker_local
       - REDIS_BROKER_PORT=6379
       - REDIS_BROKER_PASSWORD=${REDIS_BROKER_PASSWORD}
@@ -361,7 +361,7 @@ services:
       redis_cache_local:
         condition: service_healthy
     environment:
-      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@db_local:5432/${DB_NAME}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_BROKER_HOST=redis_broker_local
       - REDIS_BROKER_PORT=6379
       - REDIS_BROKER_PASSWORD=${REDIS_BROKER_PASSWORD}
@@ -419,7 +419,7 @@ services:
       redis_cache_local:
         condition: service_healthy
     environment:
-      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@db_local:5432/${DB_NAME}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_BROKER_HOST=redis_broker_local
       - REDIS_BROKER_PORT=6379
       - REDIS_BROKER_PASSWORD=${REDIS_BROKER_PASSWORD}

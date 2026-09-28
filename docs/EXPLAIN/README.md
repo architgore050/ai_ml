@@ -135,6 +135,7 @@ This directory contains comprehensive, code-grounded technical documentation for
 | POST | `/share/{id}/send-share/` | ✓ | Send clip to another user |
 | GET | `/share/inbox/` | ✓ | Get user's share inbox |
 | POST | `/follow/{id}/toggle-follow/` | ✓ | Follow/unfollow user |
+| GET | `/media/playback-token/{clip_id}/` | ✓ | HLS play token — cookie, or body token for native (`X-EchoFlow-Client: native`) |
 | POST | `/tags/initialize/` | ✓ | Cold-start tag-based vector bootstrapping |
 | GET | `/suggestions/?category=X` | ✓ | Category-scoped vector ranking |
 | GET | `/profile/me/` | ✓ | Own profile |
@@ -150,10 +151,11 @@ This directory contains comprehensive, code-grounded technical documentation for
 4. **`backend/app/views.py`** — API ViewSets: feed, uploads, interactions, comments, share, follow, tags
 5. **`backend/app/serializers.py`** — DRF serializers with HLS URL signing logic
 6. **`backend/app/services/`** — Service layer: `interactions.py` (cache invalidation), `counter_store.py` (Redis INCR + dual-write), `task_publisher.py` (correlation_id propagation), `sentry.py` (error capture)
-7. **`backend/app/db_routers.py`** — Read-replica routing; auto-activates when `READ_DATABASE_URL` is set
-8. **`docker-compose.yml`** — 14-service deployment topology
-9. **`docker/nginx.conf`** — TLS terminator with 3 listeners (`:80`/`:443`/`:9443`)
-10. **`Dockerfile`** — Multi-stage build with offline wheelhouse and HF model baking
+7. **`backend/app/throttling.py`** — `RefreshTokenRateThrottle` (keyed on the **verified** token subject, not the client IP — a carrier NAT is thousands of callers) and `RegisterUsernameRateThrottle`
+8. **`backend/app/db_routers.py`** — Read-replica routing; auto-activates when `READ_DATABASE_URL` is set
+9. **`docker-compose.yml`** — 14-service deployment topology
+10. **`docker/nginx.conf`** — TLS terminator with 3 listeners (`:80`/`:443`/`:9443`)
+11. **`Dockerfile`** — Multi-stage build with offline wheelhouse and HF model baking
 
 ---
 

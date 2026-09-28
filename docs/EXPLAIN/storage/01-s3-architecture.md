@@ -79,10 +79,16 @@ STORAGES = {
 ### Bucket Policy (via `minio-init`)
 
 ```bash
-# Private by default (uploads/)
-# Public-read for hls/ prefix only
-mc anonymous set download local/echoflow-media/hls
+# The bucket is FULLY PRIVATE. minio-init only creates it.
+# ⛔ Do NOT add `mc anonymous set download .../hls` — that makes every
+# transcript and segment readable without a playback token.
+mc mb --ignore-existing local/echoflow-media
 ```
+
+`hls/` is served through the validating edge (Cloudflare Worker at
+`media.echoflow.in` in production, nginx `:9443` locally), which checks a
+short-lived HMAC token per clip before reading the object. See
+[`04-hls-token-protection.md`](04-hls-token-protection.md).
 
 ### Prefix ACLs
 
@@ -118,9 +124,9 @@ master.m3u8 (signed)
 - **Derived/processed content** (HLS) = private + token-gated (signed cookies)
 - **Original uploads** = private, signed URLs
 - Used by Netflix, Spotify, YouTube, etc.
-- EchoFlow's current implementation uses public-read for `hls/` (see
-  `03-bucket-policies.md`). The plan to migrate to signed-cookie token
-  protection is documented in `04-hls-token-protection.md`.
+- **EchoFlow implements this.** `hls/` is private and token-gated; the edge
+  at `media.echoflow.in` validates the token. See
+  `04-hls-token-protection.md`.
 
 ---
 

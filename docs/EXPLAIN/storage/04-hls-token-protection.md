@@ -1,5 +1,29 @@
 # HLS Token Protection — Short-Lived Play Tokens for HLS Streams
 
+> **⚠️ The token has TWO transports. This document is primarily about the
+> cookie, which is correct for the web but was not sufficient on its own.**
+>
+> The cookie route is `Set-Cookie: ef_hls_token` on
+> `GET /media/playback-token/<clip_id>/`, which a browser attaches
+> automatically to every `/hls/*` request.
+>
+> **Native players cannot use it.** `AVPlayer` (iOS) does not read
+> `NSHTTPCookieStorage`, and ExoPlayer's `DefaultHttpDataSource` (Android)
+> sends no `Cookie` header — neither shares state with the app's HTTP client.
+> The cookie is also `HttpOnly` (the app cannot read it back) and `Secure`
+> (dropped over plaintext-HTTP dev), so a native client can neither obtain
+> nor present the credential.
+>
+> Second transport, added 2026-09-28: a caller sending
+> `X-EchoFlow-Client: native` additionally receives `"token"` in the JSON
+> body and replays it as the `X-EchoFlow-Media-Token` request header. Same
+> HMAC string, same TTL, same per-clip scope; **cookie-first precedence** at
+> the edge. See [§3.5](#35-native-transport-the-header-carrier) and
+> `../decisions/2026-09-28-native-media-auth-and-cgnat-throttling.md`.
+>
+> Sections below that say "the cookie" mean "the token, delivered by cookie"
+> unless they are specifically about cookie attributes.
+
 ## Table of Contents
 
 1. [Problem Statement](#1-problem-statement)
@@ -21,9 +45,17 @@
 
 ## 1. Problem Statement
 
-### Current State
+### Current State (as of 2026-09-28 — this section is now HISTORICAL)
 
-The `hls/` prefix in the S3-compatible object storage bucket is made **public-read** via a bucket policy:
+> ✅ **This is fixed.** The `hls/` prefix is **private** and token-gated at
+> the edge. `mc anonymous set download` is no longer run anywhere, and no
+> `PublicReadHLS` statement exists on the production bucket. The passages
+> below describe the state this document was written to correct; the
+> remediation is in §"Migration / Rollback Plan" and has shipped.
+> Cross-references in the two bullets point at files that have since been
+> corrected.
+
+The `hls/` prefix in the S3-compatible object storage bucket was made **public-read** via a bucket policy:
 
 - **Local dev (MinIO)**: `mc anonymous set download local/echoflow-media/hls` in the `minio-init` service (`docker-compose.yml:228`)
 - **Production (Cloudflare R2)**: Bucket policy JSON grants `s3:GetObject` on `arn:aws:s3:::echoflow-media/hls/*` to `Principal: "*"` (`docs/EXPLAIN/storage/03-bucket-policies.md:40-55`, `docs/EXPLAIN/DEPLOYMENT/04-cloudflare-config.md:41-53`)
@@ -162,7 +194,75 @@ token = f"{payload_b64}.{signature}"
 | **TTL** | 600 seconds (10 min) | Short enough to limit exposure window; long enough for a full playback session |
 | **Algorithm** | HMAC-SHA256 | Compatible with Worker `crypto.subtle.verify` and nginx `njs` `crypto` module; no external dependencies |
 | **Secret** | `MEDIA_TOKEN_SECRET` env var | Separate from `DJANGO_SECRET_KEY` so the Worker can share it as a Cloudflare secret without exposing Django's signing key |
-| **Cookie flags** | `Secure; HttpOnly; SameSite=Lax; Path=/hls/; Max-Age=600` | Secure = HTTPS only; HttpOnly = JS cannot read (reduces XSS theft); SameSite=Lax = CSRF protection |
+| **Cookie flags** | `Secure; HttpOnly; SameSite=Lax; Path=/hls/; Max-Age=600` | Cookie transport only. Secure = HTTPS only; HttpOnly = JS cannot read (reduces XSS theft); SameSite=Lax = CSRF protection. Native uses the header instead — see §3.5 |
+| **Domain** | `MEDIA_TOKEN_COOKIE_DOMAIN`, omitted when unset | Required when the media origin is a different host from the API: a host-only cookie set by `api.` is never sent to `media.` |
+
+### 3.5 Native Transport — the Header Carrier
+
+> Anchor section for the second transport. Everything above describes the
+> cookie path and remains the default.
+
+**The problem.** The cookie is attached by a **browser's** cookie jar. The
+two native players this product uses are not browsers:
+
+| | iOS `AVPlayer` | Android ExoPlayer / Media3 |
+|---|---|---|
+| Reads `NSHTTPCookieStorage` | No | n/a |
+| Sends a `Cookie` header | No | No (`DefaultHttpDataSource`) |
+| Can be given explicit headers | Yes (`AVPlayerItem` header set) | Yes (per-source `DataSource`) |
+
+React Native's `fetch` *does* have a cookie store, but that is irrelevant:
+the token is consumed by the player, not by `fetch`. And the app cannot work
+around it by reading the cookie and re-attaching it — it is `HttpOnly`, and
+`Secure` means it is discarded entirely over plaintext-HTTP dev.
+
+**Why not query-string signing?** Section §2: RFC 3986 §5.2.2 strips the
+query during relative-reference resolution, so a signed `master.m3u8` returns
+200 and every segment it names returns 403. A signed URL cannot authorize a
+stream made of dozens of objects. This applies to HLS, DASH and Smooth
+Streaming alike.
+
+**The fix.** One token, two carriers.
+
+```
+Django  GET /media/playback-token/<id>/
+        request:  Authorization: Bearer <access>
+                  X-EchoFlow-Client: native
+        response: {"status": "ok", "token": "<b64url-payload>.<b64url-hmac>"}
+                  Set-Cookie: ef_hls_token=... (ALSO set)
+
+Client  player.replace({ uri, headers: { 'X-EchoFlow-Media-Token': token } })
+        applied to the manifest AND every segment
+
+Edge    cookie? → header? → validate HMAC, version, exp, path scope
+```
+
+`expo-audio`'s `AudioSource.headers` applies the header to the entire
+request chain, which is exactly what RFC 3986 breaks for query strings.
+
+**Precedence is cookie-first, and that is a security decision.** A web
+page's own script cannot read the `HttpOnly` cookie, but it *can* set an
+arbitrary request header. Making the header authoritative would let any
+script on `app.echoflow.in` choose which credential the edge validates.
+Falling through to the header only when no token is extractable from the
+cookie keeps the web path byte-identical and adds native as strictly the
+otherwise-unauthenticated case.
+
+**The body token is opt-in.** The default body is unchanged
+(`{"status": "ok"}`) for any request without the header. `HttpOnly` exists
+to stop script from reading a bearer credential; putting the value in a
+response body that a logging interceptor or error reporter could capture
+widens exposure, so overriding that default should be something the caller
+asks for. The match is exact and case-sensitive. A caller that forges the
+header from a browser gains nothing — the token is already per-clip,
+HMAC-signed and expiry-checked.
+
+**Implementation.** Extraction lives in `workers/hls-token-worker/src/token.ts`
+as `extractTokenFromRequest()`; issuance in
+`backend/app/views/media.py::_token_response_body()`. Both are unit-tested
+(`src/token.test.ts`, `test_hls_token.py::TestNativeTokenTransport`), which
+is the point: the logic deciding *which credential the edge trusts* must not
+be the untested part.
 
 ### Per-Clip Scope Enforcement
 

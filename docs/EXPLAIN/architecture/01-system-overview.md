@@ -28,9 +28,9 @@
 ┌──────────────────────────────────────────────────┐  │  │ (feed refill)  │  │
 │              Object Storage (S3/MinIO)            │  │  └────────────────┘  │
 │  ┌─────────────────┐  ┌─────────────────────────┐ │  │  ┌────────────────┐  │
-│  │ uploads/        │  │ hls/ (public-read)      │ │  │  │ heavy_media    │  │
-│  │ (private,       │  │ • master.m3u8           │ │  │  │ (HLS + AI/ML)  │  │
-│  │  signed URLs)   │  │ • variant playlists     │ │  │  │ --pool=solo    │  │
+│  │ uploads/        │  │ hls/ (PRIVATE,          │ │  │  │ heavy_media    │  │
+│  │ (private,       │  │  token-gated at edge)   │ │  │  │ (HLS + AI/ML)  │  │
+│  │  signed URLs)   │  │ • master.m3u8 / .ts     │ │  │  │ --pool=solo    │  │
 │  └─────────────────┘  │ • .ts segments (MPEG-TS)│ │  │  └────────────────┘  │
 │                       └─────────────────────────┘ │  └──────────────────────┘
 └──────────────────────────────────────────────────┘

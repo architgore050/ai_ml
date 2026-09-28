@@ -85,9 +85,13 @@ Original uploads protected; derived HLS streams public (safe — they're transco
 
 ```python
 def get_hls_playback_url(object_key):
-    """Return browser-playable URL for HLS content (master.m3u8 or anything under hls/).
-    
-    NOT signed — hls/ prefix is public-read via bucket policy.
+    """Return a playable URL for HLS content (master.m3u8 or anything under hls/).
+
+    NOT signed — see the module docstring for why a single signed URL cannot
+    authorize a multi-file HLS stream. hls/ is PRIVATE and reachable only
+    through the validating edge (Cloudflare Worker, or nginx :9443 locally),
+    which requires a short-lived per-clip HMAC token: the ef_hls_token
+    cookie, or the X-EchoFlow-Media-Token header for native players.
     """
     if not object_key:
         return None

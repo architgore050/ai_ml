@@ -378,6 +378,38 @@ Owner confirmed `echoflow.in` is the registered zone. `echo-flow.in` →
 | `npx tsc --noEmit` | clean |
 | Full backend suite | **37 stable failures — identical to baseline. Zero regressions.** |
 
+### Live end-to-end verification of the native transport
+
+Unit tests are not sufficient for a change whose whole point is the wire
+format. Both transports were exercised through the real path — nginx `:18443`
+→ Django, nginx `:19443` → Worker → MinIO — against a seeded probe clip:
+
+| # | Check | Expected | Result |
+|---|---|---|---|
+| 1 | `X-EchoFlow-Client: native` | body contains `token` | ✅ `{"status":"ok","token":"eyJj…"}` |
+| 2 | no header (web default) | body unchanged | ✅ `{"status":"ok"}` |
+| 3 | header → `master.m3u8` | 200 | ✅ 200 |
+| 4 | no credential | 403 | ✅ 403 |
+| 5 | valid token, **different** clip's path | 403 | ✅ 403 (per-clip scope) |
+| 6 | native caller | cookie still set | ✅ `Set-Cookie: ef_hls_token=eyJj…` |
+| 7 | **bad cookie + good header** | 403 — cookie wins | ✅ 403 |
+| 8 | good cookie | 200 | ✅ 200 |
+| 9 | unrelated cookie + good header | 200 — fallback keys on the extracted **value**, not the header's presence | ✅ 200 |
+| 10 | header on a sub-resource | authorised (not 403) | ✅ 404 — token accepted, object absent |
+
+Two operational traps were hit and fixed during this, both now in
+`docs/EXPLAIN/storage/05-local-hls-worker-runbook.md` §"Before you trust a
+manual verification" and in `AGENTS.md`:
+
+- **gunicorn does not re-read bind-mounted source.** Checks 1–2 returned the
+  old body even though pytest passed and `grep` in the container showed the
+  new code. Fixed by restarting `web_local`. Diagnosing this by testing
+  against gunicorn directly on `:18000` (bypassing nginx) proved nginx was
+  not stripping the header.
+- **A stale `django-redis` connection 500s.** `ConnectionInterrupted` out of
+  the throttle check turned `/auth/login/` into a 500 debug page; transient,
+  cleared on retry.
+
 ### Establishing "zero regressions" rigorously
 
 A single full-suite run is not evidence; the failure set has to be

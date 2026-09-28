@@ -128,6 +128,25 @@ This document tracks where documentation (README, AGENTS.md, audit docs) conflic
 - Per-endpoint throttle scopes including the tighter `telemetry` scope
 - Per-request correlation_id via middleware + JSON log filter
 
+### Resolved 2026-09-28 — native media auth + CGNAT throttling
+
+Documents that asserted the *superseded* behaviour, now corrected at source.
+
+| # | Doc claimed | Actual | Status |
+|---|-------------|--------|--------|
+| 10 | `AGENTS.md`: "HLS token endpoint returns Set-Cookie, not JSON body — the frontend must NOT read the token from the response body" | The body token is **opt-in** for `X-EchoFlow-Client: native`; the web default is unchanged and must still ignore the body | ✅ Corrected |
+| 11 | `AGENTS.md`: "**Signed cookies are the only viable token mechanism for HLS**" | Too strong. A per-*prefix* credential is the requirement; the cookie is one carrier of it. Native players use the `X-EchoFlow-Media-Token` header | ✅ Corrected |
+| 12 | `FRONTEND-REQUIREMENTS.md` §1.1: `/auth/token/refresh/` = bare `TokenRefreshView`, default `user` throttle | `ThrottledTokenRefreshView`, `token_refresh` 120/hour keyed on the **verified** token subject | ✅ Corrected |
+| 13 | `FRONTEND-REQUIREMENTS.md` §1.1 + §4.8: `register` = 5/hour/IP | 200/hour per IP **plus** `register_username` 3/hour | ✅ Corrected |
+| 14 | `auth/04-rate-limiting.md`: only `anon` + `user` scopes; refresh/login/register all 100/hr per IP | 17 scopes, and the audit's "Critical Gaps" / "Recommended Improvements" are historical | ✅ Rewritten; audit sections labelled |
+| 15 | `storage/03-bucket-policies.md`: `mc anonymous set download .../hls` as an init step | Removed. `hls/` is private, token-gated at the edge | ✅ Corrected (file contradicted itself — see #19) |
+| 16 | `storage/01-s3-architecture.md`: "current implementation uses public-read for `hls/`" | Private + token-gated | ✅ Corrected |
+| 17 | `storage/02-hls-playback.md`: public-read design + `mc anonymous set download` | Historical; §2 (why query signing fails) still holds | ✅ Labelled historical |
+| 18 | `DEPLOYMENT/04-cloudflare-config.md`: prescribes a `PublicReadHLS` bucket policy | Contradicts `02-vps-setup.md` step 4. Bucket is fully private behind the Worker | ✅ Corrected (see #19) |
+| 19 | — | `03-bucket-policies.md` told you to make `hls/` public while its own ACL Summary said token-gated; `04-cloudflare-config.md` contradicted `02-vps-setup.md`. **The failure mode: following either doc makes every transcript readable without a token, while the Worker still 403s — so it presents as a broken edge, not a security hole** | ✅ Both corrected |
+| 20 | `DEPLOYMENT/05-data-flow.md`: `hls/` "served by R2 custom domain, public-read" | Served by the Worker, which reads R2 through a binding | ✅ Corrected |
+| 21 | `decisions/01-key-decisions.md`: DECISION "Split ACL (hls/ public)" with a SECURITY comment claiming it "is not a data leak" | Superseded. The reasoning was wrong — segments are verbatim transcripts | ✅ Marked superseded |
+
 ### Low Priority (Minor)
 - Service count mismatch (7 vs 8 in docker-compose) — was 8; Phase 1.0 brings it to 11 (db, redis_broker, redis_cache, pgbouncer, minio, minio-init, web, celery, celery_feed, celery_media, celery_beat)
 - AI/ML directory has stubs not implementations

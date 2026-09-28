@@ -228,7 +228,7 @@ def get_clip_hls_url(self, obj):
 The recommended approach for token-protected HLS over Cloudflare R2:
 
 1. R2 bucket `hls/` prefix becomes **private** (remove public-read bucket policy)
-2. A [Cloudflare Worker](https://developers.cloudflare.com/workers/) at `media.echo-flow.in`
+2. A [Cloudflare Worker](https://developers.cloudflare.com/workers/) at `media.echoflow.in`
    validates an HMAC-signed cookie on every `/hls/*` request
 3. If valid → Worker proxies to R2 via the Workers R2 binding (`env.HLS_BUCKET.get(key, {range: request.headers})`)
 4. If invalid → 403

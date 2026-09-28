@@ -65,7 +65,7 @@ This means **anyone** who knows or guesses a clip's UUID can download the HLS ma
 
 A signed URL's signature lives in its **query string**:
 ```
-https://media.echo-flow.in/hls/abc-123/master.m3u8?verify=1234567890-abcdef==
+https://media.echoflow.in/hls/abc-123/master.m3u8?verify=1234567890-abcdef==
 ```
 
 The `master.m3u8` playlist references variant playlists via **relative paths**:
@@ -78,7 +78,7 @@ index.m3u8
 Per RFC 3986 §5.2.2, resolving a relative reference against a base URL **does NOT carry the base URL's query string forward**. So:
 
 1. Browser loads signed `master.m3u8` → ✓ 200 OK
-2. Browser resolves `index.m3u8` (relative) → `https://media.echo-flow.in/hls/abc-123/index.m3u8` — **no signature**
+2. Browser resolves `index.m3u8` (relative) → `https://media.echoflow.in/hls/abc-123/index.m3u8` — **no signature**
 3. Browser requests `index.m3u8` → ✗ 403 Forbidden
 
 This is true against **all** S3-compatible storage: AWS S3, Google Cloud Storage, Azure Blob, MinIO, and Cloudflare R2. It is not a bug — it is fundamental to how HTTP + signed URLs work.
@@ -102,19 +102,19 @@ The "protect an entire URI path prefix" variant ([docs](https://developers.cloud
 
 ### The Cookie Advantage
 
-Unlike query-string signatures, **HTTP cookies are sent automatically by the browser on every request to the cookie's domain and path**. hls.js makes standard HTTP requests (fetch/XHR) for the master playlist, variant playlists, and segments — all to the same origin (`media.echo-flow.in`). A cookie scoped to `Path=/hls/` will be included on **every** HLS subrequest without any frontend URL manipulation.
+Unlike query-string signatures, **HTTP cookies are sent automatically by the browser on every request to the cookie's domain and path**. hls.js makes standard HTTP requests (fetch/XHR) for the master playlist, variant playlists, and segments — all to the same origin (`media.echoflow.in`). A cookie scoped to `Path=/hls/` will be included on **every** HLS subrequest without any frontend URL manipulation.
 
 ```
 Browser cookie jar:
-  Domain: media.echo-flow.in (or .echo-flow.in for shared scope)
+  Domain: media.echoflow.in (or .echoflow.in for shared scope)
   Path:   /hls/
   Name:   ef_hls_token
   Value:  <hmac_signed_token>
 
 Every request to:
-  https://media.echo-flow.in/hls/<clip_id>/master.m3u8  → cookie sent ✓
-  https://media.echo-flow.in/hls/<clip_id>/index.m3u8   → cookie sent ✓
-  https://media.echo-flow.in/hls/<clip_id>/segment_0.ts → cookie sent ✓
+  https://media.echoflow.in/hls/<clip_id>/master.m3u8  → cookie sent ✓
+  https://media.echoflow.in/hls/<clip_id>/index.m3u8   → cookie sent ✓
+  https://media.echoflow.in/hls/<clip_id>/segment_0.ts → cookie sent ✓
 ```
 
 ### Validation Layer Placement
@@ -184,22 +184,22 @@ The frontend proactively fetches a new token when the old one is about to expire
 ### Architecture
 
 ```
-Browser (app.echo-flow.in)
+Browser (app.echoflow.in)
   │
   │ GET /feed/  (JWT authenticated)
   ▼
-API (api.echo-flow.in → Cloudflare Tunnel → nginx → gunicorn → Django)
+API (api.echoflow.in → Cloudflare Tunnel → nginx → gunicorn → Django)
   │
-  │ Response: clips with hls_playlist_url: "https://media.echo-flow.in/hls/<id>/master.m3u8"
+  │ Response: clips with hls_playlist_url: "https://media.echoflow.in/hls/<id>/master.m3u8"
   │
   │ GET /media/playback-token/<clip_id>/  (JWT authenticated)
-  │ ←→ Set-Cookie: ef_hls_token=...; Domain=.echo-flow.in; Path=/hls/
+  │ ←→ Set-Cookie: ef_hls_token=...; Domain=.echoflow.in; Path=/hls/
   ▼
-Browser cookie jar now contains ef_hls_token for media.echo-flow.in/hls/
+Browser cookie jar now contains ef_hls_token for media.echoflow.in/hls/
   │
-  │ GET https://media.echo-flow.in/hls/<clip_id>/master.m3u8  (cookie auto-sent)
+  │ GET https://media.echoflow.in/hls/<clip_id>/master.m3u8  (cookie auto-sent)
   ▼
-Cloudflare Worker (media.echo-flow.in → Worker route)
+Cloudflare Worker (media.echoflow.in → Worker route)
   │
   │ 1. Validate ef_hls_token cookie (HMAC + expiry + clip scope)
   │ 2. If invalid → 403
@@ -276,8 +276,8 @@ name = "echoflow-hls-token"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
 
-# Route: media.echo-flow.in/* → Worker (replaces direct R2 custom domain)
-routes = [{ pattern = "media.echo-flow.in/*", zone_name = "echo-flow.in" }]
+# Route: media.echoflow.in/* → Worker (replaces direct R2 custom domain)
+routes = [{ pattern = "media.echoflow.in/*", zone_name = "echoflow.in" }]
 
 # R2 bucket binding (the same bucket EchoFlow uses)
 [[r2_buckets]]
@@ -305,7 +305,7 @@ npx wrangler deploy
 npx wrangler secret put MEDIA_TOKEN_SECRET
 # (paste the same value as MEDIA_TOKEN_SECRET in your VPS .env)
 
-# 5. Update Cloudflare DNS: media.echo-flow.in now points to the Worker,
+# 5. Update Cloudflare DNS: media.echoflow.in now points to the Worker,
 #    not directly to R2. The R2 custom domain is removed.
 ```
 
@@ -681,7 +681,7 @@ This is the exhaustive list of every file that will be modified or created, orga
 
 | File | Change | Why |
 |------|--------|-----|
-| `docs/EXPLAIN/DEPLOYMENT/04-cloudflare-config.md` | Update: `media.echo-flow.in` now points to Worker, not R2 direct | Document the new deployment step |
+| `docs/EXPLAIN/DEPLOYMENT/04-cloudflare-config.md` | Update: `media.echoflow.in` now points to Worker, not R2 direct | Document the new deployment step |
 | `docs/EXPLAIN/DEPLOYMENT/02-vps-setup.md` | Add Worker deployment step | Operational guide update |
 | `scripts/vps-deploy.sh` | Add optional Worker deploy step | Automate deployment |
 
@@ -875,8 +875,8 @@ class PlaybackTokenView(APIView):
 
     The cookie Domain attribute is set from MEDIA_TOKEN_COOKIE_DOMAIN (default:
     the current request's domain). In production, this should be the parent
-    domain (e.g. ".echo-flow.in") so it covers both api.echo-flow.in and
-    media.echo-flow.in.
+    domain (e.g. ".echoflow.in") so it covers both api.echoflow.in and
+    media.echoflow.in.
     """
     permission_classes = [permissions.IsAuthenticated]
     throttle_scope = 'interaction'  # reuse interaction throttle (60/min/user)
@@ -948,8 +948,8 @@ MEDIA_TOKEN_SECRET = os.environ.get("MEDIA_TOKEN_SECRET", "")
 # but long enough for a full playback session of a 5-minute clip.
 MEDIA_TOKEN_TTL_SECONDS = int(os.getenv("MEDIA_TOKEN_TTL_SECONDS", "600"))
 # Domain attribute for the HLS token cookie. In production (multi-subdomain),
-# set to ".echo-flow.in" so the cookie covers both api.echo-flow.in and
-# media.echo-flow.in. In dev (single host), leave empty so the browser
+# set to ".echoflow.in" so the cookie covers both api.echoflow.in and
+# media.echoflow.in. In dev (single host), leave empty so the browser
 # defaults to the current domain.
 MEDIA_TOKEN_COOKIE_DOMAIN = os.getenv("MEDIA_TOKEN_COOKIE_DOMAIN", "")
 ```
@@ -994,7 +994,7 @@ export const mediaAPI = {
       },
       // credentials: 'include' is needed so the browser accepts the Set-Cookie
       // from the API response even though the cookie domain differs from the
-      // API domain (api.echo-flow.in vs media.echo-flow.in)
+      // API domain (api.echoflow.in vs media.echoflow.in)
       credentials: 'include',
     });
 
@@ -1028,7 +1028,7 @@ const loadSource = useCallback(async (clip: AudioClip) => {
   // DECISION: Fetch a short-lived playback token BEFORE loading HLS.
   // The token is set as a signed cookie by the Django response, and
   // the browser automatically sends it on all HLS subrequests to
-  // media.echo-flow.in/hls/<clip_id>/* (master.m3u8, variants, segments).
+  // media.echoflow.in/hls/<clip_id>/* (master.m3u8, variants, segments).
   // Without this, the Cloudflare Worker / nginx would return 403.
   try {
     await mediaAPI.getPlaybackToken(clip.id);
@@ -1061,9 +1061,9 @@ This is **already present** and needs no change. The token endpoint will be at `
 
 ### 9.4 Environment Variable — `VITE_HLS_COOKIE_DOMAIN`
 
-In production, the cookie must be set with `Domain=.echo-flow.in` (cross-subdomain). This value needs to reach the frontend so the player knows the cookie scope. Add to vite config:
+In production, the cookie must be set with `Domain=.echoflow.in` (cross-subdomain). This value needs to reach the frontend so the player knows the cookie scope. Add to vite config:
 
-Actually, the cookie Domain is set by the **server** (Django), not the frontend. The frontend just needs to know that the cookie was set successfully (by checking the response). The `credentials: 'include'` header in the fetch request ensures the browser honors the `Set-Cookie` from `api.echo-flow.in` for the `.echo-flow.in` domain.
+Actually, the cookie Domain is set by the **server** (Django), not the frontend. The frontend just needs to know that the cookie was set successfully (by checking the response). The `credentials: 'include'` header in the fetch request ensures the browser honors the `Set-Cookie` from `api.echoflow.in` for the `.echoflow.in` domain.
 
 No frontend env var is needed. The cookie Domain is controlled by `MEDIA_TOKEN_COOKIE_DOMAIN` on the backend.
 
@@ -1090,9 +1090,9 @@ Remove the `hls/*` public-read policy from the R2 bucket. The bucket becomes ful
 
 **Step 3: Update Cloudflare DNS**
 
-Change `media.echo-flow.in` from a R2 custom domain (CNAME to R2) to a **Worker route**. This is done in the Cloudflare dashboard:
-- Remove the R2 custom domain for `media.echo-flow.in`
-- The Worker's `wrangler.toml` `routes` entry (`media.echo-flow.in/*`) takes over
+Change `media.echoflow.in` from a R2 custom domain (CNAME to R2) to a **Worker route**. This is done in the Cloudflare dashboard:
+- Remove the R2 custom domain for `media.echoflow.in`
+- The Worker's `wrangler.toml` `routes` entry (`media.echoflow.in/*`) takes over
 
 **Step 4: Set MEDIA_TOKEN_SECRET**
 
@@ -1110,7 +1110,7 @@ MEDIA_TOKEN_SECRET=change-me-to-64-hex-chars
 
 ```bash
 # In .env.vps (not .example — this is deployment-specific):
-MEDIA_TOKEN_COOKIE_DOMAIN=.echo-flow.in
+MEDIA_TOKEN_COOKIE_DOMAIN=.echoflow.in
 ```
 
 ### 10.2 Development (Option B — nginx njs)
@@ -1307,11 +1307,11 @@ The `diagnostics/check_pipeline.py` and `diagnostics/test_hls_playback.py` scrip
 2. **Set Worker secret** (`npx wrangler secret put MEDIA_TOKEN_SECRET`) — same value as VPS `.env`
 3. **Deploy backend** — new token API endpoint is live but Worker not yet routing
 4. **Frontend deploy** — player calls token endpoint before HLS load
-5. **Switch DNS** — `media.echo-flow.in` CNAME changes from R2 to Worker
+5. **Switch DNS** — `media.echoflow.in` CNAME changes from R2 to Worker
 6. **Remove R2 public-read policy** — `hls/*` becomes private
 7. **Verify** — playback works end-to-end; anonymous requests get 403
 
-**Rollback:** Revert DNS `media.echo-flow.in` back to R2 direct + re-add the public-read bucket policy. No data changes — HLS objects are untouched.
+**Rollback:** Revert DNS `media.echoflow.in` back to R2 direct + re-add the public-read bucket policy. No data changes — HLS objects are untouched.
 
 ### Migration Steps (Dev)
 
@@ -1340,8 +1340,8 @@ The migration is **zero-downtime** because:
 
 | Issue | Mitigation |
 |-------|------------|
-| Safari/iOS third-party cookie blocking | `SameSite=Lax` + `Secure` on same-site requests works. The cookie is set from `api.echo-flow.in` for Domain=`.echo-flow.in`, and sent to `media.echo-flow.in` — these are same-site (both Cloudflare-proxied). Safari's ITP treats same-site cross-subdomain as first-party. |
-| Cookie Domain configuration | Default (empty) = current request domain. For dev (localhost), this works out of the box. For prod, `.echo-flow.in` must be set. |
+| Safari/iOS third-party cookie blocking | `SameSite=Lax` + `Secure` on same-site requests works. The cookie is set from `api.echoflow.in` for Domain=`.echoflow.in`, and sent to `media.echoflow.in` — these are same-site (both Cloudflare-proxied). Safari's ITP treats same-site cross-subdomain as first-party. |
+| Cookie Domain configuration | Default (empty) = current request domain. For dev (localhost), this works out of the box. For prod, `.echoflow.in` must be set. |
 | Token endpoint not deployed but frontend calls it | Frontend catches the 404/403 and displays an error. Users without a fresh deploy can still access the old public URLs. |
 | Worker cold start | ~5ms cold start on first request; after that, requests are served from warm instances. For 5-10 users, this is negligible. |
 | njs crypto module availability | The `nginx:1.27-alpine` image with `nginx-mod-njs` provides `crypto.subtle` (Web Crypto API) — verified in njs docs. |
@@ -1438,20 +1438,20 @@ All three implementations must agree on:
 
 ```
 Step 1: User opens feed
-  Browser → GET https://api.echo-flow.in/feed/
+  Browser → GET https://api.echoflow.in/feed/
   Headers: Authorization: Bearer <JWT>
-  Response: { clips: [{ hls_playlist_url: "https://media.echo-flow.in/hls/abc-123/master.m3u8" }] }
+  Response: { clips: [{ hls_playlist_url: "https://media.echoflow.in/hls/abc-123/master.m3u8" }] }
 
 Step 2: Playback initiated (clip comes into view)
-  Browser → GET https://api.echo-flow.in/media/playback-token/abc-123/
+  Browser → GET https://api.echoflow.in/media/playback-token/abc-123/
   Headers: Authorization: Bearer <JWT>
   Response: 200 OK
-  Set-Cookie: ef_hls_token=<HMAC_TOKEN>; Domain=.echo-flow.in; Path=/hls/; Secure; HttpOnly; SameSite=Lax; Max-Age=600
+  Set-Cookie: ef_hls_token=<HMAC_TOKEN>; Domain=.echoflow.in; Path=/hls/; Secure; HttpOnly; SameSite=Lax; Max-Age=600
   ↓
   Browser cookie jar stores the cookie
 
 Step 3: hls.js requests master.m3u8
-  Browser → GET https://media.echo-flow.in/hls/abc-123/master.m3u8
+  Browser → GET https://media.echoflow.in/hls/abc-123/master.m3u8
   Headers: Cookie: ef_hls_token=<HMAC_TOKEN>  ← automatically sent
   ↓
   Cloudflare Worker:
@@ -1463,13 +1463,13 @@ Step 3: hls.js requests master.m3u8
     6. If any fail → 403
 
 Step 4: hls.js requests variant playlist (relative URL)
-  Browser → GET https://media.echo-flow.in/hls/abc-123/index.m3u8
+  Browser → GET https://media.echoflow.in/hls/abc-123/index.m3u8
   Headers: Cookie: ef_hls_token=<HMAC_TOKEN>  ← automatically sent (same domain + /hls/ path)
   ↓
   Cloudflare Worker validates → proxies to R2 ✓
 
 Step 5: hls.js requests segments (relative URLs)
-  Browser → GET https://media.echo-flow.in/hls/abc-123/segment_000.ts
+  Browser → GET https://media.echoflow.in/hls/abc-123/segment_000.ts
   Headers: Cookie: ef_hls_token=<HMAC_TOKEN>  ← automatically sent
   ↓
   Cloudflare Worker validates → proxies to R2 ✓

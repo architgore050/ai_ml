@@ -2,10 +2,10 @@
 
 > **Target:** ~$6/month (or $0/month with Oracle Always Free).  
 > **Architecture:** Small VPS (light services) + Laptop (heavy media worker) + Cloudflare R2 (object storage) + Tailscale (private connectivity).  
-> **Domain:** `echo-flow.in`  
-> **Frontend:** Cloudflare Pages at `app.echo-flow.in`  
-> **API:** `api.echo-flow.in` (Cloudflare Tunnel → VPS nginx → gunicorn)  
-> **HLS Playback:** `media.echo-flow.in` (Cloudflare Custom Domain → R2, direct, no VPS hop)  
+> **Domain:** `echoflow.in`  
+> **Frontend:** Cloudflare Pages at `app.echoflow.in`  
+> **API:** `api.echoflow.in` (Cloudflare Tunnel → VPS nginx → gunicorn)  
+> **HLS Playback:** `media.echoflow.in` (Cloudflare Custom Domain → R2, direct, no VPS hop)  
 > **Connectivity:** Tailscale subnet router for laptop → VPS private network
 
 ---
@@ -80,9 +80,9 @@ All services share one Docker network. Media is stored on MinIO. The `api` Docke
 
 | Hostname | Route | Purpose |
 |---|---|---|
-| `api.echo-flow.in` | Cloudflare Tunnel → VPS cloudflared → nginx → gunicorn | API entrypoint |
-| `media.echo-flow.in` | Cloudflare Custom Domain → R2 (direct) | HLS playback |
-| `app.echo-flow.in` | Cloudflare Pages | Frontend |
+| `api.echoflow.in` | Cloudflare Tunnel → VPS cloudflared → nginx → gunicorn | API entrypoint |
+| `media.echoflow.in` | Cloudflare Custom Domain → R2 (direct) | HLS playback |
+| `app.echoflow.in` | Cloudflare Pages | Frontend |
 
 **Removed from VPS**: `pgbouncer`, `minio`, `minio-init`, `celery_media`, `prometheus`, `grafana`.
 
@@ -92,7 +92,7 @@ All services share one Docker network. Media is stored on MinIO. The `api` Docke
 2. **`docker/nginx.conf`** — Reused as-is on VPS. The unused `minio_backend` upstream and `:9443` server block are harmless because port 9443 is not published on the VPS compose.
 3. **Heartbeat Redis** — Broker Redis (`REDIS_BROKER_URL`). The laptop writes the heartbeat key; the API reads from the same place.
 4. **Laptop → VPS connectivity** — **Tailscale** with subnet router (`172.28.0.0/16`). Fixed Docker IPs via `networks:` block. No public ports exposed.
-5. **Cloudflare Tunnel** — VPS runs `cloudflared` for `api.echo-flow.in` (user installs separately). Laptop runs `cloudflared` optionally for API access.
+5. **Cloudflare Tunnel** — VPS runs `cloudflared` for `api.echoflow.in` (user installs separately). Laptop runs `cloudflared` optionally for API access.
 6. **pg_dump** — Local disk (`/backups/echoflow-$(date +%F).sql.gz`) → upload to R2 via `aws s3 cp` or `mc cp`.
 7. **Gunicorn workers** — In `.env.vps.example` (`GUNICORN_WORKERS=2` for 4 GB VPS).
 8. **PgBouncer** — Removed. Direct DB connection at 50 users. Saves ~256 MB RAM.
@@ -141,10 +141,10 @@ All services share one Docker network. Media is stored on MinIO. The `api` Docke
 ### 3.1 User Uploads a Clip (Unchanged Code Path)
 
 ```
-Browser (app.echo-flow.in)
+Browser (app.echoflow.in)
   │ POST /clips/ (multipart/form-data)
   ▼
-Cloudflare (api.echo-flow.in, TLS + Bot Fight Mode)
+Cloudflare (api.echoflow.in, TLS + Bot Fight Mode)
   │
   ▼
 Cloudflare Tunnel → VPS cloudflared → nginx (:443)
@@ -220,11 +220,11 @@ process_audio_to_hls() [backend/app/tasks.py:165+]
 ### 3.4 Browser Plays HLS (NEW Path: Direct to R2)
 
 ```
-Browser (app.echo-flow.in)
-  │ GET https://media.echo-flow.in/hls/{clip_id}/master.m3u8
+Browser (app.echoflow.in)
+  │ GET https://media.echoflow.in/hls/{clip_id}/master.m3u8
   │ (URL was baked into the feed response by media_urls.py:43-59)
   ▼
-Cloudflare (media.echo-flow.in, Custom Domain)
+Cloudflare (media.echoflow.in, Custom Domain)
   │
   ▼
 R2 (echoflow-media bucket, hls/ prefix, public-read)
@@ -258,10 +258,10 @@ This is the **only new code** — a single view + one URL route + one test.
 
 ### 4.1 Cloudflare Tunnel (VPS → Cloudflare)
 
-The VPS runs `cloudflared` to expose `api.echo-flow.in` to the public internet. This is the ONLY public-facing tunnel.
+The VPS runs `cloudflared` to expose `api.echoflow.in` to the public internet. This is the ONLY public-facing tunnel.
 
 ```
-Browser → Cloudflare (api.echo-flow.in) → VPS cloudflared → nginx → gunicorn
+Browser → Cloudflare (api.echoflow.in) → VPS cloudflared → nginx → gunicorn
 ```
 
 **Configuration (user installs separately):**
@@ -272,7 +272,7 @@ tunnel: <tunnel-uuid>
 credentials-file: /etc/cloudflared/<tunnel-uuid>.json
 
 ingress:
-  - hostname: api.echo-flow.in
+  - hostname: api.echoflow.in
     service: http://nginx:80
   - service: http_status:404
 ```
@@ -327,12 +327,12 @@ The Tailscale IPs (`172.28.0.2`, `172.28.0.3`, `172.28.0.4`) are the Docker cont
 
 R2 supports custom domains via Cloudflare. The user must:
 1. Create a custom domain in the R2 bucket settings
-2. Point `media.echo-flow.in` at the R2 `r2.dev` subdomain
+2. Point `media.echoflow.in` at the R2 `r2.dev` subdomain
 3. Cloudflare handles TLS (Universal SSL, free)
 
 ### 4.4 Cloudflare Pages (Frontend)
 
-The frontend at `app.echo-flow.in` is hosted on Cloudflare Pages. The user must:
+The frontend at `app.echoflow.in` is hosted on Cloudflare Pages. The user must:
 1. Connect their GitHub repo to Cloudflare Pages
 2. Set build command: `npm run build`
 3. Set output directory: `dist/`
@@ -415,9 +415,9 @@ The frontend at `app.echo-flow.in` is hosted on Cloudflare Pages. The user must:
 |---|---|---|
 | `DATABASE_URL` | `postgres://echoflow:…@pgbouncer:6432/echoflow_db` | `postgres://echoflow:…@db:5432/echoflow_db` |
 | `AWS_S3_ENDPOINT_URL` | `http://minio:9000` | `https://<accountid>.r2.cloudflarestorage.com` |
-| `PUBLIC_MEDIA_ENDPOINT_URL` | `https://localhost:9443` | `https://media.echo-flow.in` |
-| `DJANGO_ALLOWED_HOSTS` | `localhost,127.0.0.1` | `api.echo-flow.in,media.echo-flow.in` |
-| `DJANGO_CORS_ALLOWED_ORIGINS` | `https://localhost:3000,...` | `https://app.echo-flow.in` |
+| `PUBLIC_MEDIA_ENDPOINT_URL` | `https://localhost:9443` | `https://media.echoflow.in` |
+| `DJANGO_ALLOWED_HOSTS` | `localhost,127.0.0.1` | `api.echoflow.in,media.echoflow.in` |
+| `DJANGO_CORS_ALLOWED_ORIGINS` | `https://localhost:3000,...` | `https://app.echoflow.in` |
 | `GUNICORN_WORKERS` | `4` | `2` (4 GB VPS) |
 | `redis_cache` maxmemory | `3gb` | `1gb` (hardcoded) |
 | `nginx` ports | `80:80`, `443:443`, `9443:9443` | `80:80`, `443:443` (no 9443) |
@@ -466,8 +466,8 @@ services:
 |---|---|
 | `DJANGO_DEBUG` | `False` |
 | `DJANGO_SECRET_KEY` | `change-me` (with generation hint) |
-| `DJANGO_ALLOWED_HOSTS` | `api.echo-flow.in,media.echo-flow.in` |
-| `DJANGO_CORS_ALLOWED_ORIGINS` | `https://app.echo-flow.in` |
+| `DJANGO_ALLOWED_HOSTS` | `api.echoflow.in,media.echoflow.in` |
+| `DJANGO_CORS_ALLOWED_ORIGINS` | `https://app.echoflow.in` |
 | `DB_NAME` | `echoflow_db` |
 | `DB_USER` | `echoflow` |
 | `DB_PASSWORD` | `change-me-strong-password` |
@@ -481,7 +481,7 @@ services:
 | `AWS_S3_ENDPOINT_URL` | `https://<accountid>.r2.cloudflarestorage.com` |
 | `AWS_S3_REGION_NAME` | `auto` (R2) |
 | `AWS_S3_QUERYSTRING_EXPIRE` | `3600` |
-| `PUBLIC_MEDIA_ENDPOINT_URL` | `https://media.echo-flow.in` |
+| `PUBLIC_MEDIA_ENDPOINT_URL` | `https://media.echoflow.in` |
 | `HF_TOKEN` | (empty — not needed) |
 | `SENTRY_DSN` | (empty — optional) |
 | `SENTRY_ENV` | `production` |
@@ -555,8 +555,8 @@ echo "=== VPS Deploy Complete ==="
 echo "Next steps:"
 echo "  1. Configure Cloudflare Tunnel (user installs cloudflared)"
 echo "  2. Configure R2 bucket policy (hls/ public-read)"
-echo "  3. Configure Cloudflare Custom Domain (media.echo-flow.in → R2)"
-echo "  4. Verify: curl -I https://api.echo-flow.in/health/"
+echo "  3. Configure Cloudflare Custom Domain (media.echoflow.in → R2)"
+echo "  4. Verify: curl -I https://api.echoflow.in/health/"
 ```
 
 ### 6.4 Commit 4: `feat(api): add /api/v1/health/media-worker/ heartbeat endpoint`
@@ -722,7 +722,7 @@ volumes:
 |---|---|
 | `DJANGO_DEBUG` | `False` |
 | `DJANGO_SECRET_KEY` | `<same-as-vps>` (must match — signed cookies) |
-| `DJANGO_ALLOWED_HOSTS` | `api.echo-flow.in` (laptop doesn't serve HTTP) |
+| `DJANGO_ALLOWED_HOSTS` | `api.echoflow.in` (laptop doesn't serve HTTP) |
 | `DB_NAME` | `echoflow_db` |
 | `DB_USER` | `echoflow` |
 | `DB_PASSWORD` | `<same-as-vps>` |
@@ -870,20 +870,20 @@ The heartbeat script must start **after** the `celery_media` worker starts. If t
 
 The R2 bucket must have a bucket policy that makes `hls/*` public-read and keeps `uploads/*` private. This is set in the Cloudflare dashboard, not in code. If the user forgets to set this, HLS playback will fail with 403 errors.
 
-**Mitigation:** The deploy scripts should include a verification step: `curl -I https://media.echo-flow.in/hls/test-master.m3u8` to check that HLS files are accessible.
+**Mitigation:** The deploy scripts should include a verification step: `curl -I https://media.echoflow.in/hls/test-master.m3u8` to check that HLS files are accessible.
 
-### 9.8 `media.echo-flow.in` Custom Domain configuration
+### 9.8 `media.echoflow.in` Custom Domain configuration
 
 R2 supports custom domains via Cloudflare. The user must:
 1. Create a custom domain in the R2 bucket settings
-2. Point `media.echo-flow.in` at the R2 `r2.dev` subdomain
+2. Point `media.echoflow.in` at the R2 `r2.dev` subdomain
 3. Cloudflare handles TLS (Universal SSL, free)
 
-**Risk:** If the custom domain is not configured, `PUBLIC_MEDIA_ENDPOINT_URL=https://media.echo-flow.in` will 404. The user must configure this in the Cloudflare dashboard.
+**Risk:** If the custom domain is not configured, `PUBLIC_MEDIA_ENDPOINT_URL=https://media.echoflow.in` will 404. The user must configure this in the Cloudflare dashboard.
 
 ### 9.9 CORS for the frontend
 
-The frontend at `app.echo-flow.in` makes requests to `api.echo-flow.in`. Django's `CORS_ALLOWED_ORIGINS` must include `https://app.echo-flow.in`. This is set in `.env.vps.example`.
+The frontend at `app.echoflow.in` makes requests to `api.echoflow.in`. Django's `CORS_ALLOWED_ORIGINS` must include `https://app.echoflow.in`. This is set in `.env.vps.example`.
 
 **Risk:** If the user sets `DJANGO_CORS_ALLOWED_ORIGINS` incorrectly, the browser will block preflight requests and the frontend will fail to load data.
 
@@ -1022,14 +1022,14 @@ These are operational validations, not code validations. They must be done manua
 
 ### 13.1 Assumptions
 
-1. **The user has a Cloudflare account** with the domain `echo-flow.in` already registered and nameservers pointing to Cloudflare.
+1. **The user has a Cloudflare account** with the domain `echoflow.in` already registered and nameservers pointing to Cloudflare.
 2. **The user has a Hetzner or Oracle account** for the VPS.
 3. **The user's laptop has Docker installed** (or will install it).
 4. **The user's laptop has 8+ GB RAM** (required for Whisper + ST + KeyBERT).
 5. **The user's laptop has a stable internet connection** (required for tunnel connectivity).
 6. **The user will create the R2 bucket and set the bucket policy** in the Cloudflare dashboard (not in code).
-7. **The user will configure the Cloudflare Custom Domain** for `media.echo-flow.in` (not in code).
-8. **The user will configure the Cloudflare Tunnel** with the public hostname `api.echo-flow.in` (not in code).
+7. **The user will configure the Cloudflare Custom Domain** for `media.echoflow.in` (not in code).
+8. **The user will configure the Cloudflare Tunnel** with the public hostname `api.echoflow.in` (not in code).
 9. **The user will install Tailscale** on both the VPS and the laptop (not in code).
 10. **The user will install cloudflared** on the VPS (not in code, user installs separately).
 
@@ -1038,7 +1038,7 @@ These are operational validations, not code validations. They must be done manua
 1. **Which Hetzner instance?** The doc mentions CX22 (4 GB) and CPX21 (8 GB). The VPS compose assumes 4 GB. If the user gets an 8 GB instance, they can increase `GUNICORN_WORKERS` and `redis_cache` memory.
 2. **Oracle A1 ARM architecture?** If the user uses Oracle A1 (ARM), the Docker images must be multi-arch or built on ARM. The existing `Dockerfile` uses `python:3.11-slim-bookworm` which supports ARM.
 3. **Frontend build process?** The doc assumes Cloudflare Pages. The user needs to configure the build command (`npm run build`) and output directory (`dist/`).
-4. **SSL certificate for `api.echo-flow.in`?** Cloudflare's Universal SSL handles this automatically. No manual cert management needed.
+4. **SSL certificate for `api.echoflow.in`?** Cloudflare's Universal SSL handles this automatically. No manual cert management needed.
 5. **`DJANGO_SECRET_KEY` and `FIELD_ENCRYPTION_KEY` generation?** The `.env.vps.example` should include hints for generating these (like the existing `.env.example` does for `DJANGO_SECRET_KEY`).
 
 ### 13.3 Conflicts with Existing Implementation
@@ -1051,14 +1051,14 @@ These are operational validations, not code validations. They must be done manua
 
 ### 14.1 Pre-Deployment (Cloudflare)
 
-- [ ] Add `echo-flow.in` to Cloudflare
+- [ ] Add `echoflow.in` to Cloudflare
 - [ ] Update nameservers at registrar to point to Cloudflare
 - [ ] Create R2 bucket: `echoflow-media`
 - [ ] Create R2 API Token: `Object Read & Write` scoped to bucket
 - [ ] Set R2 bucket policy: `hls/*` public-read, `uploads/*` private
-- [ ] Configure Cloudflare Custom Domain: `media.echo-flow.in` → R2 `r2.dev` subdomain
+- [ ] Configure Cloudflare Custom Domain: `media.echoflow.in` → R2 `r2.dev` subdomain
 - [ ] Create Cloudflare Tunnel: `echoflow-vps`
-- [ ] Add public hostname: `api.echo-flow.in` → `http://nginx:80`
+- [ ] Add public hostname: `api.echoflow.in` → `http://nginx:80`
 
 ### 14.2 Pre-Deployment (VPS)
 
@@ -1070,7 +1070,7 @@ These are operational validations, not code validations. They must be done manua
 - [ ] Clone repo, checkout `feat/hybrid-vps`
 - [ ] Copy `.env.vps.example` to `.env`, fill in real values
 - [ ] Run `bash scripts/vps-deploy.sh`
-- [ ] Verify: `curl -I https://api.echo-flow.in/health/` → 200
+- [ ] Verify: `curl -I https://api.echoflow.in/health/` → 200
 
 ### 14.3 Pre-Deployment (Laptop)
 
@@ -1080,7 +1080,7 @@ These are operational validations, not code validations. They must be done manua
 - [ ] Copy `.env.laptop.example` to `.env`, fill in real values
 - [ ] Run `bash scripts/laptop-deploy.sh`
 - [ ] Run `nohup bash scripts/laptop-heartbeat.sh > /tmp/heartbeat.log 2>&1 &`
-- [ ] Verify: `curl -I https://api.echo-flow.in/api/v1/health/media-worker/` → 200
+- [ ] Verify: `curl -I https://api.echoflow.in/api/v1/health/media-worker/` → 200
 
 ### 14.4 End-to-End Test
 
@@ -1089,7 +1089,7 @@ These are operational validations, not code validations. They must be done manua
 - [ ] Approve moderation
 - [ ] Verify laptop processes the clip (check `docker compose -f docker-compose.laptop.yml logs -f celery_media`)
 - [ ] Verify HLS appears in R2 `hls/` prefix
-- [ ] Verify playback in browser via `https://media.echo-flow.in/hls/{clip_id}/master.m3u8`
+- [ ] Verify playback in browser via `https://media.echoflow.in/hls/{clip_id}/master.m3u8`
 
 ---
 
@@ -1124,7 +1124,7 @@ These are operational validations, not code validations. They must be done manua
 ---
 
 *Last updated: 2026-09-06*
-*Domain: echo-flow.in*
-*Frontend: app.echo-flow.in (Cloudflare Pages)*
-*API: api.echo-flow.in (Cloudflare Tunnel → VPS)*
-*HLS: media.echo-flow.in (Cloudflare Custom Domain → R2)*
+*Domain: echoflow.in*
+*Frontend: app.echoflow.in (Cloudflare Pages)*
+*API: api.echoflow.in (Cloudflare Tunnel → VPS)*
+*HLS: media.echoflow.in (Cloudflare Custom Domain → R2)*

@@ -169,7 +169,7 @@ The `celery_media` worker:
 docker compose -f docker-compose.laptop.yml logs -f celery_media
 
 # Check heartbeat (should return {"media_worker_alive": true})
-curl https://api.echo-flow.in/api/v1/health/media-worker/
+curl https://api.echoflow.in/api/v1/health/media-worker/
 
 # Upload a clip on the VPS, approve moderation, and watch the laptop process it
 ```

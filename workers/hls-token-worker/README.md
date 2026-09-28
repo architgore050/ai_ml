@@ -5,7 +5,7 @@ content stored in Cloudflare R2.
 
 ## Role
 
-Replaces the direct `media.echo-flow.in` → R2 custom domain mapping. The
+Replaces the direct `media.echoflow.in` → R2 custom domain mapping. The
 Worker sits between the browser and R2, validating the `ef_hls_token` cookie
 on every `/hls/*` request before proxying to R2.
 
@@ -34,8 +34,8 @@ npx wrangler secret put MEDIA_TOKEN_SECRET
 npx wrangler deploy
 
 # Verify
-curl -b "ef_hls_token=<valid_token>" https://media.echo-flow.in/hls/<clip_id>/master.m3u8
-curl -I https://media.echo-flow.in/hls/<clip_id>/master.m3u8  # should 403 without cookie
+curl -b "ef_hls_token=<valid_token>" https://media.echoflow.in/hls/<clip_id>/master.m3u8
+curl -I https://media.echoflow.in/hls/<clip_id>/master.m3u8  # should 403 without cookie
 ```
 
 ## Cost

@@ -613,7 +613,7 @@ services:
   # HTTP over the docker network; TLS is terminated once at the edge.
   #
   # HLS TOKEN PROTECTION (dev parity): In production, HLS token validation
-  # happens at the Cloudflare Worker edge (media.echo-flow.in → Worker → R2).
+  # happens at the Cloudflare Worker edge (media.echoflow.in → Worker → R2).
   # In dev, the :9443 nginx server block validates HLS tokens via the njs
   # module (docker/nginx/hls_auth.js) before proxying to MinIO. Both layers
   # validate the same ef_hls_token HMAC cookie issued by Django.

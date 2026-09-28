@@ -24,16 +24,16 @@ $0 with Oracle Always Free) instead of requiring a larger VPS.
 ## Architecture Diagram
 
 ```
-Browser (app.echo-flow.in)
+Browser (app.echoflow.in)
   │
   ▼
 Cloudflare (TLS termination, Bot Fight Mode)
   │
-  │ GET/POST api.echo-flow.in
+  │ GET/POST api.echoflow.in
   ▼
 Cloudflare Tunnel → VPS cloudflared → nginx (:443) → gunicorn → Django
   │
-  │ GET media.echo-flow.in/hls/{clip_id}/master.m3u8
+  │ GET media.echoflow.in/hls/{clip_id}/master.m3u8
   ▼
 Cloudflare Custom Domain → R2 (direct, no VPS hop)
   │
@@ -78,9 +78,9 @@ VPS Redis (broker: 172.28.0.2) ─Tailscale─ → Laptop docker0
 
 | Hostname | Product | Purpose |
 |----------|---------|---------|
-| `api.echo-flow.in` | Cloudflare Tunnel | Routes to VPS nginx → gunicorn |
-| `media.echo-flow.in` | R2 Custom Domain | Direct HLS playback from R2 (no VPS hop) |
-| `app.echo-flow.in` | Cloudflare Pages | Static React frontend |
+| `api.echoflow.in` | Cloudflare Tunnel | Routes to VPS nginx → gunicorn |
+| `media.echoflow.in` | R2 Custom Domain | Direct HLS playback from R2 (no VPS hop) |
+| `app.echoflow.in` | Cloudflare Pages | Static React frontend |
 
 ## What Was Removed and Why
 

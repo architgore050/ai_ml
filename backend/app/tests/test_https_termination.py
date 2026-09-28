@@ -783,3 +783,121 @@ class TestLiveNginxTerminator:
             f'https://{self._nginx_host}:9443/minio/health/live', context=ctx
         )
         assert r.status == 200, f'MinIO via :9443 returned {r.status}'
+
+
+# ---------------------------------------------------------------------------
+# Local stack: the HLS token Worker routing
+# ---------------------------------------------------------------------------
+
+class TestLocalHlsWorkerRouting:
+    """Static analysis of docker/nginx.local.conf.
+
+    The production `TestNginxConfig` above reads docker/nginx.conf, whose
+    :9443 block is entirely commented out. `test_https_listeners_present`
+    still passes for it because its regex matches the commented line — a
+    vacuous assertion that gives false confidence the MinIO listener is live.
+    These tests read the LOCAL config, where the block actually is live, and
+    assert the routing that makes HLS token-gated rather than merely broken.
+    """
+
+    LOCAL_CONF = REPO_ROOT / "docker" / "nginx.local.conf"
+    LOCAL_COMPOSE = REPO_ROOT / "docker-compose.local.yml"
+
+    @pytest.fixture
+    def conf_text(self):
+        assert self.LOCAL_CONF.is_file(), f'Missing {self.LOCAL_CONF}'
+        return self.LOCAL_CONF.read_text()
+
+    @pytest.fixture
+    def compose_text(self):
+        return self.LOCAL_COMPOSE.read_text()
+
+    @pytest.fixture
+    def media_block(self, conf_text):
+        """Just the :9443 server block.
+
+        The file also contains the :80 redirect block, whose own
+        `location / { return 301 ...; }` would otherwise be matched first and
+        make these assertions pass or fail for the wrong reason.
+        """
+        blocks = re.split(r'\n\s*server\s*\{', conf_text)
+        media = [b for b in blocks if re.search(r'listen\s+9443', b)]
+        assert media, 'No server block listening on :9443 in nginx.local.conf'
+        return 'server {' + media[-1]
+
+    def test_hls_is_proxied_to_the_worker(self, media_block):
+        m = re.search(r'location\s+/hls/\s*\{(.*?)\n\s*\}', media_block, re.DOTALL)
+        assert m, 'No `location /hls/` block — /hls/* would fall through to MinIO'
+        assert 'proxy_pass' in m.group(1)
+        assert 'hls_worker' in m.group(1), (
+            '/hls/ must proxy to the hls_worker upstream, not minio_backend'
+        )
+
+    def test_minio_upstream_is_only_the_catchall(self, media_block):
+        """If /hls/ reached minio_backend, the token gate would be bypassed."""
+        hls = re.search(r'location\s+/hls/\s*\{(.*?)\n\s*\}', media_block, re.DOTALL)
+        assert hls and 'minio_backend' not in hls.group(1)
+
+        catchall = re.search(r'location\s+/\s*\{(.*?)\n\s*\}', media_block, re.DOTALL)
+        assert catchall and 'minio_backend' in catchall.group(1), (
+            'The catch-all location should still serve MinIO so presigned '
+            'uploads/ URLs and the console keep working'
+        )
+
+    def test_hls_location_precedes_the_catchall(self, media_block):
+        hls_at = media_block.find('location /hls/')
+        catchall_at = media_block.find('location / {')
+        assert hls_at != -1 and catchall_at != -1
+        assert hls_at < catchall_at
+
+    def test_hls_block_forwards_cookie_and_range(self, media_block):
+        hls = re.search(r'location\s+/hls/\s*\{(.*?)\n\s*\}', media_block, re.DOTALL).group(1)
+        # Losing Cookie is a 403 that reads like an auth bug; losing Range
+        # breaks seeking and ABR switching silently.
+        assert re.search(r'proxy_set_header\s+Cookie\s+\$http_cookie', hls)
+        assert re.search(r'proxy_set_header\s+Range\s+\$http_range', hls)
+        assert re.search(r'proxy_buffering\s+off', hls)
+
+    def test_worker_upstream_points_at_the_host_gateway(self, conf_text):
+        m = re.search(r'upstream\s+hls_worker\s*\{(.*?)\}', conf_text, re.DOTALL)
+        assert m, 'No hls_worker upstream block'
+        # The Worker is a bare host process, not a compose service, so the
+        # container reaches it via the host gateway. A compose service name
+        # here would never resolve.
+        assert 'host.docker.internal:8787' in m.group(1)
+
+    def test_nginx_compose_declares_the_host_gateway(self, compose_text):
+        # Without extra_hosts on Linux, nginx fails to start with
+        # "host not found in upstream" as soon as the config references it.
+        assert 'host.docker.internal:host-gateway' in compose_text
+
+    def test_minio_upstream_uses_the_hyphenated_alias(self, conf_text):
+        """`minio_local` is not a legal RFC 1123 hostname.
+
+        mc and botocore both reject it outright, which is why the bucket was
+        never created and Django could not reach storage at all.
+        """
+        m = re.search(r'upstream\s+minio_backend\s*\{(.*?)\}', conf_text, re.DOTALL)
+        assert m, 'No minio_backend upstream block'
+        assert 'minio-local:9000' in m.group(1)
+        assert 'minio_local:9000' not in m.group(1)
+
+    def test_bridge_name_fits_the_interface_limit(self, compose_text):
+        """Linux caps interface names at 15 chars.
+
+        Docker reports a longer one as "numerical result out of range", which
+        makes the whole network uncreatable and is a very indirect symptom.
+        """
+        m = re.search(r'bridge\.name:\s*(\S+)', compose_text)
+        assert m, 'No explicit bridge name in the compose file'
+        assert len(m.group(1)) <= 15, (
+            f'bridge name {m.group(1)!r} is {len(m.group(1))} chars; max is 15'
+        )
+
+    def test_hls_token_js_stub_is_not_mounted(self, compose_text):
+        """The njs dev path was abandoned; the Worker replaced it.
+
+        The image (nginx:1.27-alpine) has no njs module, so the mount was
+        always inert.
+        """
+        assert 'hls_auth.js' not in compose_text or 'NOT mounted' in compose_text

@@ -309,3 +309,251 @@ class TestExtractTokenFromCookie:
 
         result = extract_token_from_cookie(cookie_header)
         assert result == token
+
+
+# ---------------------------------------------------------------------------
+# HLS URL shape
+#
+# The Worker's scope check requires the request path to start with "/<clip>/",
+# where <clip> is the token's `c` field, and its own routing requires the path
+# to start with "/hls/". A bucket-prefixed URL therefore 404s at the edge with
+# nothing to do with auth. These lock the two shapes in place.
+# ---------------------------------------------------------------------------
+
+class TestHlsUrlShape:
+    KEY = "hls/abc-123/master.m3u8"
+
+    def test_edge_style_is_bucketless(self, settings):
+        from backend.app.media_urls import get_hls_playback_url
+
+        settings.HLS_URL_STYLE = "edge"
+        settings.PUBLIC_HLS_ENDPOINT_URL = "https://localhost:19443"
+        settings.PUBLIC_MEDIA_ENDPOINT_URL = "http://localhost:19000"
+
+        url = get_hls_playback_url(self.KEY)
+        assert url == "https://localhost:19443/hls/abc-123/master.m3u8"
+        # The whole point: no bucket segment, so the path starts with /hls/.
+        assert url.split("://", 1)[1].split("/", 1)[1].startswith("hls/")
+        assert "echoflow-media" not in url
+
+    def test_bucket_style_keeps_the_bucket_segment(self, settings):
+        from backend.app.media_urls import get_hls_playback_url
+
+        settings.HLS_URL_STYLE = "bucket"
+        settings.PUBLIC_MEDIA_ENDPOINT_URL = "http://localhost:19000"
+        settings.STORAGES = {
+            **settings.STORAGES,
+            "default": {
+                **settings.STORAGES["default"],
+                "OPTIONS": {**settings.STORAGES["default"]["OPTIONS"], "bucket_name": "echoflow-media"},
+            },
+        }
+
+        assert get_hls_playback_url(self.KEY) == (
+            "http://localhost:19000/echoflow-media/hls/abc-123/master.m3u8"
+        )
+
+    def test_edge_style_strips_a_trailing_slash_on_the_origin(self, settings):
+        from backend.app.media_urls import get_hls_playback_url
+
+        settings.HLS_URL_STYLE = "edge"
+        settings.PUBLIC_HLS_ENDPOINT_URL = "https://media.echoflow.in/"
+
+        assert get_hls_playback_url(self.KEY) == (
+            "https://media.echoflow.in/hls/abc-123/master.m3u8"
+        )
+
+    def test_falsy_object_key_returns_none_in_both_styles(self, settings):
+        from backend.app.media_urls import get_hls_playback_url
+
+        for style in ("edge", "bucket"):
+            settings.HLS_URL_STYLE = style
+            assert get_hls_playback_url("") is None
+            assert get_hls_playback_url(None) is None
+
+    def test_signed_upload_urls_still_use_the_storage_origin(self, settings):
+        """The edge must not leak into presigned uploads/ URLs.
+
+        If these two settings are ever collapsed, uploads break while HLS
+        keeps working — the kind of regression that is easy to miss because
+        the HLS path is the one being actively tested.
+        """
+        from backend.app import media_urls
+
+        settings.HLS_URL_STYLE = "edge"
+        settings.PUBLIC_HLS_ENDPOINT_URL = "https://media.echoflow.in"
+        settings.PUBLIC_MEDIA_ENDPOINT_URL = "https://storage.echoflow.in"
+        settings.AWS_S3_QUERYSTRING_EXPIRE = 600
+        settings.STORAGES = {
+            **settings.STORAGES,
+            "default": {
+                **settings.STORAGES["default"],
+                "OPTIONS": {
+                    **settings.STORAGES["default"]["OPTIONS"],
+                    "access_key": "ak",
+                    "secret_key": "sk",
+                    "region_name": "auto",
+                    "addressing_style": "path",
+                },
+            },
+        }
+
+        url = media_urls.get_signed_media_url("uploads/original.mp3")
+        assert url.startswith("https://storage.echoflow.in")
+        assert "media.echoflow.in" not in url
+
+
+# ---------------------------------------------------------------------------
+# Clip key extraction
+# ---------------------------------------------------------------------------
+
+class TestExtractClipKey:
+    def test_strips_the_playlist_filename(self):
+        from backend.app.views.media import _extract_clip_key
+
+        assert _extract_clip_key("hls/abc-123/master.m3u8") == "hls/abc-123"
+
+    def test_returns_none_for_null_playlist_url(self):
+        """hls_playlist_url is null=True.
+
+        rsplit on None raised AttributeError, turning a not-yet-processed clip
+        into a 500 instead of a 4xx.
+        """
+        from backend.app.views.media import _extract_clip_key
+
+        assert _extract_clip_key(None) is None
+        assert _extract_clip_key("") is None
+
+
+# ---------------------------------------------------------------------------
+# PlaybackTokenView
+#
+# The view is the token ISSUER — the Django half of the gate — and had no
+# coverage at all. The cookie attributes below are the contract the Worker and
+# the browser depend on; a silent change to any of them is a security or
+# playback regression.
+# ---------------------------------------------------------------------------
+
+class TestPlaybackTokenView:
+    @pytest.fixture
+    def user(self, django_user_model):
+        return django_user_model.objects.create_user(
+            username="viewer", email="viewer@example.com", password="pw-probe-123"
+        )
+
+    @pytest.fixture
+    def ready_clip(self, user):
+        from backend.app.models import AudioClip
+
+        return AudioClip.objects.create(
+            creator=user,
+            title="probe",
+            moderation_approved=True,
+            status="ready",
+            hls_playlist_url="hls/00000000-0000-0000-0000-000000000001/master.m3u8",
+        )
+
+    @pytest.fixture
+    def authed(self, user, token_secret, token_ttl):
+        # DRF's APIClient, not the plain Django one: force_authenticate is a
+        # DRF test helper, and issuing a real JWT would only add a second
+        # thing that can be broken.
+        from rest_framework.test import APIClient
+
+        client = APIClient()
+        client.force_authenticate(user=user)
+        return client
+
+    def url(self, clip_id):
+        return f"/media/playback-token/{clip_id}/"
+
+    def test_issues_the_cookie_with_the_contract_attributes(
+        self, authed, ready_clip, settings
+    ):
+        response = authed.get(self.url(ready_clip.id))
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+
+        cookie = response.cookies["ef_hls_token"]
+        # Path must cover the whole clip, not just the master playlist.
+        assert cookie["path"] == "/hls/"
+        assert cookie["httponly"] is True
+        assert cookie["secure"] is True
+        # Lax, not Strict: the master playlist is fetched on a top-level
+        # navigation, and Strict would withhold the cookie there.
+        assert cookie["samesite"] == "Lax"
+        # No Domain in local dev: both origins are `localhost`, which rejects
+        # domain cookies. Omitting it keeps the cookie host-only.
+        assert cookie["domain"] in ("", None)
+
+    def test_max_age_tracks_media_token_ttl_seconds(self, authed, ready_clip, settings):
+        settings.MEDIA_TOKEN_TTL_SECONDS = 60
+        response = authed.get(self.url(ready_clip.id))
+        assert response.cookies["ef_hls_token"]["max-age"] == 60
+
+        settings.MEDIA_TOKEN_TTL_SECONDS = 1800
+        response = authed.get(self.url(ready_clip.id))
+        assert response.cookies["ef_hls_token"]["max-age"] == 1800
+
+    def test_domain_is_set_when_media_token_cookie_domain_is(
+        self, authed, ready_clip, settings
+    ):
+        # Required in production when the media origin is a different host
+        # from the API; without it the cookie is host-only and never sent.
+        settings.MEDIA_TOKEN_COOKIE_DOMAIN = ".echoflow.in"
+        response = authed.get(self.url(ready_clip.id))
+        assert response.cookies["ef_hls_token"]["domain"] == ".echoflow.in"
+
+    def test_issued_cookie_validates_against_the_request_path(
+        self, authed, ready_clip
+    ):
+        """End of the gate: the cookie the view sets must be accepted for the
+        clip's own path and rejected for a different clip's."""
+        from backend.app.services.hls_token import validate_playback_token
+
+        response = authed.get(self.url(ready_clip.id))
+        token = response.cookies["ef_hls_token"].value
+
+        assert validate_playback_token(
+            token, "/hls/00000000-0000-0000-0000-000000000001/master.m3u8",
+        ) is not None
+        assert validate_playback_token(
+            token, "/hls/00000000-0000-0000-0000-000000000099/master.m3u8",
+        ) is None
+
+    def test_requires_authentication(self, user, token_secret, token_ttl, ready_clip):
+        from rest_framework.test import APIClient
+
+        response = APIClient().get(self.url(ready_clip.id))
+        assert response.status_code in (401, 403)
+
+    def test_unknown_clip_is_404(self, authed, token_secret, token_ttl):
+        import uuid
+
+        response = authed.get(self.url(uuid.uuid4()))
+        assert response.status_code == 404
+
+    def test_unmoderated_clip_is_403(self, authed, ready_clip, token_secret, token_ttl):
+        ready_clip.moderation_approved = False
+        ready_clip.save(update_fields=["moderation_approved"])
+
+        response = authed.get(self.url(ready_clip.id))
+        assert response.status_code == 403
+        assert "ef_hls_token" not in response.cookies
+
+    def test_clip_without_hls_output_is_409_not_500(self, authed, user, token_secret, token_ttl):
+        """hls_playlist_url is null until media processing runs.
+
+        _extract_clip_key used to rsplit(None) and raise, producing a 500
+        and a stack trace in the logs for an entirely ordinary state.
+        """
+        from backend.app.models import AudioClip
+
+        clip = AudioClip.objects.create(
+            creator=user, title="unprocessed", moderation_approved=True, status="pending"
+        )
+        assert clip.hls_playlist_url is None
+
+        response = authed.get(self.url(clip.id))
+        assert response.status_code == 409
+        assert "ef_hls_token" not in response.cookies

@@ -663,7 +663,7 @@ Keep entries concise. Link to docs instead of inlining long explanations.
 - Comment count on `AudioClip` is denormalized and updated in `Comment.save()/delete()` — not via signals.
 - `UserInteraction` uses `F()` expressions for atomic counter increments on likes/shares/skips.
 - **Self-signed dev cert (`docker/certs/localhost.crt`) is in the repo on purpose** so a fresh clone works. For prod, replace with Let's Encrypt material and `nginx -s reload` — the cert is bind-mounted, so no rebuild is needed. **Do NOT push the dev key to a public registry in any fork that re-publishes the image**; revocation is the only fix.
-- **HLS token cookies**: The `ef_hls_token` cookie must have `SameSite=Lax` (not `Strict`) so it's sent on top-level navigation from `app.echo-flow.in` to `media.echo-flow.in` (SameSite=Lax permits cookies on same-site top-level navigations, but blocks cross-site). `Secure` requires HTTPS on both `api.echo-flow.in` and `media.echo-flow.in`. In dev, `Domain` attribute must be empty (localhost doesn't support domain cookies). See `docs/EXPLAIN/storage/04-hls-token-protection.md`.
+- **HLS token cookies**: The `ef_hls_token` cookie must have `SameSite=Lax` (not `Strict`) so it's sent on top-level navigation from `app.echoflow.in` to `media.echoflow.in` (SameSite=Lax permits cookies on same-site top-level navigations, but blocks cross-site). `Secure` requires HTTPS on both `api.echoflow.in` and `media.echoflow.in`. In dev, `Domain` attribute must be empty (localhost doesn't support domain cookies). See `docs/EXPLAIN/storage/04-hls-token-protection.md`.
 - **HLS token secret sync**: In production, `MEDIA_TOKEN_SECRET` must be **identical** in the VPS `.env` (Django issuance) and the Cloudflare Worker secret (`npx wrangler secret put MEDIA_TOKEN_SECRET`). If these diverge, all HLS playback returns 403.
 - **RFC 3986 §5.2.2 — Signed URLs don't work for HLS**: The master playlist references variant playlists and segments via relative paths. RFC 3986 §5.2.2 strips query strings during relative-reference resolution, so signed URLs (which rely on query parameters) fail on the second and subsequent HLS requests. **Signed cookies are the only viable token mechanism for HLS.** This applies to any multi-file streaming protocol (HLS, DASH, Smooth Streaming).
 - **fetch `credentials: 'include'` for Set-Cookie**: When using `fetch()` to call an endpoint that sets an HttpOnly cookie via `Set-Cookie`, the fetch request **must** include `credentials: 'include'` (or `'same-origin'`). Without it, the browser silently discards the Set-Cookie header. This is a common gotcha when building token-issuance endpoints.
@@ -772,6 +772,25 @@ Durable, repo-specific knowledge. Append a concise entry at the end of each sess
 - 4 pre-existing failures unrelated to this work: `test_task_publisher.py::TestFlushTelemetryInvalidation` (3) and `test_feed_license_filter.py::test_fallback_excludes_nc_and_sa` (1). None of those files are in this branch's diff.
 - 8 scraper test modules error on `ai_ml.scrapers.state`, deleted in `5c9c2d6 "removed scraper"` while `scrape_audio.py` and the tests still import it.
 - `celery_media_local` OOMs (2 GB limit, 12 GB host), so HLS output is not produced locally; fixtures are seeded into MinIO directly.
+
+---
+
+### 2026-09-28 — mobile-rebuild: native media auth + CGNAT throttling
+**Learned:**
+- `ef_hls_token` is unreachable for native players: AVPlayer/ExoPlayer have no shared cookie jar, and the cookie is `HttpOnly`+`Secure`. Fixed by an opt-in `X-EchoFlow-Client: native` body token + Worker `X-EchoFlow-Media-Token` header (cookie-first precedence — a page can set a header but cannot read the cookie). `docs/mobile-rebuild-plan.md` §2-3.
+- `ScopedRateThrottle` reads its scope from the **view** and allows *everything* when absent. Listing the class on a view with no `throttle_scope` silently unthrottles it — no error. `throttle_scope` is load-bearing.
+- simplejwt **stringifies** `user_id` (`tokens.py:228`), so `isinstance(x, int)` on the token subject always fails; accept `(str, int)` or the throttle silently falls back to IP keying.
+- `AnonRateThrottle` is fatal on mobile: 100/hour/IP behind a carrier NAT, and 15-min access tokens mean every user refreshes ~4x/hour → mass logout. Key refresh on the verified token subject, not the address.
+- `.env.vps.example` was missing `PUBLIC_HLS_ENDPOINT_URL`, so prod emitted bucket-prefixed HLS URLs the Worker 404s. Domain is `echoflow.in` (was split with `echo-flow.in` across 13 files).
+
+**Changed:**
+- `backend/app/throttling.py` (new), `views/media.py`, `views/auth.py`, `app/urls.py`, `settings.py`; `workers/hls-token-worker/src/{token,index}.ts`; `.env.vps.example`, 3 compose files; 11 docs.
+- New tests: `test_throttling.py` (26), `token.test.ts` (8), `TestNativeTokenTransport` (9).
+
+**Open:**
+- **No phone dev loop.** `PUBLIC_HLS_ENDPOINT_URL` is hardcoded to `localhost:19443` (a phone's `localhost` is the phone) and `docker/certs/localhost.crt` does not cover a LAN IP. Cert setup is manual per owner decision; runbook section not yet written.
+- Suite flakiness: `test_counter_store` / `test_revenuecat` / `test_services_interactions` fail non-deterministically under a contended stack and pass in isolation. Compare failure **sets** across >=2 runs vs a stashed baseline; a single run proves nothing.
+- Mobile app itself is **not started** — the rewrite plan is `docs/mobile-rebuild-plan.md` §8-17. Backend items still blocking feature parity are tabulated in §17.
 
 ---
 

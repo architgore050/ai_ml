@@ -112,6 +112,9 @@ This directory contains comprehensive, code-grounded technical documentation for
 - [comprehensive-bug-sweep.md](decisions/comprehensive-bug-sweep.md) — Original Group A/B/C/D audit findings (4 groups, 31 items, 3 false positives, 1 not-shipped)
 - [group-b-architectural-plan.md](decisions/group-b-architectural-plan.md) — Plan for Group B items 9-12 (counter store, cache invalidation, correlation_id, orphan cleanup)
 - [partial-issues-completion-plan.md](decisions/partial-issues-completion-plan.md) — Plan + completion record for the 7 partially-addressed items (A1, A3, A5, A8, B13, B14, B17) + B19 docstring (added 2026-09-04)
+- [2026-09-28-local-hls-worker.md](decisions/2026-09-28-local-hls-worker.md) — Local HLS token Worker (S3/MinIO storage backend, `/healthz`, nginx `:9443` routing) (added 2026-09-28)
+- [2026-09-28-native-media-auth-and-cgnat-throttling.md](decisions/2026-09-28-native-media-auth-and-cgnat-throttling.md) — Native media auth transport (body token + Worker header) and CGNAT-safe throttle keying (added 2026-09-28)
+- [Mobile rebuild plan](../../mobile-rebuild-plan.md) — Approved plan for rewriting `mobile/` from scratch: architecture decisions, playback sequence, feature scope, UI/UX port, build phases (added 2026-09-28)
 
 ---
 

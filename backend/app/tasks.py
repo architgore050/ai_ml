@@ -1540,3 +1540,36 @@ def _materialize_user_interaction_rows(
     return written
 
 
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=120, retry_backoff=True)
+def execute_data_erasure(self, user_id: int):
+    """Erase one user's personal data and anonymise what the law requires kept.
+
+    B3 (2026-09-29). Reached from ``POST /data-subject/erasure/`` once the
+    30-day cooling-off has passed; the endpoint previously marked the request
+    ``completed`` and reported "Data erasure process initiated" while deleting
+    nothing.
+
+    Routed to the ``default`` queue, not ``heavy_media``: this is a row-count
+    sweep plus object-storage deletes, with no ML model and no ffmpeg. See
+    the rationale for a task rather than request-path work in
+    ``services/erasure.py``.
+
+    Idempotent on ``user_id`` — a redelivery after a partial failure finds no
+    user and returns ``already_erased`` rather than raising, because a retry
+    that raises forever would page someone for work that is already done.
+
+    SECURITY: the report is logged, not returned to the client. It contains
+    row counts, which are a fingerprint of the subject's activity.
+    """
+    from .services.erasure import execute_erasure
+
+    try:
+        report = execute_erasure(int(user_id))
+    except Exception as exc:
+        # Retry rather than swallowing. A partial delete that reports success
+        # is precisely the failure this task exists to remove.
+        logger.error("execute_data_erasure failed for user %s: %s", user_id, exc)
+        raise self.retry(exc=exc)
+    return report

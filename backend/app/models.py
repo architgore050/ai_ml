@@ -87,7 +87,13 @@ class ConsentAudit(models.Model):
     # audit logs — queryable by user, withdrawable, and retainable
     # per regulatory timeline. Tradeoff: extra table + index vs.
     # tamper-resistant DB record.
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='consent_audits', null=True, blank=True)
+    # B3 (2026-09-29): was on_delete=CASCADE. Erasing a user therefore
+    # destroyed the very record that proves consent was collected — the
+    # opposite of what a consent audit trail is for. DPDP §5(2) / §11
+    # require the record to outlive the processing it justified.
+    # SET_NULL + services/erasure.py::execute_erasure keeps the evidence and
+    # severs the pointer to the person.
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='consent_audits')
     consent_issued_at = models.DateTimeField(auto_now_add=True)
     terms_version_id = models.CharField(max_length=50, default='v1.0')
     privacy_version_id = models.CharField(max_length=50, default='v1.0')
@@ -371,7 +377,11 @@ class DataSubjectRequest(models.Model):
     request_type = models.CharField(max_length=20, choices=[
         ('access', 'Access'), ('erasure', 'Erasure'),
     ])
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='data_subject_requests')
+    # B3 (2026-09-29): was on_delete=CASCADE, so the erasure request deleted
+    # itself — erasing the evidence that erasure was ever requested, and
+    # losing completed_at. SET_NULL; services/erasure.py stamps
+    # status='completed' and completed_at before the cascade runs.
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='data_subject_requests')
     status = models.CharField(max_length=20, default='pending')
     token_hash = models.CharField(max_length=128, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)

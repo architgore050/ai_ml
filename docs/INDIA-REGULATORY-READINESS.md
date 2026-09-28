@@ -264,6 +264,32 @@
 3. Add `GET /data-subject/grievance/` endpoint (or reuse `POST /grievance/` from ISSUE-03) to satisfy DPDP §11 + IT Rules grievance requirements together.
 4. Update `OwnProfileSerializer` to include a `data_access_url` link.
 
+> **✅ RESOLVED 2026-09-29 (B3).** Erasure actually deletes now.
+> `POST /data-subject/erasure/` no longer returns "Data erasure process
+> initiated" having deleted nothing — it publishes a Celery task
+> (`execute_data_erasure`) and reports `in_progress`; the task sets
+> `completed` when it finishes.
+>
+> What is deleted: the `User` row and its cascade (`AudioClip`, `Comment`,
+> `ShareEvent`, `UserInteraction`), the avatar and each clip's
+> `original_file` / `hls/` tree / **`cover_image`**, and the Redis keys
+> holding behavioural data (`user_feed:{id}`, `user_vectors:{id}`, and the
+> per-(clip,user) completion counters). Object storage and Redis are the
+> parts a Postgres cascade never reaches.
+>
+> What is **retained and anonymised**, because deleting it would be a
+> compliance failure in the other direction:
+>
+> | Record | Why |
+> |---|---|
+> | `ConsentAudit` | DPDP §5(2)/§11 — proof of consent must outlive the account. Its FK was **CASCADE**, so deleting the user destroyed the evidence of consent. Now SET_NULL, with `withdrawn_at` stamped. |
+> | `AuditLog` | CERT-In 2022 — 180-day identity retention. |
+> | `Grievance` | IT Rules 2021 R4(2). |
+> | `DataSubjectRequest` | Evidence that erasure was requested *and* completed. Its FK was **CASCADE**, so the request deleted itself and `completed_at` was lost. |
+>
+> Migration 0007 changes those two FKs. 24 tests in `test_erasure.py`,
+> verified live end-to-end through nginx → Django → Celery.
+
 ---
 
 ### 2.2 High Priority (legal exposure if not addressed; significant UX gap)
@@ -672,7 +698,7 @@ The plan is designed to **minimise legal exposure** first, then close backend co
 | ISSUE-03 (Grievance / Compliance) | **Complete** | `models.py`: `Grievance` (268-288). `settings.py`: `GRIEVANCE_OFFICER_*`, `COMPLIANCE_OFFICER_*`, `NODAL_CONTACT_*`, `VERSION` (621-629). `urls.py`: `/grievance/`, `/legal/compliance/`, `/legal/takedown/` (62-64). `tests/test_auth_regulatory.py`: compliance endpoint returns JSON. | All regulatory contact endpoints live; DB persistence verified. |
 | ISSUE-04 (Content Moderation) | **Partially Complete** — see correction at ISSUE-04 | `services/content_moderation.py`; invoked from `tasks.py:302` for both transcript and tags. | The pipeline is wired and runs, but the prohibited-content blocklist it matches against is **empty**, so it approves every input. External API upgrade also still open. |
 | ISSUE-05 (Copyright / License) | **Complete** | `serializers.py`: `license_type`, `copyright_owner_name`, `copyright_acknowledgement` fields (141-164). `models.py`: same fields (113-116). `AudioUploadSerializer.validate()` enforces acknowledgment (177-191). | DB persistence verified. User uploads require acknowledgment; `Unknown` license logs a warning. |
-| ISSUE-06 (Data Subject Rights) | **Partially Complete** — see correction at ISSUE-06 | `models.py`: `DataSubjectRequest`, `AuditLog`, `TakedownRequest`, `Report`. `urls.py`: `/data-subject/access/`, `/data-subject/erasure/`. | Cooling-off window is implemented. **Erasure deletes nothing** (`views/data_subject.py:82` defers it) yet returns "Data erasure process initiated". |
+| ISSUE-06 (Data Subject Rights) | **Complete** (2026-09-29, B3) | `models.py`: `DataSubjectRequest`, `AuditLog`, `Grievance`, `TakedownRequest`, `Report`. `urls.py`: `/data-subject/access/`, `/data-subject/erasure/`. Celery: `execute_data_erasure`. | Access, grievance and erasure all work. Erasure deletes the account, its content, its object-storage objects and its Redis keys; `ConsentAudit`/`AuditLog`/`Grievance`/`DataSubjectRequest` are retained with `user=NULL` as DPDP §5(2)/§11 and CERT-In 2022 require. |
 | ISSUE-07 (Audit / Identity Retention) | **Complete** | `backend/EchoFlow/middleware.py`: identity attachment (36-41), audit write (45-61) with `DECISION` (line 292 in `models.py` explanation), `HACK` (line 295), `SECURITY` (line 60). `settings.py`: `LOGGING.formatters.json` includes `user_id`, `client_ip`, `endpoint_path` (569-572). `models.py`: `AuditLog` (290-312). | Every authenticated request writes an `AuditLog`. DB overhead tradeoff accepted per `DECISION`. |
 | ISSUE-08 (Profile Picture URL) | **Complete** | `serializers.py`: `PublicProfileSerializer.get_profile_picture_url` (443-446) and `OwnProfileSerializer.get_profile_picture_url` (466-469) both call `get_signed_media_url()`. `DECISION` tag present in serializer (line 124). | Profile pictures load as absolute HTTPS URLs; `media_urls.py` generates signed URLs. |
 | ISSUE-09 (Feed Cold Retry) | **Complete** | `pages/Feed.tsx`: retry delay + degraded state handling (per agent 4 fix). `data/feedAdapter.ts`: `degraded`, `retry_after_ms`, `message` propagated. | Feed retry storm eliminated; 202 handling verified. |

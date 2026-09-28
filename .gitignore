@@ -104,6 +104,16 @@ yarn-debug.log*
 yarn-error.log*
 .pnp
 .pnp.js
+
+# Cloudflare Worker local dev
+# .dev.vars holds MEDIA_TOKEN_SECRET and the MinIO credentials — real secrets,
+# same class as .env. Wrangler reads it automatically, so it is easy to commit
+# by accident. The committed template is .dev.vars.example.
+workers/**/.dev.vars
+workers/**/.dev.vars.*
+!workers/**/.dev.vars.example
+# Miniflare's local R2/KV/D1 state
+workers/**/.wrangler/
 .next/
 .nuxt/
 .vuepress/dist

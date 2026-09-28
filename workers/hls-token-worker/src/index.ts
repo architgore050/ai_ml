@@ -8,10 +8,14 @@
 // Request flow:
 //   Browser → Cloudflare Worker (media.echoflow.in)
 //     → validatePlaybackToken() [token.ts]
-//       → env.MEDIA_BUCKET.get() [R2 binding — free, no egress]
+//       → getStorage(env).get() [storage.ts — R2 binding in prod,
+//                                 S3/MinIO over SigV4 under `wrangler dev`]
 //         → stream response back to browser with CORS headers
 
 import { validatePlaybackToken, extractTokenFromCookie } from "./token";
+import { getStorage, assertTokenSecret, StorageUnavailable, type Env } from "./storage";
+
+export type { Env };
 
 // ---------------------------------------------------------------------------
 // Allowed origins — add localhost variants for local dev
@@ -23,6 +27,11 @@ const ALLOWED_ORIGINS = new Set([
   "https://www.echoflow.in",
   "http://localhost:5173",
   "http://localhost:3000",
+  // Local docker-compose stack: the nginx :9443 / :19443 media listener.
+  "https://localhost:9443",
+  "https://localhost:19443",
+  "https://app.localhost:18443",
+  "https://app.localhost:19443",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -59,6 +68,41 @@ export default {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin");
     const allowed = isAllowedOrigin(origin);
+
+    // --- Health ---
+    // Reported before the method and path checks so it answers to a plain GET
+    // from a container healthcheck. It names the active storage backend and
+    // reports whether the token secret is configured, but never emits a
+    // credential. A 503 here is the fast way to catch a missing/stale
+    // .dev.vars before staring at a wall of 403s.
+    if (url.pathname === "/healthz") {
+      try {
+        const storage = getStorage(env);
+        return Response.json({ status: "ok", backend: storage.name });
+      } catch (err) {
+        return Response.json(
+          {
+            status: "misconfigured",
+            error: err instanceof Error ? err.message : String(err),
+          },
+          { status: 503 }
+        );
+      }
+    }
+
+    // Fail loudly on a missing token secret. Without this the HMAC would be
+    // computed over an EMPTY key and every request would 403, looking
+    // identical to a Django-side token bug.
+    try {
+      assertTokenSecret(env);
+    } catch (err) {
+      return errorResponse(
+        503,
+        err instanceof Error ? err.message : String(err),
+        origin,
+        allowed
+      );
+    }
 
     // --- OPTIONS preflight ---
     // Must be handled explicitly — R2 CORS config is bypassed for Worker bindings.
@@ -100,31 +144,33 @@ export default {
       return errorResponse(403, "Invalid or expired playback token", origin, allowed);
     }
 
-    // --- Fetch object from R2 via binding ---
-    // R2 binding supports Range headers natively — critical for HLS seeking.
-    // env.MEDIA_BUCKET.get() is a server-side call, not an HTTP request,
-    // so it has no egress cost and no CORS negotiation.
-    //
+    // --- Fetch the object from storage ---
     // The object key is the pathname without the leading "/":
     //   pathname "/hls/abc-123/master.m3u8" → key "hls/abc-123/master.m3u8"
     const objectKey = url.pathname.slice(1);
 
-    const rangeHeader = request.headers.get("Range");
-    const object = await env.MEDIA_BUCKET.get(objectKey, {
-      range: rangeHeader ? request : undefined,
-      onlyIf: request.headers,
-    });
+    let object;
+    try {
+      object = await getStorage(env).get(objectKey, request);
+    } catch (err) {
+      // Auth already passed at this point. A storage fault must never be
+      // reported as 403, or a broken backend looks like a rejected token.
+      if (err instanceof StorageUnavailable) {
+        return errorResponse(502, err.message, origin, allowed);
+      }
+      throw err;
+    }
 
     if (object === null) {
       return errorResponse(404, "Not found", origin, allowed);
     }
 
     // --- Build response headers ---
-    const responseHeaders = new Headers();
+    const responseHeaders = new Headers(object.headers);
 
-    // Copy R2 object metadata (Content-Type, ETag, Content-Length, etc.)
-    object.writeHttpMetadata(responseHeaders);
-    responseHeaders.set("ETag", object.httpEtag);
+    if (object.etag) {
+      responseHeaders.set("ETag", object.etag);
+    }
 
     // Cache HLS segments aggressively (they are immutable once uploaded).
     // Master and variant playlists are short-lived because they may update.
@@ -144,11 +190,14 @@ export default {
       }
     }
 
-    // Determine status: 206 Partial Content for range requests, 200 otherwise
-    const status = rangeHeader && object.range ? 206 : 200;
+    // 304 means the client's cached copy is still valid — pass it through
+    // with no body, but keep the ETag so the browser can revalidate.
+    if (object.status === 304) {
+      return new Response(null, { status: 304, headers: responseHeaders });
+    }
 
     return new Response(object.body, {
-      status,
+      status: object.status,
       headers: responseHeaders,
     });
   },
@@ -174,11 +223,6 @@ function errorResponse(
 }
 
 // ---------------------------------------------------------------------------
-// Env interface — must match wrangler.toml bindings exactly
+// Env interface — declared in storage.ts (which owns the storage vars) and
+// re-exported above, so storage.ts need not import from this module.
 // ---------------------------------------------------------------------------
-
-interface Env {
-  MEDIA_BUCKET: R2Bucket;
-  MEDIA_TOKEN_SECRET: string;
-  MEDIA_TOKEN_TTL_SECONDS: string;
-}

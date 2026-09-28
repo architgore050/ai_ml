@@ -1,5 +1,28 @@
 # Bucket Policies & MinIO Init
 
+> **⛔ READ FIRST. The bucket is FULLY PRIVATE, and this file's
+> "anonymous policy" sections are HISTORICAL.**
+>
+> This page was written for the pre-token-protection design and still contains
+> runnable commands that publish `hls/` to the world. **Do not run
+> `mc anonymous set download .../hls`, and do not add the `PublicReadHLS`
+> statement to any real bucket.** `hls/` segments are verbatim transcripts,
+> so a public prefix means the entire clip is readable in one request by
+> anyone who can guess a clip UUID.
+>
+> Current state: `hls/` is private and reachable only through the validating
+> edge — the Cloudflare Worker at `media.echoflow.in` in production, nginx
+> `:9443` locally — which checks a short-lived per-clip HMAC token
+> (`ef_hls_token` cookie, or the `X-EchoFlow-Media-Token` header for native
+> players) before reading the object. `minio-init` now only *creates* the
+> bucket.
+>
+> The **ACL Summary** near the bottom of this file is accurate and is the
+> part to trust. The `PublicReadHLS` JSON blocks retained below are kept only
+> so the mistake they describe is recognisable.
+>
+> See [`04-hls-token-protection.md`](04-hls-token-protection.md).
+
 ## MinIO Init Service (`docker-compose.yml:99-109`)
 
 ```yaml
@@ -11,8 +34,9 @@ minio-init:
   entrypoint: >
     sh -c "
       mc alias set local http://minio:9000 ${AWS_ACCESS_KEY_ID:-echoflow-dev} ${AWS_SECRET_ACCESS_KEY:-echoflow-dev-secret} &&
-      mc mb --ignore-existing local/${AWS_STORAGE_BUCKET_NAME:-echoflow-media} &&
-      mc anonymous set download local/${AWS_STORAGE_BUCKET_NAME:-echoflow-media}/hls
+      mc mb --ignore-existing local/${AWS_STORAGE_BUCKET_NAME:-echoflow-media}
+    # ⛔ The `mc anonymous set download .../hls` line that used to be here was
+    # removed: hls/ is token-gated at the edge, not public. See the banner.
     "
 ```
 
@@ -28,16 +52,21 @@ minio-init:
    mc mb --ignore-existing local/echoflow-media
    ```
 
-3. **Set public-read on hls/**
+3. ~~**Set public-read on hls/**~~ — **REMOVED, do not run**
    ```bash
-   mc anonymous set download local/echoflow-media/hls
+   # ⛔ OBSOLETE: mc anonymous set download local/echoflow-media/hls
+   # hls/ is token-gated at the edge; the bucket stays fully private.
    ```
 
 ---
 
-## Anonymous Policy Details
+## Anonymous Policy Details (HISTORICAL — not applied)
 
 ### What `mc anonymous set download` Does
+
+> ⛔ This is what the removed init step *used to* create. It is recorded here
+> so the policy it produced is recognisable in a real bucket. If you find
+> `PublicReadHLS` on `echoflow-media`, remove it — it defeats the gate.
 
 Creates bucket policy:
 ```json
@@ -84,7 +113,7 @@ echoflow-media/
 │   └── wikimedia/2024/01/15/
 │       └── uuid.mp3
 │
-├── hls/                        ← **Public-read** (anonymous)
+├── hls/                        ← Private, token-gated at the edge
 │   └── clip-uuid/
 │       ├── master.m3u8
 │       ├── index.m3u8
@@ -192,7 +221,11 @@ curl -H "Origin: http://localhost:5173" \
 
 ## Production: AWS S3 Bucket Policy
 
-### Public Read for HLS
+### ⛔ Public Read for HLS — DO NOT APPLY
+> The production design is Cloudflare R2 with a **fully private** bucket and a
+> Worker in front (`workers/hls-token-worker/`). `02-vps-setup.md` step 4
+> says the same. This policy is the superseded alternative.
+
 ```json
 {
   "Version": "2012-10-17",
@@ -209,9 +242,10 @@ curl -H "Origin: http://localhost:5173" \
 ```
 
 ### Block Public Access (Account Level)
-- Ensure **only** `hls/` prefix is public
-- Use S3 Block Public Access settings for account/bucket
-- Explicitly allow only the policy above
+- Enable S3 **Block Public Access** for the account/bucket
+- With the Worker design there should be **no** allow statements at all —
+  the Worker reads R2 through a server-side binding, not an HTTP request,
+  so it needs no public policy
 
 ---
 

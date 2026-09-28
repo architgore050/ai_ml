@@ -31,8 +31,28 @@ Cloudflare provides three services for EchoFlow:
 
 ### Set bucket policy for HLS playback
 
-HLS playback requires the `hls/` prefix to be publicly accessible, while
-`uploads/` (original audio clips) must remain private.
+> **⛔ DO NOT ADD A PUBLIC-READ POLICY ON `hls/`. This step is obsolete and
+> actively defeats the playback gate.**
+>
+> This section predates HLS token protection and contradicts
+> `02-vps-setup.md` step 4, which correctly says the bucket starts private and
+> **not** to add a public-read policy for `hls/*`. The policy below was never
+> removed from this file, so following it makes every transcript and segment
+> world-readable to anyone who can guess or enumerate a clip UUID — while the
+> Worker still demands a valid token, which now looks like a broken edge
+> rather than a security hole.
+>
+> **The correct state is an entirely private bucket.** `media.echoflow.in`
+> points at the `echoflow-hls-worker` Cloudflare Worker
+> (`workers/hls-token-worker/`), which validates the playback token and then
+> reads the object through an R2 binding. The Worker is the only way in.
+>
+> Verify: the bucket has **no** policy statements, and
+> `GET https://media.echoflow.in/healthz` returns
+> `200 {"status":"ok","backend":"r2"}`.
+
+<details>
+<summary>Historical: the policy this section used to prescribe (do not apply)</summary>
 
 1. Go to the `echoflow-media` bucket → **Settings** → **Bucket policy**
 2. Replace any default policy with:
@@ -56,6 +76,8 @@ HLS playback requires the `hls/` prefix to be publicly accessible, while
 user-submitted audio that may have copyright restrictions. Only the processed
 HLS segments (`hls/`) are safe to serve publicly, since they are derived
 content (transcoded, shorter, and intended for streaming).
+
+</details>
 
 ## 2. R2 Custom Domain
 

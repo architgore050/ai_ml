@@ -1,5 +1,15 @@
 # EchoFlow — Hybrid Deployment V1: Complete Implementation Plan
 
+> **⚠️ HISTORICAL PLAN. Partly superseded on media delivery.** This document
+> predates HLS token protection and still describes `hls/` as a public-read
+> R2 prefix served by an R2 custom domain. The shipped design is: the bucket
+> is **fully private**, and `media.echoflow.in` is a Cloudflare Worker that
+> validates a per-clip HMAC token before reading the object. Steps marked
+> `(public-read)` below are **obsolete — do not run them**; the current setup
+> checklist is in `02-vps-setup.md` and
+> [`../storage/04-hls-token-protection.md`](../storage/04-hls-token-protection.md).
+> Everything else here is still accurate.
+
 > **Target:** ~$6/month (or $0/month with Oracle Always Free).  
 > **Architecture:** Small VPS (light services) + Laptop (heavy media worker) + Cloudflare R2 (object storage) + Tailscale (private connectivity).  
 > **Domain:** `echoflow.in`  

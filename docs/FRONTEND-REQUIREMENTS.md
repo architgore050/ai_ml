@@ -45,9 +45,9 @@ All routes are mounted under `backend/app/urls.py` (included at `/` by
 
 | Verb + path | View / action | Permission | Throttle scope | Source |
 | --- | --- | --- | --- | --- |
-| `POST /auth/register/` | `RegisterView` | AllowAny | `register` (5/hour) | `backend/app/views/auth.py:11` |
+| `POST /auth/register/` | `RegisterView` | AllowAny | `register` (200/hour, IP) + `register_username` (3/hour, username) | `backend/app/views/auth.py` |
 | `POST /auth/login/` | `ThrottledTokenObtainPairView` (SimpleJWT) | AllowAny | `login` (10/min) | `backend/app/urls.py:17` |
-| `POST /auth/token/refresh/` | `TokenRefreshView` (SimpleJWT) | AllowAny | (default `user`) | `backend/app/urls.py:58` |
+| `POST /auth/token/refresh/` | `ThrottledTokenRefreshView` (SimpleJWT) | AllowAny | `token_refresh` (120/hour, keyed on the **verified** user_id in the token) | `backend/app/urls.py` |
 | `POST /auth/logout/` | `LogoutView` (blacklists refresh) | IsAuthenticated | (default) | `backend/app/urls.py:35-51` |
 | `GET /feed/` | `FastFeedViewSet.list` | IsAuthenticated | (default) | `backend/app/views/feed.py:60-142` |
 | `GET /suggestions/` | `SuggestionViewSet.list` | IsAuthenticated | (default) | `backend/app/views/feed.py:145-197` |
@@ -662,17 +662,31 @@ Specific status codes to handle:
 `backend/EchoFlow/settings.py:527-538`:
 
 ```text
-anon:        100/hour
-user:        1000/hour
-telemetry:   60/min           # log_telemetry (the abuse vector)
-upload:      20/hour          # /clips/ (DoS guard)
-register:    5/hour           # /auth/register/
-login:       10/min           # /auth/login/ (credential stuffing)
-comment:     60/hour          # /comments/ (spam)
-share_send:  100/hour         # /share/{clip_id}/send-share/
-share_poll:  1000/hour        # inbox/unread/mark-read (polling)
-interaction: 60/min           # toggle-like, register-skip
+anon:              100/hour
+user:             1000/hour
+telemetry:          60/min      # log_telemetry (the abuse vector)
+upload:             20/hour     # /clips/ (DoS guard)
+register:          200/hour     # /auth/register/ (per IP)
+register_username:   3/hour     # /auth/register/ (per username)
+login:              10/min      # /auth/login/ (credential stuffing)
+token_refresh:     120/hour     # /auth/token/refresh/ (per verified user_id)
+comment:            60/hour     # /comments/ (spam)
+share_send:        100/hour     # /share/{clip_id}/send-share/
+share_poll:       1000/hour     # inbox/unread/mark-read (polling)
+interaction:        60/min     # toggle-like, register-skip
 ```
+
+**Do not key rate-limit assumptions on the client IP.** `anon` is 100/hour
+per address, and on a mobile network one carrier NAT gateway is thousands of
+subscribers. `/auth/token/refresh/` was inheriting exactly that and logged
+out entire cells; it is now keyed on the verified subject in the refresh
+token. `/auth/register/` is 200/hour per IP plus 3/hour per username.
+See `docs/EXPLAIN/auth/04-rate-limiting.md`.
+
+⚠️ `ScopedRateThrottle` allows **everything** when the view declares no
+`throttle_scope`. That is a backend concern, not a client one, but it means
+"the client was throttled" and "the throttle is not wired" are
+indistinguishable from the client side.
 
 `/feed/` and `/suggestions/` are NOT throttled beyond the default `user`
 scope (1000/hour) — a chatty client is fine up to ~16 req/min. But
@@ -1018,7 +1032,7 @@ and the corresponding UI/UX requirement. Each item maps back to §1.
   user sees the category picker).
 - **Errors to render:** 400 field errors. Specifically, `email`
   duplicate returns `{"email": ["..."]}` (RegisterSerializer
-  UniqueValidator). 429 (register throttle: 5/hour/IP).
+  UniqueValidator). 429 (`register` 200/hour per IP, or `register_username` 3/hour per username).
 - **Implementation status:** **Partially implemented** —
   `stores/auth.tsx:52-61` is broken (doesn't login).
 
@@ -1432,7 +1446,8 @@ and the corresponding UI/UX requirement. Each item maps back to §1.
   - Do NOT show a user-facing error for telemetry 429s.
 - `share_send = 100/hour`. If a user is sending 1 share / 30 s, they
   will hit 429 after ~50 minutes. Realistically unproblematic.
-- `register = 5/hour`, `login = 10/min`. Show explicit cooldown UI.
+- `register = 200/hour` per IP, `register_username = 3/hour`, `login = 10/min`.
+  Show explicit cooldown UI.
 
 ### 4.5 Cache invalidation
 
@@ -1448,35 +1463,71 @@ performance behavior.
 
 ### 4.6 HLS Playback Token (`ef_hls_token`)
 
-The `hls/` object storage prefix is **token-gated** — it is no longer
-public-read. All HLS playback requires a valid short-lived HMAC cookie.
+The `hls/` object storage prefix is **token-gated** — it is not public-read.
+All HLS playback requires a valid short-lived HMAC credential. There are
+**two transports** for the same token: a cookie for browsers, a request
+header for native players.
 
-**What the frontend must do:**
+**Web (cookie):**
 
 1. **Before playing any clip**, call `GET /media/playback-token/<clip_id>/`
    with `Authorization: Bearer <access>` and `credentials: 'include'`.
-
 2. The backend sets an `HttpOnly` cookie `ef_hls_token` via `Set-Cookie`.
-   The frontend **cannot read this cookie** — it is handled automatically
-   by the browser on all `/hls/*` requests.
+   The frontend **cannot read this cookie** and must not try — it is
+   attached automatically by the browser on all `/hls/*` requests.
+3. **Read nothing from the response body.** It is `{"status": "ok"}`.
 
-3. **Error handling:** If the token endpoint returns 401/403/404/network
-   error, do NOT attempt playback. Show "Playback unavailable" UI.
+**Native (header):**
 
-4. **Scope:** Token is per-clip (`hls/<clip_id>/`). Switching clips
-   requires a new token call.
+1. Call the same endpoint with an extra `X-EchoFlow-Client: native` header.
+2. The response is `{"status": "ok", "token": "<b64url-payload>.<b64url-hmac>"}`.
+   **Read `token` from the body.**
+3. Attach it to every media request as `X-EchoFlow-Media-Token`, via the
+   player's per-source headers. expo-audio applies those to the manifest
+   *and* every segment.
 
-5. **TTL:** 10 minutes (configurable via `MEDIA_TOKEN_TTL_SECONDS`).
+**Why native needs a second transport:** `AVPlayer` (iOS) does not read
+`NSHTTPCookieStorage`, and ExoPlayer's `DefaultHttpDataSource` (Android)
+sends no `Cookie` header — neither shares state with the app's HTTP client.
+The cookie is also `HttpOnly` (the app cannot read it back) and `Secure`
+(dropped outright over plaintext-HTTP dev). A native client therefore
+cannot obtain *or* present the cookie.
 
-**Why cookies, not signed URLs?**
+The body token is **opt-in**: without the `X-EchoFlow-Client: native` header
+the body stays `{"status": "ok"}`, because `HttpOnly` exists to stop script
+from reading a bearer credential. The cookie is set in **both** cases, so
+this is additive and the web path is unchanged.
+
+**Precedence at the edge is cookie-first.** A page's script cannot read the
+`HttpOnly` cookie but can set an arbitrary header, so the header is only
+consulted when no token is extractable from the cookie.
+
+**Common to both:**
+
+4. **Error handling:** on 401/403/404, or a network error, do NOT attempt
+   playback — show "Playback unavailable". **409** means the clip's media is
+   still processing: show a spinner on the artwork and retry in ~5s. 403 also
+   covers a moderation rejection.
+5. **Scope:** the token is per-clip (`hls/<clip_id>/`). Switching clips
+   requires a new token.
+6. **TTL:** `MEDIA_TOKEN_TTL_SECONDS` (default 600s). Cache per clip and
+   refresh with ~120s of headroom; prefetch the next clip in the queue.
+
+**Why not signed URLs?**
 HLS uses relative references between master playlist → variant playlists
 → segments. RFC 3986 §5.2.2 strips query strings during relative
-resolution, breaking signed URLs. Signed cookies survive because the
-browser sends them automatically on all requests to the cookie's path.
+resolution, breaking signed URLs — the manifest returns 200 and every
+segment it names returns 403. A single signed URL cannot authorize a stream
+made of dozens of objects. The token is issued per *path prefix* instead,
+which survives relative-reference resolution.
 
 **Implementation reference:**
-- `frontend/sample_frontend/src/api/client.ts` — `mediaAPI.getPlaybackToken()`
-- `frontend/sample_frontend/src/stores/player.tsx` — `loadSource()` calls token API before `hls.loadSource()`
+- `backend/app/views/media.py` — `_token_response_body()` (the opt-in and why)
+- `backend/app/throttling.py`, `backend/app/urls.py` — refresh keying
+- `workers/hls-token-worker/src/token.ts` — `extractTokenFromRequest()` (precedence)
+- Design: `docs/EXPLAIN/decisions/2026-09-28-native-media-auth-and-cgnat-throttling.md`
+- `docs/EXPLAIN/storage/04-hls-token-protection.md` — full design
+- `docs/mobile-rebuild-plan.md` §10 — the mobile playback sequence
 
 ### 4.7 Media URL handling
 

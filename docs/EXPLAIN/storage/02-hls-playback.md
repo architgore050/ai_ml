@@ -97,7 +97,16 @@ Set-Cookie: CloudFront-Policy=...; CloudFront-Signature=...; CloudFront-Key-Pair
 
 ---
 
-## Working Solution: Public-Read Derived Content
+> **⚠️ HISTORICAL. EchoFlow does NOT do this.** The public-read `hls/`
+> arrangement described below was the pre-token-protection design. It is kept
+> for the reasoning about *why query-string signing fails*, which still holds.
+> Current state: `hls/` is **private**, served through the Cloudflare Worker at
+> `media.echoflow.in` (or nginx `:9443` locally), which validates a
+> short-lived HMAC credential per clip. Never run
+> `mc anonymous set download .../hls` — it makes every transcript readable
+> without a token. See [`04-hls-token-protection.md`](04-hls-token-protection.md).
+
+## Working Solution: Public-Read Derived Content (historical)
 
 ### Architecture
 ```
@@ -160,7 +169,9 @@ def get_signed_media_url(object_key):
 
 ### MinIO Init (`docker-compose.yml`)
 ```bash
-mc anonymous set download local/echoflow-media/hls
+# ⛔ OBSOLETE — do not run. This is what made hls/ world-readable.
+# The bucket is left fully private; minio-init only creates it.
+mc mb --ignore-existing local/echoflow-media
 ```
 
 ### URL Generation (`media_urls.py`)
@@ -227,7 +238,8 @@ def get_clip_hls_url(self, obj):
 
 The recommended approach for token-protected HLS over Cloudflare R2:
 
-1. R2 bucket `hls/` prefix becomes **private** (remove public-read bucket policy)
+1. R2 bucket `hls/` prefix is **private** — this is the shipped state, not a
+   future step (remove any public-read bucket policy)
 2. A [Cloudflare Worker](https://developers.cloudflare.com/workers/) at `media.echoflow.in`
    validates an HMAC-signed cookie on every `/hls/*` request
 3. If valid → Worker proxies to R2 via the Workers R2 binding (`env.HLS_BUCKET.get(key, {range: request.headers})`)

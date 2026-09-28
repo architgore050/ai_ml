@@ -641,8 +641,26 @@ REST_FRAMEWORK = {
         'user': '1000/hour',
         'telemetry': '60/min',      # log_telemetry: 1/second max sustained
         'upload': '20/hour',        # AudioUploadViewSet.create: prevent storage abuse
-        'register': '5/hour',       # RegisterView: prevent account-creation spam
+        # Registration is anonymous, so the key has to be the caller's IP.
+        # Raised 5 -> 200 on 2026-09-28: 5/hour/IP caps new-user signup
+        # behind a single mobile carrier NAT gateway rather than capping an
+        # attacker. The per-IP cap on actual spam is now carried by
+        # 'register_username' below, which is per-account and therefore
+        # cannot be shared by unrelated users behind one NAT.
+        'register': '200/hour',
+        # Per-username, applied alongside 'register' by RegisterView. Catches
+        # what the IP key cannot express: one host cycling through many
+        # usernames, and the repeated re-registration used to squat or
+        # reclaim a handle. 3/hour leaves room for a genuine user who typos a
+        # name twice and then succeeds on the third attempt.
+        'register_username': '3/hour',
         'login': '10/min',          # TokenObtainPairView: prevent credential stuffing
+        # Per VERIFIED refresh-token subject, not per IP — see
+        # backend/app/throttling.py. Sized for a 15-minute access token: ~4
+        # refreshes/hour is the steady state, so 120/hour is ~30x headroom
+        # for clock skew, retries and multi-device sign-in, while still
+        # bounding a single abusive token.
+        'token_refresh': '120/hour',
         'comment': '60/hour',       # CommentViewSet.create
         'share_send': '100/hour',   # ShareViewSet.send_share (anti-spam)
         'share_poll': '1000/hour',  # ShareViewSet inbox/unread/mark-read (client polling)

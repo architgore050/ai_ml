@@ -18,12 +18,34 @@ from .views import (
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from rest_framework.throttling import ScopedRateThrottle
 
+from .throttling import RefreshTokenRateThrottle
+
 
 class ThrottledTokenObtainPairView(TokenObtainPairView):
     # SECURITY: 10 login attempts/min/IP. Default AnonRateThrottle
     # 100/hour = ~1.7/min — too loose for credential stuffing.
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = 'login'
+
+
+class ThrottledTokenRefreshView(TokenRefreshView):
+    # SECURITY: refresh is keyed on the *verified user id* inside the refresh
+    # token, not on the caller's IP. The previous configuration inherited
+    # `AnonRateThrottle` (100/hour/IP), which is fatal on a mobile network:
+    # access tokens live 15 minutes, so every active user refreshes ~4x/hour
+    # and a single carrier NAT gateway exhausts the cell's 100/hour budget
+    # within minutes, logging out every subscriber on that cell at once.
+    #
+    # `throttle_scope` IS LOAD-BEARING, not decorative. `ScopedRateThrottle`
+    # (the base of `RefreshTokenRateThrottle`) reads its scope from the view
+    # at request time and returns True — allowing the request with no
+    # accounting at all — when the view does not declare one. Dropping this
+    # attribute would silently unthrottle the endpoint, which is a worse
+    # failure than the original bug because nothing errors.
+    # See backend/app/throttling.py and
+    # backend/app/tests/test_throttling.py::TestRefreshThrottleWiring.
+    throttle_classes = [RefreshTokenRateThrottle]
+    throttle_scope = 'token_refresh'
 
 router = DefaultRouter()
 router.register(r'feed', FastFeedViewSet, basename='feed')
@@ -60,7 +82,7 @@ urlpatterns = [
     path('', include(router.urls)),
     path('auth/login/', ThrottledTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('auth/register/', RegisterView.as_view(), name='register'),
-    path('auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('auth/token/refresh/', ThrottledTokenRefreshView.as_view(), name='token_refresh'),
     path('auth/logout/', LogoutView.as_view(), name='logout'),
     # ISSUE-03 (grievance / compliance) and ISSUE-06 (data-subject rights)
     # TODO: Check if they are rate-limited or throttled. If so, add ScopedRateThrottle and throttle_scope.

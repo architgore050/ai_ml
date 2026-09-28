@@ -704,18 +704,26 @@ Durable, repo-specific knowledge. Append a concise entry at the end of each sess
 
 ---
 
-### 2026-09-07 — media-image-build + test-suite-greening + db-init-rewiring
+### 2026-09-15 — local-stack-compose-fixes + hybrid-deployment-diagnostics
 **Learned:**
-- BuildKit `--mount=type=cache` paths are invisible to other build stages — `cp -a` to a real path before `COPY --from`.
-- `AudioClip.cover_image` was in the model with no migration → 71 fixture-error cascade. Fix: `makemigrations`. CI guard (`makemigrations --check`) not yet wired.
-- `ai_ml/scrapers/uploader.py` relative import `..models` resolves to `ai_ml.models`; use absolute `from backend.app.models import AudioClip`.
-- Postgres `docker-entrypoint-initdb.d` scripts run against `POSTGRES_DB`, not `template1` — vector on template1 needs its own `\c template1` script in alphabetical order (`00→01→02`).
-- Init scripts only run on fresh data volumes — `docker volume rm` needed to re-trigger.
-- `TestLiveNginxTerminator` false-fails when main stack's nginx is up — fixture only checks TCP connect, not upstream correctness.
+- MinIO image tags `RELEASE.2025-09-07T16-13-09Z` don't exist on Docker Hub → change to `quay.io/minio/minio:latest`; same for `mc:latest`
+- Locally-built images (`echoflow-api:local`, `echoflow-media:local`, `echoflow/pgbouncer:local`) require `pull_policy: never` in docker-compose to avoid pulling from non-existent Docker Hub repos
+- Redis passwords with base64 chars (`+`, `/`, `=`) break Kombu URL parsing → split into `REDIS_*_HOST/PORT/PASSWORD` env vars + `build_redis_url()` helper in `settings.py`
+- `docker/nginx.conf` uses `web:8000`/`minio:9000` upstreams but local services are `web_local`/`minio_local` → create `docker/nginx.local.conf` with corrected hostnames
+- Dockerfile HEALTHCHECK for `api` stage is web probe (`localhost:8000/health/`), not Celery → override healthcheck in compose with `celery inspect ping` for worker services
+- `minio_init_local` service auto-initializes MinIO bucket on first stack up but `quay.io/minio/mc:latest` may have version incompatibility with MinIO server; service exits after init (one-shot behavior)
+- Orphan container `echoflow_revnuecat-prod-celery_media-1` from previous project config is NOT part of current stack; use `docker compose down --remove-orphans` to clean
+- Laptop media worker (`docker-compose.laptop.yml`) uses Tailscale tunnel to VPS, NOT Docker bridge; requires `tailscale up --accept-routes`, IP forwarding on both devices, and VPS nftables rule `ip saddr <laptop-ts-ip> iifname "tailscale0" accept` for TCP to work (ICMP/ping may work without it)
 
-**Changed:** Dockerfile (`cp -a` + COPY path), `migrations/0002_audioclip_cover_image.py`, uploader.py import fix, 3 postgres-init SQL scripts, docker-compose.yml db mount, CI workflow.
+**Changed:**
+- `docker-compose.local.yml`: fixed image tags, pull policies, Redis URLs, nginx upstreams, celery healthcheck, removed/re-added minio_init_local
+- `docker/nginx.local.conf`: new file with corrected upstream hostnames
+- `backend/EchoFlow/settings.py`: added `build_redis_url()` function
+- Verified all 13 local services healthy; health endpoint `curl -k https://localhost:18443/health/` works
 
-**Open:** `TestLiveNginxTerminator` fix (probe response body); `makemigrations --check` in CI.
+**Open:**
+- `TestLiveNginxTerminator` fix (probe response body) - tracked in AGENTS.md
+- `makemigrations --check` in CI - tracked in AGENTS.md
 
 ---
 
@@ -729,5 +737,6 @@ Accumulated from user corrections. Append on your own when corrected.
 | Lessons learned → AGENTS.md, max 3 lines per bullet | Listing full decision rationale in AGENTS.md |
 | DOs/DON'Ts → AGENTS.md, updated automatically on correction | Duplicating env-var tables across sections |
 | Link to docs instead of inlining | Asking permission to correct AGENTS.md after a user correction |
+| Record session learnings with `YYYY-MM-DD` slug format | Leaving entries unresolved indefinitely |
 
 _(No user-corrected entries yet — add rows above as corrections come in.)_

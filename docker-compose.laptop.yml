@@ -25,7 +25,7 @@ services:
       sh -c "set -e && python wait_for_db.py &&
               celery -A backend.EchoFlow worker -Q heavy_media --pool=prefork --concurrency=2 --loglevel=info"
     env_file:
-      - .env
+      - .env.laptop
     volumes:
       - laptop-scratch:/tmp
     deploy:

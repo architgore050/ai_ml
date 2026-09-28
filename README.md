@@ -140,7 +140,7 @@ A `robots.txt`-respecting, rate-limited scraper ingests openly-licensed audio fr
 # 1. Ensure .env exists and is populated (DB_*, REDIS_URL, DJANGO_SECRET_KEY, HF_TOKEN, ...)
 #    docker compose reads ${VAR} substitutions from your .env file.
 
-# 2. Build and start all services (14: db, pgbouncer, redis_broker, redis_cache, minio, minio-init,
+# 2. Build and start all services (13: db, pgbouncer, redis_broker, redis_cache, minio, nginx, web, celery, celery_feed, celery_media, celery_beat, prometheus, grafana)
 #    nginx, web, celery, celery_feed, celery_media, celery_beat, prometheus, grafana)
 docker compose up --build
 
@@ -258,7 +258,7 @@ EchoFlow/
 ├── frontend/                   # Sample Vite/React client (HLS.js playback)
 ├── docs/                       # Architecture audits, EXPLAIN/, scaling analysis, deployment notes
 ├── docker/                     # nginx.conf, prometheus/, grafana/, certs/
-├── docker-compose.yml          # 14 services (db, pgbouncer, redis_broker, redis_cache, minio, minio-init, nginx, web, celery, celery_feed, celery_media, celery_beat, prometheus, grafana)
+├── docker-compose.yml          # 13 services (db, pgbouncer, redis_broker, redis_cache, minio, nginx, web, celery, celery_feed, celery_media, celery_beat, prometheus, grafana)
 ├── Dockerfile                  # Multi-stage build → api + media images, offline wheelhouse installs
 ├── requirements.txt            # Aggregate for local dev (-r base + media)
 ├── requirements-base.txt       # Core Django/API deps (used by api image)
@@ -322,7 +322,7 @@ Full design: [docs/EXPLAIN/docker/05-https-tls-termination.md](docs/EXPLAIN/dock
 
 ---
 
-**Stack at a glance:** `Django 5` · `DRF` · `PostgreSQL + pgvector` · `Redis` · `Celery` · `FFmpeg/HLS` · `faster-whisper` · `sentence-transformers` · `librosa` · `nginx 1.27 (TLS terminator)` · `Docker Compose` (14 services: db, pgbouncer, redis_broker, redis_cache, minio, minio-init, nginx, web, celery, celery_feed, celery_media, celery_beat, prometheus, grafana)
+**Stack at a glance:** `Django 5` · `DRF` · `PostgreSQL + pgvector` · `Redis` · `Celery` · `FFmpeg/HLS` · `faster-whisper` · `sentence-transformers` · `librosa` · `nginx 1.27 (TLS terminator)` · `Docker Compose` (13 services: db, pgbouncer, redis_broker, redis_cache, minio, nginx, web, celery, celery_feed, celery_media, celery_beat, prometheus, grafana)
 
 ## Storage (MinIO / S3-compatible)
 Derived HLS streams live in object storage (MinIO locally / S3 in prod) with the `hls/` prefix **token-gated** for multi-file playback — original uploads (`uploads/`) stay private via signed URLs. The token-gated approach uses HMAC-signed cookies (`ef_hls_token`) issued by the `/media/playback-token/<clip_id>/` endpoint; the Cloudflare Worker (production) or nginx njs (dev) validates the cookie before proxying to R2/MinIO. This prevents unauthorized access and DDOS on the public storage endpoint. The `hls/` prefix is **no longer public-read** — all HLS access requires a valid playback token. See [docs/EXPLAIN/storage/04-hls-token-protection.md](docs/EXPLAIN/storage/04-hls-token-protection.md) for the full design.

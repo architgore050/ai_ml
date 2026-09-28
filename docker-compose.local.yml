@@ -1,0 +1,488 @@
+# =============================================================================
+# EchoFlow — Local Development Compose (Parallel with VPS Stack)
+# =============================================================================
+# Runs a full local stack with renamed containers, shifted ports, and isolated
+# network/volumes so it can run alongside the VPS stack (docker-compose.vps.yml)
+# and the laptop media worker (docker-compose.laptop.yml) simultaneously.
+#
+# Usage: docker compose -f docker-compose.local.yml up -d
+# =============================================================================
+
+services:
+  # ---- PostgreSQL (local port 15432) ----
+  db_local:
+    image: pgvector/pgvector:pg16
+    container_name: echoflow_db_local
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data_local:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  # ---- Redis Broker (local port 16379) ----
+  redis_broker_local:
+    image: redis:7-alpine
+    container_name: echoflow_redis_broker_local
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --requirepass ${REDIS_BROKER_PASSWORD}
+    volumes:
+      - redis_broker_data_local:/data
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_BROKER_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # ---- Redis Cache (local port 16380) ----
+  redis_cache_local:
+    image: redis:7-alpine
+    container_name: echoflow_redis_cache_local
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru --requirepass ${REDIS_CACHE_PASSWORD}
+    volumes:
+      - redis_cache_data_local:/data
+    ports:
+      - "16380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_CACHE_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 1G
+
+  # ---- PgBouncer (local port 16432) ----
+  pgbouncer_local:
+    build:
+      context: ./docker/pgbouncer
+      dockerfile: Dockerfile
+    image: echoflow/pgbouncer:local
+    pull_policy: never
+    container_name: echoflow_pgbouncer_local
+    restart: unless-stopped
+    environment:
+      - DB_HOST=db_local
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - LISTEN_PORT=6432
+      - AUTH_TYPE=scram-sha-256
+      - POOL_MODE=transaction
+      - MAX_CLIENT_CONN=10000
+      - DEFAULT_POOL_SIZE=25
+      - MIN_POOL_SIZE=5
+      - RESERVE_POOL_SIZE=5
+      - RESERVE_POOL_TIMEOUT=3
+      - SERVER_IDLE_TIMEOUT=600
+      - QUERY_WAIT_TIMEOUT=120
+      - VERBOSE=0
+      - LOG_CONNECTIONS=1
+      - LOG_POOLER_ERRORS=1
+      - IGNORE_STARTUP_PARAMETERS=extra_float_digits,statement_timeout,idle_in_transaction_session_timeout,lock_timeout,connect_timeout,default_transaction_read_only
+      - LOG_DISCONNECTIONS=1
+      - LOG_POOLER_ERRORS=1
+    depends_on:
+      db_local:
+        condition: service_healthy
+    ports:
+      - "16432:6432"
+    healthcheck:
+      test: ["CMD-SHELL", "PGPASSWORD=$DB_PASSWORD psql -h 127.0.0.1 -p 6432 -U $DB_USER -d $DB_NAME -c 'SELECT 1' -t -A -q >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 128M
+
+  # ---- MinIO (local ports 19000/19001) ----
+  minio_local:
+    image: quay.io/minio/minio:latest
+    container_name: echoflow_minio_local
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID}
+      MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY}
+      MINIO_CORS_ALLOW_ORIGIN: "*"
+      MINIO_CORS_ALLOW_METHODS: "GET,PUT,POST,DELETE,OPTIONS"
+      MINIO_CORS_ALLOW_HEADERS: "Origin,Accept,Content-Type,Authorization,Range"
+      MINIO_CORS_EXPOSE_HEADERS: "Date,Content-Length,Content-Range,Accept-Ranges"
+      MINIO_CORS_MAX_AGE: "3600"
+    volumes:
+      - minio_data_local:/data
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  minio_init_local:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio_local:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        mc alias set local http://minio_local:9000 ${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY} &&
+        mc mb --ignore-existing local/${AWS_STORAGE_BUCKET_NAME:-echoflow-media}
+      "
+
+  # ---- Django Web (local port 18000) ----
+  web_local:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    image: echoflow-api:local
+    pull_policy: never
+    container_name: echoflow_web_local
+    restart: unless-stopped
+    working_dir: /app
+    env_file:
+      - .env.local
+    environment:
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@db_local:5432/${DB_NAME}
+      - REDIS_BROKER_HOST=redis_broker_local
+      - REDIS_BROKER_PORT=6379
+      - REDIS_BROKER_PASSWORD=${REDIS_BROKER_PASSWORD}
+      - REDIS_CACHE_HOST=redis_cache_local
+      - REDIS_CACHE_PORT=6379
+      - REDIS_CACHE_PASSWORD=${REDIS_CACHE_PASSWORD}
+      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
+      - DJANGO_DEBUG=True
+      - DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1
+      - GUNICORN_WORKERS=2
+      - GUNICORN_THREADS=2
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_STORAGE_BUCKET_NAME=${AWS_STORAGE_BUCKET_NAME:-echoflow-media}
+      - AWS_S3_ENDPOINT_URL=http://minio_local:9000
+      - AWS_S3_REGION_NAME=auto
+      - AWS_S3_QUERYSTRING_EXPIRE=3600
+      - PUBLIC_MEDIA_ENDPOINT_URL=http://localhost:19000
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - SENTRY_ENV=development
+    command: >
+      sh -c "set -e && python wait_for_db.py &&
+             python manage.py migrate &&
+             python manage.py collectstatic --noinput &&
+             gunicorn -c gunicorn.conf.py backend.EchoFlow.wsgi:application"
+    volumes:
+      - .:/app
+    ports:
+      - "18000:8000"
+    depends_on:
+      db_local:
+        condition: service_healthy
+      redis_broker_local:
+        condition: service_healthy
+      redis_cache_local:
+        condition: service_healthy
+      minio_local:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; req = urllib.request.Request('http://localhost:8000/health/', headers={'X-Forwarded-Proto': 'https'}); urllib.request.urlopen(req, timeout=4)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  # ---- Celery Workers (local) ----
+  celery_local:
+    image: echoflow-api:local
+    pull_policy: never
+    container_name: echoflow_celery_local
+    restart: unless-stopped
+    working_dir: /app
+    user: "1000:1000"
+    env_file:
+      - .env.local
+    command: >
+      sh -c "set -e && python wait_for_db.py &&
+              celery -A backend.EchoFlow worker --loglevel=info"
+    volumes:
+      - .:/app
+    depends_on:
+      db_local:
+        condition: service_healthy
+      redis_broker_local:
+        condition: service_healthy
+      redis_cache_local:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@db_local:5432/${DB_NAME}
+      - REDIS_BROKER_HOST=redis_broker_local
+      - REDIS_BROKER_PORT=6379
+      - REDIS_BROKER_PASSWORD=${REDIS_BROKER_PASSWORD}
+      - REDIS_CACHE_HOST=redis_cache_local
+      - REDIS_CACHE_PORT=6379
+      - REDIS_CACHE_PASSWORD=${REDIS_CACHE_PASSWORD}
+      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
+      - DJANGO_DEBUG=True
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - SENTRY_ENV=development
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A backend.EchoFlow inspect ping -d \"celery@$$(hostname)\" --timeout=10 || exit 1"]
+      interval: 30s
+      timeout: 15s
+      start_period: 30s
+      retries: 3
+
+  celery_feed_local:
+    image: echoflow-api:local
+    pull_policy: never
+    container_name: echoflow_celery_feed_local
+    restart: unless-stopped
+    command: >
+      sh -c "set -e && python wait_for_db.py &&
+              celery -A backend.EchoFlow worker -Q fast_feed --concurrency=2 --loglevel=info"
+    env_file:
+      - .env.local
+    depends_on:
+      db_local:
+        condition: service_healthy
+      redis_broker_local:
+        condition: service_healthy
+      redis_cache_local:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@db_local:5432/${DB_NAME}
+      - REDIS_BROKER_HOST=redis_broker_local
+      - REDIS_BROKER_PORT=6379
+      - REDIS_BROKER_PASSWORD=${REDIS_BROKER_PASSWORD}
+      - REDIS_CACHE_HOST=redis_cache_local
+      - REDIS_CACHE_PORT=6379
+      - REDIS_CACHE_PASSWORD=${REDIS_CACHE_PASSWORD}
+      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
+      - DJANGO_DEBUG=True
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - SENTRY_ENV=development
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A backend.EchoFlow inspect ping -d \"celery@$$(hostname)\" --timeout=10 || exit 1"]
+      interval: 30s
+      timeout: 15s
+      start_period: 30s
+      retries: 3
+
+  # ---- Celery Media (local) ----
+  celery_media_local:
+    image: echoflow-media:local
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: media
+      secrets:
+        - hf_token
+    container_name: echoflow_celery_media_local
+    restart: unless-stopped
+    command: >
+      sh -c "set -e && python wait_for_db.py &&
+              celery -A backend.EchoFlow worker -Q heavy_media --pool=prefork --concurrency=2 --loglevel=info"
+    env_file:
+      - .env.local
+    depends_on:
+      db_local:
+        condition: service_healthy
+      redis_broker_local:
+        condition: service_healthy
+      redis_cache_local:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@db_local:5432/${DB_NAME}
+      - REDIS_BROKER_HOST=redis_broker_local
+      - REDIS_BROKER_PORT=6379
+      - REDIS_BROKER_PASSWORD=${REDIS_BROKER_PASSWORD}
+      - REDIS_CACHE_HOST=redis_cache_local
+      - REDIS_CACHE_PORT=6379
+      - REDIS_CACHE_PASSWORD=${REDIS_CACHE_PASSWORD}
+      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
+      - DJANGO_DEBUG=True
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - SENTRY_ENV=development
+      - HF_HOME=/home/appuser/.cache/huggingface
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  # ---- Celery Beat (local) ----
+  celery_beat_local:
+    image: echoflow-api:local
+    pull_policy: never
+    container_name: echoflow_celery_beat_local
+    restart: unless-stopped
+    working_dir: /app
+    user: "1000:1000"
+    command: >
+      sh -c "set -e && python wait_for_db.py &&
+              celery -A backend.EchoFlow beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler"
+    env_file:
+      - .env.local
+    depends_on:
+      db_local:
+        condition: service_healthy
+      redis_broker_local:
+        condition: service_healthy
+      redis_cache_local:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@db_local:5432/${DB_NAME}
+      - REDIS_BROKER_HOST=redis_broker_local
+      - REDIS_BROKER_PORT=6379
+      - REDIS_BROKER_PASSWORD=${REDIS_BROKER_PASSWORD}
+      - REDIS_CACHE_HOST=redis_cache_local
+      - REDIS_CACHE_PORT=6379
+      - REDIS_CACHE_PASSWORD=${REDIS_CACHE_PASSWORD}
+      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
+      - DJANGO_DEBUG=True
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - SENTRY_ENV=development
+    healthcheck:
+      disable: true
+
+  # ---- nginx (local ports 18080/18443/19443) ----
+  nginx_local:
+    image: nginx:1.27-alpine
+    container_name: echoflow_nginx_local
+    restart: unless-stopped
+    depends_on:
+      web_local:
+        condition: service_healthy
+    ports:
+      - "18080:80"
+      - "18443:443"
+      - "19443:9443"
+    volumes:
+      - ./docker/nginx.local.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/certs:/etc/nginx/certs:ro
+      - ./docker/nginx/hls_auth.js:/etc/nginx/hls_auth.js:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--no-check-certificate", "--spider", "https://localhost/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ---- Prometheus (local port 19090) ----
+  prometheus_local:
+    image: prom/prometheus:latest
+    container_name: echoflow_prometheus_local
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data_local:/prometheus
+    ports:
+      - "19090:9090"
+    depends_on:
+      web_local:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ---- Grafana (local port 13000) ----
+  grafana_local:
+    image: grafana/grafana:latest
+    container_name: echoflow_grafana_local
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data_local:/var/lib/grafana
+    ports:
+      - "13000:3000"
+    depends_on:
+      prometheus_local:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+# ---- Networks ----
+networks:
+  echoflow_local:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-echoflow-local
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+          gateway: 172.29.0.1
+
+# ---- Volumes ----
+volumes:
+  postgres_data_local:
+  redis_broker_data_local:
+  redis_cache_data_local:
+  minio_data_local:
+  prometheus_data_local:
+  grafana_data_local:
+
+# Build secrets
+secrets:
+  hf_token:
+    environment: HF_TOKEN
+

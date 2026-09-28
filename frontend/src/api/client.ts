@@ -17,7 +17,7 @@ const STORAGE_KEY_REFRESH = "ef_refresh_token";
 const STORAGE_KEY_USER = "ef_user";
 
 const API_BASE_URL = (
-  import.meta.env.VITE_API_BASE_URL || "http://localhost:8005"
+  import.meta.env.VITE_API_BASE_URL || "http://localhost:18000"
 ).replace(/\/+$/, "");
 
 function apiUrl(endpoint: string): string {

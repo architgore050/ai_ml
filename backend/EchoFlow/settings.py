@@ -242,14 +242,27 @@ if 'read' in DATABASES:
 REDIS_URL_DEFAULT = 'redis://localhost:6379/1'
 REDIS_URL = os.getenv("REDIS_URL", REDIS_URL_DEFAULT)
 
+# Build Redis URL from components if full URL not provided
+def build_redis_url(prefix: str) -> str:
+    """Build Redis URL from individual components."""
+    host = os.getenv(f"{prefix}_HOST")
+    port = os.getenv(f"{prefix}_PORT", "6379")
+    password = os.getenv(f"{prefix}_PASSWORD")
+    if host and password:
+        # URL-encode the password to handle special characters
+        from urllib.parse import quote
+        encoded_password = quote(password, safe='')
+        return f"redis://:{encoded_password}@{host}:{port}/0"
+    return REDIS_URL
+
 # DECISION: Two Redis URLs in Docker (broker vs cache) so a feed-queue spike
 # can't evict queued Celery tasks and vice versa. In Docker compose the broker
 # runs with `--maxmemory-policy noeviction` (can't lose queued tasks) and the
 # cache with `allkeys-lru` (feed queues evictable since refill is idempotent).
 # Non-Docker dev collapses both to REDIS_URL — a single Redis on localhost is
 # fine for one developer.
-REDIS_BROKER_URL = os.getenv("REDIS_BROKER_URL", REDIS_URL)
-REDIS_CACHE_URL = os.getenv("REDIS_CACHE_URL", REDIS_URL)
+REDIS_BROKER_URL = os.getenv("REDIS_BROKER_URL", build_redis_url("REDIS_BROKER"))
+REDIS_CACHE_URL = os.getenv("REDIS_CACHE_URL", build_redis_url("REDIS_CACHE"))
 
 # This is how you connect Redis to Django
 CACHES = {

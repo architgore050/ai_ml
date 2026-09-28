@@ -4,7 +4,7 @@ import { createServer as createViteServer } from "vite";
 import multer from "multer";
 
 const app = express();
-const PORT = 3001;
+const PORT = 18001;
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));

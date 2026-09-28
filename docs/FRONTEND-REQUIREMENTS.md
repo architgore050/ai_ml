@@ -1767,7 +1767,7 @@ For the implementing agent: every endpoint, every response shape.
 ```
 AUTH
   POST /auth/register/         {username, password, email,                   → 201 User (no tokens)
-                                consent_accepted, terms_version}             | 400 {<field>: [<err>]}
+                                consent_accepted, terms_version, dob}        | 400 {<field>: [<err>]}
   POST /auth/login/            {username, password}                         → 200 {access, refresh}
   POST /auth/token/refresh/    {refresh}                                    → 200 {access, refresh (new)}
   POST /auth/logout/           {refresh}                                    → 200/400 {detail}
@@ -1781,7 +1781,12 @@ AUTH
   # terms_version is validated against the server's list. Read
   # current_terms_version from /legal/compliance/ rather than hardcoding —
   # appending a version to TERMS_VERSIONS otherwise 400s every client.
-  # dob is still optional; making it required is tracked separately (age gate).
+  #
+  # B1 (2026-09-29): dob is now REQUIRED (was optional, so a client could
+  # dodge the DPDP §9 age gate by omission). If the computed age is under 18,
+  # parent_email is required too and the account is flagged is_minor — and
+  # POST /interactions/{id}/log-telemetry/ then returns 403 for that user.
+  # Likes and skips are NOT gated. Future or >120-year-old dob is rejected.
 
 FEED
   GET  /feed/                                                                → 200 {next, queue_health, results: FeedClip[]}

@@ -102,6 +102,19 @@
 
 ---
 
+> **✅ PARTIALLY RESOLVED 2026-09-29 (B1).** `dob` is now **required**
+> (`serializers.py`), so the omit-to-bypass path is closed: a client that
+> omits it gets 400 rather than an adult-flagged account. Under-18 users
+> must supply `parent_email` and are flagged `is_minor`, and
+> `POST /interactions/{id}/log-telemetry/` returns **403** for them, which
+> closes the behavioural-monitoring exposure DPDP §9 actually cares about.
+> Future and implausible (>120y) dates are rejected.
+>
+> **Still open:** there is no parental-*verification* flow, so
+> `minor_consent_verified` is hardcoded `False` (no mail backend is
+> configured). Nothing ever sets it `True`, so a parent's email address is
+> collected but unverified. Closing that needs mail infrastructure.
+
 #### ISSUE-03: Grievance Officer, Chief Compliance Officer, Nodal Contact missing [COMPLETED — Phase A] (IT Rules 2021 Rule 4(1)(a)(b)(c))
 
 **Status:** Critical — **IT Rules 2021 compliance is non-negotiable; the government can take down the site**

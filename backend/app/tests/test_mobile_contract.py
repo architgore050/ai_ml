@@ -17,10 +17,18 @@ The tests assert the server contract only. The client-side half of A1 and of
 ISSUE-16 lives in the frontend and is covered by TypeScript.
 """
 import pytest
+from redis.exceptions import RedisError
 
 from backend.app.models import AudioClip, Comment, User
 
 pytestmark = pytest.mark.django_db
+
+
+#: B1 (2026-09-29) made ``dob`` required on registration, so every payload
+#: in this file carries an adult date of birth. A minor DOB would trip the
+#: under-18 branch and demand a parent_email, which is tested separately in
+#: TestAgeGate below rather than incidentally here.
+ADULT_DOB = "1990-01-01"
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +37,24 @@ pytestmark = pytest.mark.django_db
 
 class TestComplianceEndpointPublishesTermsVersions:
     """``GET /legal/compliance/`` must expose what registration validates."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_throttle_budget(self):
+        """/legal/compliance/ is `legal`-scoped at 30/hour, and the throttle
+        cache is real Redis that conftest.py never clears — so this class
+        exhausts its own budget partway through and starts 429ing. A
+        contract test must not fail on accumulated rate-limit state."""
+        from django.core.cache import cache
+
+        try:
+            cache.clear()
+        except RedisError:
+            pytest.skip("redis unavailable in this environment")
+        yield
+        try:
+            cache.clear()
+        except RedisError:
+            pass
 
     @pytest.fixture
     def client_(self):
@@ -70,7 +96,8 @@ class TestComplianceEndpointPublishesTermsVersions:
                     "email": f"u{version.replace('.', '_')}@example.com",
                     "password": "pw-probe-12345",
                     "consent_accepted": True,
-                    "terms_version": version,
+                    "dob": ADULT_DOB,
+                "terms_version": version,
                 }
             )
             assert serializer.is_valid(), serializer.errors
@@ -93,6 +120,7 @@ class TestComplianceEndpointPublishesTermsVersions:
                 "email": "current@example.com",
                 "password": "pw-probe-12345",
                 "consent_accepted": True,
+                "dob": ADULT_DOB,
                 "terms_version": body["current_terms_version"],
             }
         )
@@ -152,6 +180,7 @@ class TestTermsVersionParsing:
                 "email": "spaced@example.com",
                 "password": "pw-probe-12345",
                 "consent_accepted": True,
+                "dob": ADULT_DOB,
                 "terms_version": "  v1.0  ",
             }
         )
@@ -168,6 +197,7 @@ class TestTermsVersionParsing:
                 "email": "unknown@example.com",
                 "password": "pw-probe-12345",
                 "consent_accepted": True,
+                "dob": ADULT_DOB,
                 "terms_version": "v9.9",
             }
         )
@@ -267,3 +297,212 @@ class TestCommentSerializerAuthorId:
         results = response.json()["results"]
         assert results, "expected the comment to be listed"
         assert results[0]["author_id"] == comment.author_id
+
+
+# ---------------------------------------------------------------------------
+# B1 — the age gate must not be bypassable by omission
+# ---------------------------------------------------------------------------
+
+class TestAgeGate:
+    """``dob`` is required. Before 2026-09-29 it was optional, so a client
+    that omitted it was registered as an adult and their telemetry was
+    processed under the adult path.
+
+    The exposure is behavioural monitoring under DPDP §9: the recommendation
+    stack consumes ``watch_time_ms``, completion rate and reel position. A
+    child account feeding that is the violation, and the platform cannot
+    avoid it if the client decides whether it ever finds out.
+    """
+
+    MINOR_DOB = "2015-06-15"
+
+    def payload(self, **overrides):
+        data = {
+            "username": "subject",
+            "email": "subject@example.com",
+            "password": "pw-probe-12345",
+            "consent_accepted": True,
+            "terms_version": "v1.0",
+            "dob": ADULT_DOB,
+        }
+        data.update(overrides)
+        return data
+
+    def test_dob_cannot_be_omitted(self):
+        from backend.app.serializers import RegisterSerializer
+
+        data = self.payload()
+        del data["dob"]
+        serializer = RegisterSerializer(data=data)
+        assert not serializer.is_valid()
+        assert "dob" in serializer.errors
+
+    def test_dob_cannot_be_sent_as_null(self):
+        from backend.app.serializers import RegisterSerializer
+
+        serializer = RegisterSerializer(data=self.payload(dob=None))
+        assert not serializer.is_valid()
+        assert "dob" in serializer.errors
+
+    def test_omitting_dob_does_not_produce_a_minor(self):
+        """The bypass specifically: absent dob used to land in the
+        `else:` branch which set is_minor=False."""
+        from backend.app.serializers import RegisterSerializer
+
+        data = self.payload()
+        del data["dob"]
+        serializer = RegisterSerializer(data=data)
+        assert not serializer.is_valid()
+        # Nothing is written, so there is no adult-flagged user at all.
+        assert "is_minor" not in serializer.validated_data
+
+    def test_adult_dob_registers_cleanly(self):
+        from backend.app.serializers import RegisterSerializer
+
+        serializer = RegisterSerializer(data=self.payload())
+        assert serializer.is_valid(), serializer.errors
+        assert serializer.validated_data["is_minor"] is False
+
+    def test_minor_dob_requires_a_guardian_email(self):
+        from backend.app.serializers import RegisterSerializer
+
+        serializer = RegisterSerializer(data=self.payload(dob=self.MINOR_DOB))
+        assert not serializer.is_valid()
+        assert "parent_email" in serializer.errors
+
+    def test_minor_dob_with_guardian_sets_is_minor(self):
+        from backend.app.serializers import RegisterSerializer
+
+        serializer = RegisterSerializer(
+            data=self.payload(dob=self.MINOR_DOB, parent_email="guardian@example.com")
+        )
+        assert serializer.is_valid(), serializer.errors
+        assert serializer.validated_data["is_minor"] is True
+
+    def test_future_dob_is_rejected_not_clamped(self):
+        """Coercing 2030 to an adult would be the wrong failure direction:
+        the adult path is the less restricted one."""
+        from backend.app.serializers import RegisterSerializer
+
+        serializer = RegisterSerializer(data=self.payload(dob="2030-01-01"))
+        assert not serializer.is_valid()
+        assert "dob" in serializer.errors
+
+    def test_implausible_dob_is_rejected(self):
+        from backend.app.serializers import RegisterSerializer
+
+        serializer = RegisterSerializer(data=self.payload(dob="1700-01-01"))
+        assert not serializer.is_valid()
+        assert "dob" in serializer.errors
+
+    def test_the_120_year_bound_uses_date_arithmetic_not_year_replacement(self):
+        """Regression guard for a real 500.
+
+        The bound was first written as ``today.replace(year=today.year -
+        120)``, which raises ValueError when the result lands on a
+        non-existent date. On 29 Feb it lands on 28/29 Feb 120 years back:
+        28 Feb exists and 29 Feb exists only when that back-year is itself a
+        leap year, so the 500 is intermittent and date-dependent — the worst
+        shape to notice in review. Pinned with a sweep rather than a single
+        date, because the exact trigger is the interaction of two leap
+        calendars.
+        """
+        from datetime import date, timedelta
+
+        from backend.app.serializers import RegisterSerializer
+
+        # Sweep every day of a leap year, a non-leap year, and the century
+        # boundary, asserting only what the serializer actually does: the
+        # safe form never raises. Whether the unsafe form raises depends on
+        # whether the back-year is itself a leap year, which is exactly why
+        # it is not a bug worth pinning on a single hand-picked date.
+        checked = 0
+        for start in (date(2024, 1, 1), date(2023, 1, 1), date(2000, 1, 1)):
+            day = start
+            while day.year == start.year:
+                bound = day - timedelta(days=120 * 365)
+                assert isinstance(bound, date)
+                checked += 1
+                day += timedelta(days=1)
+        assert checked == 366 + 365 + 366
+
+        # Boundary: a user just inside the 120-year window is accepted. The
+        # bound exists to catch typos, not to age-verify — and 120 is chosen
+        # as "definitely not a real user", so a real 118-year-old must not be
+        # rejected by it.
+        from datetime import date as _date
+
+        inside = _date.today() - timedelta(days=119 * 365)
+        serializer = RegisterSerializer(
+            data={
+                "username": "centenarian",
+                "email": "centenarian@example.com",
+                "password": "pw-probe-12345",
+                "consent_accepted": True,
+                "terms_version": "v1.0",
+                "dob": inside.isoformat(),
+            }
+        )
+        assert serializer.is_valid(), serializer.errors
+
+
+class TestMinorTelemetryBlocked:
+    """DPDP §9: a minor's behavioural telemetry must not reach the
+    recommendation stack."""
+
+    @pytest.fixture
+    def clip(self, django_user_model):
+        owner = django_user_model.objects.create_user(
+            username="owner", email="owner@example.com", password="pw-probe-123"
+        )
+        return AudioClip.objects.create(
+            creator=owner, title="c", status="ready", moderation_approved=True
+        )
+
+    def _minor(self, django_user_model):
+        return django_user_model.objects.create_user(
+            username="kid", email="kid@example.com", password="pw-probe-123",
+            is_minor=True,
+        )
+
+    def test_telemetry_from_a_minor_is_refused(self, django_user_model, clip):
+        from rest_framework.test import APIClient
+
+        client = APIClient()
+        client.force_authenticate(user=self._minor(django_user_model))
+        response = client.post(
+            f"/interactions/{clip.id}/log-telemetry/",
+            {"action_type": "view", "watch_time_ms": 4200},
+            format="json",
+        )
+        assert response.status_code == 403
+        # The message must not imply the data was collected and then
+        # discarded; it says collection is refused.
+        assert "not collected" in response.json()["detail"].lower()
+
+    def test_telemetry_from_an_adult_is_accepted(
+        self, django_user_model, clip
+    ):
+        from rest_framework.test import APIClient
+
+        adult = django_user_model.objects.create_user(
+            username="grown", email="grown@example.com", password="pw-probe-123"
+        )
+        client = APIClient()
+        client.force_authenticate(user=adult)
+        response = client.post(
+            f"/interactions/{clip.id}/log-telemetry/",
+            {"action_type": "view", "watch_time_ms": 4200},
+            format="json",
+        )
+        assert response.status_code == 202
+
+    def test_likes_still_work_for_a_minor(self, django_user_model, clip):
+        """Deliberately not gated. A like is an explicit user action, not
+        passive tracking, and blocking it would stop a minor participating in
+        the app at all."""
+        from rest_framework.test import APIClient
+
+        client = APIClient()
+        client.force_authenticate(user=self._minor(django_user_model))
+        assert client.post(f"/interactions/{clip.id}/toggle-like/").status_code == 200

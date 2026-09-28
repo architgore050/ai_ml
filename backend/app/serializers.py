@@ -460,6 +460,14 @@ class RegisterSerializer(serializers.ModelSerializer):
         required=True,
         validators=[UniqueValidator(queryset=User.objects.all())]
     )
+    # B1 (2026-09-29): was `required=False, allow_null=True`, which made the
+    # age gate advisory rather than enforced — a client that simply omitted
+    # dob was registered as an adult, is_minor stayed False, and their
+    # telemetry was processed under the adult path. DPDP §9 applies to
+    # processing a child's data; the platform cannot know whether it is
+    # doing that if the client controls whether it finds out. Optionality
+    # was the bypass.
+    dob = serializers.DateField(required=True)
 
     class Meta:
         model = User #built-in User model
@@ -482,27 +490,60 @@ class RegisterSerializer(serializers.ModelSerializer):
         return value.strip()
 
     def validate(self, data):
-        # DECISION: If user provides dob and age < 18, require parent_email
-        # and set is_minor/minor_consent_verified flags. Tradeoff: extra
-        # validation logic vs. regulatory compliance (DPDP age gate).
-        dob = data.get('dob')
-        if dob:
-            from datetime import date
-            today = date.today()
-            age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
-            if age < 18:
-                data['is_minor'] = True
-                data['minor_consent_verified'] = False  # default; verified via parent flow
-                parent_email = data.get('parent_email')
-                if not parent_email:
-                    raise serializers.ValidationError(
-                        {"parent_email": "Parent/guardian email is required for users under 18."}
-                    )
-            else:
-                data['is_minor'] = False
-                data['minor_consent_verified'] = False
+        # DECISION: age < 18 requires a parent/guardian email and sets
+        # is_minor. Tradeoff: extra validation vs. DPDP §9.
+        #
+        # B1 (2026-09-29) — two changes:
+        #  * `dob` is now required, so the `if dob:` / `else:` split that let
+        #    a client dodge the gate by omission is gone. The else branch set
+        #    is_minor=False, which is precisely the bypass.
+        #  * A future `dob` is rejected outright rather than clamping. A
+        #    client sending 2030-01-01 is either a typo or someone trying to
+        #    be born after the fact, and silently coercing it to an adult
+        #    would hide a data-quality problem. Note this is also a
+        #    minor-safety question: the adult path is the one with fewer
+        #    restrictions, so it is the one worth refusing to guess at.
+        from datetime import date
+
+        today = date.today()
+        dob = data['dob']
+        if dob > today:
+            raise serializers.ValidationError(
+                {"dob": "Date of birth cannot be in the future."}
+            )
+        # Constructed by subtracting days rather than via
+        # today.replace(year=today.year - 120): replace() raises ValueError on
+        # 29 Feb, so a leap-day "today" would turn this validation into a
+        # 500 for every registration. timedelta arithmetic has no such edge.
+        from datetime import timedelta
+
+        if dob < today - timedelta(days=120 * 365):
+            raise serializers.ValidationError(
+                {"dob": "Date of birth is implausible (over 120 years ago)."}
+            )
+
+        age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+        if age < 18:
+            data['is_minor'] = True
+            # HACK: minor_consent_verified is hardcoded False because there
+            # is no parental-verification flow (no mail backend is
+            # configured). The field exists so the intent is recorded and so
+            # the telemetry gate has something to read, but nothing can set
+            # it True yet.
+            #
+            # SECURITY: is_minor=True already gates telemetry downstream
+            # (see the age gate in interactions.py), so the DPDP §9
+            # behavioural-monitoring exposure is closed by is_minor alone.
+            # minor_consent_verified is the stricter signal and will matter
+            # when a verification flow exists.
+            data['minor_consent_verified'] = False
+            if not data.get('parent_email'):
+                raise serializers.ValidationError(
+                    {"parent_email": "Parent/guardian email is required for users under 18."}
+                )
         else:
             data['is_minor'] = False
+            data['minor_consent_verified'] = False
         return data
 
     def create(self, validated_data):

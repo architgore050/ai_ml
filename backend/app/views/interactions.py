@@ -48,6 +48,30 @@ class ClipInteractionViewSet(viewsets.GenericViewSet):
 
     @action(detail=True, methods=['post'], url_path='log-telemetry')
     def log_telemetry(self, request, pk=None):
+        # B1 (2026-09-29): DPDP §9 behavioural-monitoring gate. EchoFlow's
+        # recommendation path consumes watch_time_ms, completion rate and
+        # reel position, which is behavioural monitoring of a child. A
+        # minor's telemetry must not reach it.
+        #
+        # Gated on is_minor rather than minor_consent_verified because
+        # nothing can set the latter True yet (no parental-verification
+        # flow exists — see RegisterSerializer). Gating on
+        # minor_consent_verified alone would therefore admit every minor,
+        # which is the opposite of the intent.
+        #
+        # Likes and skips are NOT blocked: they are explicit user actions
+        # rather than passive tracking, and blocking them would stop a
+        # minor participating in the app at all.
+        if request.user.is_minor:
+            logger.info(
+                "telemetry refused for minor: user=%s clip=%s",
+                request.user.pk, pk,
+            )
+            return Response(
+                {"detail": "Telemetry is not collected for accounts of users under 18."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         clip = self.get_object()
         serializer = InteractionTelemetrySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)

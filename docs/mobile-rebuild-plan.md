@@ -805,7 +805,7 @@ defect with an owner decision required.
 | B9 ✅ | `PlaybackTokenView` has no `throttle_scope` | Draws from the shared 1000/hr `user` bucket; a fast-scrolling feed mints ~1 token per clip | P2 |
 | — | Registration returns no tokens and no `id` | App must follow up with a second `login` call | by design |
 | — | RevenueCat: 6 defects (see D8) | Native IAP impossible | v1.2 |
-| — | `dob` is optional, so the DPDP §9 age gate is bypassed by omission; `minor_consent_verified` has no setter; no telemetry block for unverified minors | Compliance gap | P1 |
+| — ✅ | `dob` is optional, so the DPDP §9 age gate is bypassed by omission; `minor_consent_verified` has no setter; no telemetry block for unverified minors | Compliance gap | P1 |
 | — | `POST /data-subject/erasure/` never deletes anything but reports "Data erasure process initiated" | False success message; DPDP §12 | P1 |
 | — | `ConsentAudit.ip_address` uses `REMOTE_ADDR` only, so behind nginx it records the proxy IP (`AuditLog` correctly falls back to `HTTP_X_FORWARDED_FOR`; `ConsentAudit` does not) | Weak DPDP §5(1) notice evidence | P2 |
 | — ✅ | **`PlaybackTokenView` performs no entitlement check at all** (B9 above is only the throttle). It verifies `IsAuthenticated`, clip exists, `moderation_approved`, and HLS present — nothing else. `FastFeedViewSet` filters `is_noncommercial=False, requires_share_alike=False`; this view applies neither | **Live licensing bypass** — any logged-in user can mint a token for an NC/SA clip the feed deliberately withholds. The intended check exists only as a comment that was deferred ("a future hardening pass can add explicit authorization here"), and the docstring additionally falsely claimed `ShareViewSet` handled share-link auth | **P0** |

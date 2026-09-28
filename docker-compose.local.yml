@@ -147,9 +147,25 @@ services:
       MINIO_CORS_MAX_AGE: "3600"
     volumes:
       - minio_data_local:/data
+    networks:
+      default:
+        # The service name `minio_local` contains an underscore, which is NOT a
+        # legal RFC 1123 hostname character. Modern S3 clients reject it:
+        #   - `mc:latest`     -> "Invalid Request (invalid hostname)"
+        #   - botocore 1.43.x -> "ValueError: Invalid endpoint: ..."
+        # which silently breaks BOTH `minio-init` (bucket never created) and
+        # Django's STORAGES backend (no S3 access at all). The `minio-local`
+        # alias is hyphenated, so it resolves over the same network and is
+        # accepted by every S3 client. See the alias, not the service name.
+        aliases:
+          - minio-local
     ports:
-      - "19000:9000"
-      - "19001:9001"
+      # Bound to loopback only. The HLS Worker runs as a host process and
+      # reaches MinIO over 127.0.0.1:19000; nothing off-host should be able
+      # to read segments directly. Containers still reach MinIO over the
+      # bridge via the `minio-local` alias, so this does not affect them.
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 10s
@@ -162,10 +178,13 @@ services:
     depends_on:
       minio_local:
         condition: service_healthy
+    networks:
+      - default
     entrypoint: >
       sh -c "
-        mc alias set local http://minio_local:9000 ${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY} &&
-        mc mb --ignore-existing local/${AWS_STORAGE_BUCKET_NAME:-echoflow-media}
+        mc alias set local http://minio-local:9000 ${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY} &&
+        mc mb --ignore-existing local/${AWS_STORAGE_BUCKET_NAME:-echoflow-media} &&
+        echo 'minio_init_local: bucket ${AWS_STORAGE_BUCKET_NAME:-echoflow-media} ready (private, no anonymous policy)'
       "
 
   # ---- Django Web (local port 18000) ----
@@ -197,7 +216,7 @@ services:
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_STORAGE_BUCKET_NAME=${AWS_STORAGE_BUCKET_NAME:-echoflow-media}
-      - AWS_S3_ENDPOINT_URL=http://minio_local:9000
+      - AWS_S3_ENDPOINT_URL=http://minio-local:9000
       - AWS_S3_REGION_NAME=auto
       - AWS_S3_QUERYSTRING_EXPIRE=3600
       - PUBLIC_MEDIA_ENDPOINT_URL=http://localhost:19000
@@ -344,6 +363,20 @@ services:
       - HF_HOME=/home/appuser/.cache/huggingface
       - HF_HUB_OFFLINE=1
       - TRANSFORMERS_OFFLINE=1
+      # Storage access. This service is the one that actually WRITES objects
+      # (original uploads + HLS output), and it has no explicit override, so
+      # it would otherwise inherit AWS_S3_ENDPOINT_URL from .env.local — which
+      # points at `http://minio:9000`, the *main* compose service name. No
+      # container in the local stack answers to `minio`, so every S3 write
+      # fails with an unresolvable host. Override it explicitly, matching
+      # web_local.
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_STORAGE_BUCKET_NAME=${AWS_STORAGE_BUCKET_NAME:-echoflow-media}
+      - AWS_S3_ENDPOINT_URL=http://minio-local:9000
+      - AWS_S3_REGION_NAME=auto
+      - AWS_S3_QUERYSTRING_EXPIRE=3600
+      - PUBLIC_MEDIA_ENDPOINT_URL=http://localhost:19000
     deploy:
       resources:
         limits:
@@ -460,11 +493,23 @@ services:
       start_period: 30s
 
 # ---- Networks ----
+# The network MUST be named `default`. Compose attaches every service that
+# doesn't declare its own `networks:` block to the implicit `default` network
+# and to nothing else — declaring a *differently named* top-level network
+# (e.g. `echoflow_local`) silently creates a network that NO service joins.
+# That is what happened: the whole local stack was running on the
+# auto-assigned `echoflow_default` (172.19.0.0/16) while the block below was
+# inert. Naming it `default` makes the explicit bridge name and subnet apply.
 networks:
-  echoflow_local:
+  default:
     driver: bridge
     driver_opts:
-      com.docker.network.bridge.name: br-echoflow-local
+      # MUST be <= 15 characters. Linux caps interface names at IFNAMSIZ-1
+      # (15), and Docker surfaces the violation as the very unhelpful
+      # "numerical result out of range" when creating the network.
+      # The previous value, "br-echoflow-local", was 17 chars and therefore
+      # made this network UNCREATABLE. Do not lengthen this back.
+      com.docker.network.bridge.name: br-ef-local
       com.docker.network.bridge.enable_icc: "true"
       com.docker.network.bridge.enable_ip_masquerade: "true"
     ipam:

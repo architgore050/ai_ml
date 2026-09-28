@@ -429,6 +429,15 @@ services:
     depends_on:
       web_local:
         condition: service_healthy
+    extra_hosts:
+      # Required so nginx can reach the HLS token Worker, which runs as a bare
+      # host process (`wrangler dev` via scripts/run-hls-worker-local.sh)
+      # rather than as a compose service. The Worker binds 0.0.0.0:8787
+      # because a container cannot reach the host's 127.0.0.1. Docker Desktop
+      # (Mac/Windows) resolves host.docker.internal natively; on Linux this
+      # host-gateway entry is what makes it work. Without it nginx fails to
+      # start with "host not found in upstream".
+      - "host.docker.internal:host-gateway"
     ports:
       - "18080:80"
       - "18443:443"
@@ -436,7 +445,10 @@ services:
     volumes:
       - ./docker/nginx.local.conf:/etc/nginx/nginx.conf:ro
       - ./docker/certs:/etc/nginx/certs:ro
-      - ./docker/nginx/hls_auth.js:/etc/nginx/hls_auth.js:ro
+      # NOTE: docker/nginx/hls_auth.js is deliberately NOT mounted. It is a
+      # 19-line stub for the abandoned nginx+njs dev path, and this image
+      # (nginx:1.27-alpine) has no njs module, so it could never do anything.
+      # HLS token validation in dev is done by the Worker, same as prod.
     healthcheck:
       test: ["CMD", "wget", "-q", "--no-check-certificate", "--spider", "https://localhost/health/"]
       interval: 30s

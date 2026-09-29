@@ -1317,6 +1317,15 @@ def _apply_counter_deltas(
     return applied
 
 
+# Weight standing in for prior completion evidence when blending
+# avg_completion_rate in _apply_completion_deltas. The flusher drains Redis
+# counters and has no count of how many samples produced the value already on
+# the row, so this stands in for it: 10 means a clip is treated as if it
+# already had ten observations. Raising it damps a single beat more; lowering
+# it makes the metric track recent behaviour more closely. Must be > 0.
+_COMPLETION_PRIOR_WEIGHT = 10
+
+
 def _apply_completion_deltas(
     completion_deltas: dict[tuple[str, str], dict[str, float]],
     batch_size: int,
@@ -1348,9 +1357,37 @@ def _apply_completion_deltas(
     for clip_id, total_count in list(per_clip_count.items())[:batch_size]:
         if total_count <= 0:
             continue
-        mean = per_clip_sum[clip_id] / total_count
+        total_sum = per_clip_sum[clip_id]
+        mean = total_sum / total_count
         try:
-            AudioClip.objects.filter(pk=clip_id).update(avg_completion_rate=mean)
+            # SECURITY: blend, do not replace.
+            #
+            # This was `.update(avg_completion_rate=mean)` — a full replace
+            # with only the samples drained in *this* beat. One sample was
+            # therefore the entire global value, so a single completion
+            # sample pinned a clip's score until enough other samples
+            # averaged it back down. Combined with the client-controlled
+            # divisor in services.interactions.record_skip (fixed in the same
+            # commit) a single tap of "Next" could set the term that is 30% of
+            # the recommendation composite (feed_pool.py:152, :225).
+            #
+            # The blend is expressed with F() so it stays a single UPDATE
+            # with no read, preserving the "batched UPDATEs that touch only
+            # the dirty clip set" property from the metrics rewrite. The
+            # weight stands in for the prior evidence the flusher does not
+            # have a count for, and bounds how far one beat can move the
+            # value: with a weight of 10, one sample moves it by at most
+            # 1/11 of the distance to that sample.
+            #
+            # Averaging is a deliberate trade: the metric is no longer a
+            # pure mean over all samples ever seen, and a clip whose real
+            # completion has changed will now converge rather than snap.
+            AudioClip.objects.filter(pk=clip_id).update(
+                avg_completion_rate=(
+                    (F('avg_completion_rate') * _COMPLETION_PRIOR_WEIGHT + total_sum)
+                    / (_COMPLETION_PRIOR_WEIGHT + total_count)
+                )
+            )
             applied += 1
         except Exception as exc:
             logger.warning(

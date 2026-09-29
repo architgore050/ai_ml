@@ -164,6 +164,30 @@ def record_like_toggle(user, clip: AudioClip) -> tuple[UserInteraction, bool]:
     return interaction, created
 
 
+def _completion_rate(listen_duration_ms: int, clip: AudioClip) -> float:
+    """Fraction of the clip actually listened to, in [0, 1].
+
+    The denominator is `clip.duration_ms` — server state. The numerator is
+    still client-supplied, because the only true measure of watch time lives
+    in the player; the client-side fix (measure elapsed playback, not media
+    position) is tracked separately. Clamping the numerator to the clip
+    duration means a client that reports listening longer than the clip is
+    long is capped at 1.0 rather than producing a rate the `min()` would
+    have produced anyway.
+
+    Falls back to the reported position when `duration_ms` is unset. That is
+    weaker than the clip duration but strictly better than a constant, and a
+    clip with no recorded duration has no server-side answer available.
+    """
+    expected_duration = clip.duration_ms or 0
+    if expected_duration <= 0:
+        # No server-side duration to divide by. `reel_position_ms` is not
+        # passed in here; callers that have a real duration use it.
+        expected_duration = 60_000
+    listened = max(0, min(int(listen_duration_ms or 0), expected_duration))
+    return min(listened / expected_duration, 1.0)
+
+
 def record_skip(
     user,
     clip: AudioClip,
@@ -187,11 +211,28 @@ def record_skip(
     per beat with the aggregated completion_rate, so downstream
     consumers reading the row table see the same shape they always
     did.
+
+    SECURITY: the divisor is server-side. It used to be
+
+        expected_duration = reel_position_ms if reel_position_ms > 0 else 60000
+        completion_rate = min(listen_duration_ms / expected_duration, 1.0)
+
+    which the caller fully controlled: `reel_position_ms` and
+    `listen_duration_ms` are both request-body integers. The web client
+    happens to send them equal (`player.tsx` sends
+    `listen_duration_ms == reel_position_ms == currentTime * 1000`), so
+    the ratio is exactly 1.0 on *every* skip — no manipulation required,
+    just pressing "Next". A client could also send an arbitrary pair, e.g.
+    `listen=999999, reel=1`, and hit the `min(...)` cap directly.
+
+    `completion_rate` is 30% of the recommendation composite score
+    (`feed_pool.py:152`, `:225`), so this was a ranking-integrity hole and
+    not a metrics nit. The divisor is now `clip.duration_ms`, which the
+    client cannot influence.
     """
     from . import counter_store
 
-    expected_duration = reel_position_ms if reel_position_ms > 0 else 60000
-    completion_rate = min(listen_duration_ms / expected_duration, 1.0)
+    completion_rate = _completion_rate(listen_duration_ms, clip)
 
     try:
         counter_store.add_completion(str(clip.id), str(user.id), completion_rate)

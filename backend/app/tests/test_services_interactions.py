@@ -87,10 +87,12 @@ class TestRecordSkip:
             record_skip(user, ready_clip, listen_duration_ms=15_000, reel_position_ms=30_000)
 
         drained = counter_store.drain()
-        # 15000 / 30000 = 0.5 completion_rate
+        # 15000 / 60000 (ready_clip.duration_ms) = 0.25.
+        # Was 15000/30000 = 0.5, i.e. listen/reel_position — a divisor the
+        # caller controls. See _completion_rate in services/interactions.py.
         assert drained['completion'][(str(ready_clip.id), str(user.id))][
             'completion_sum'
-        ] == pytest.approx(0.5)
+        ] == pytest.approx(0.25)
         assert drained['counters'][str(ready_clip.id)] == {'skips': 1}
 
     def test_no_synchronous_userinteraction_row(self, user, ready_clip):
@@ -123,9 +125,12 @@ class TestRecordSkip:
             record_skip(user, ready_clip, listen_duration_ms=20_000, reel_position_ms=20_000)
 
         drained = counter_store.drain()
-        # 0.5 + 1.0 = 1.5 sum, count 2.
+        # 10000/60000 + 20000/60000 = 1/6 + 1/3 = 0.5 sum, count 2.
+        # Was 0.5 + 1.0 = 1.5: the second sample reported a perfect completion
+        # for having listened to a third of the clip, because the divisor was
+        # the client-sent reel_position_ms.
         slot = drained['completion'][(str(ready_clip.id), str(user.id))]
-        assert slot['completion_sum'] == pytest.approx(1.5)
+        assert slot['completion_sum'] == pytest.approx(0.5)
         assert slot['completion_count'] == 2
         # Skips counter accumulates.
         assert drained['counters'][str(ready_clip.id)] == {'skips': 2}
@@ -389,3 +394,177 @@ class TestCacheInvalidation:
 
         # Cache was invalidated by the fallback path.
         assert cache.get(cache_key) is None
+
+
+class TestCompletionRateIsNotClientControlled:
+    """REGRESSION: `completion_rate` was fully client-writable, and it is 30%
+    of the recommendation composite score (feed_pool.py:152, :225).
+
+    `record_skip` computed:
+
+        expected_duration = reel_position_ms if reel_position_ms > 0 else 60000
+        completion_rate = min(listen_duration_ms / expected_duration, 1.0)
+
+    Both operands are request-body integers. The shipped web client sends them
+    EQUAL — `player.tsx` posts `listen_duration_ms == reel_position_ms ==
+    currentTime * 1000` — so the ratio was exactly 1.0 on *every* skip, with
+    no manipulation required beyond pressing "Next". A client could also send
+    any pair it liked (`listen=999999, reel=1`) and hit the cap directly.
+
+    Then `flush_counters_to_pg` did `.update(avg_completion_rate=mean)` — a
+    full replace with just that beat's samples — so one sample became the
+    entire global value.
+
+    The divisor is now `clip.duration_ms` and the write blends. These tests
+    pin the *behaviour that was exploitable*, not the arithmetic, so they
+    stay meaningful if the formula is later rewritten.
+    """
+
+    def _rate(self, user, clip, **kwargs):
+        from backend.app.services import counter_store
+        from backend.app.services.interactions import record_skip
+        from django.test import TestCase
+
+        counter_store._reset_backend_for_tests()
+        with TestCase.captureOnCommitCallbacks(execute=True):
+            result = record_skip(user, clip, **kwargs)
+        return result['completion_rate']
+
+    def test_listen_equals_position_does_not_yield_a_perfect_score(self, user, ready_clip):
+        """The exact shape the shipped client sends. Was 1.0."""
+        rate = self._rate(
+            user, ready_clip,
+            listen_duration_ms=30_000, reel_position_ms=30_000,
+        )
+        assert rate == pytest.approx(0.5), (
+            f"listen==reel_position gave {rate}; a caller must not be able to "
+            "reach 1.0 by sending two equal numbers."
+        )
+
+    def test_early_skip_cannot_claim_full_completion(self, user, ready_clip):
+        """Pressing Next 5s into a 60s clip."""
+        rate = self._rate(
+            user, ready_clip,
+            listen_duration_ms=5_000, reel_position_ms=5_000,
+        )
+        assert rate < 0.2, f"5s of a 60s clip scored {rate}"
+
+    def test_inflating_the_position_does_not_inflate_the_score(self, user, ready_clip):
+        """Seek to the end, then skip: reel_position is large, listen is not.
+
+        The client can still report whatever it likes for `listen_duration_ms`
+        — the true measure of watch time lives in the player, and the
+        client-side fix is tracked separately. What must not happen is the
+        score being derived from the position.
+        """
+        rate = self._rate(
+            user, ready_clip,
+            listen_duration_ms=5_000, reel_position_ms=60_000,
+        )
+        assert rate == pytest.approx(5_000 / 60_000)
+
+    def test_listening_longer_than_the_clip_is_capped(self, user, ready_clip):
+        rate = self._rate(
+            user, ready_clip,
+            listen_duration_ms=10_000_000, reel_position_ms=10_000_000,
+        )
+        assert rate == 1.0, "Watching past the end is legitimately 1.0, not more."
+
+    def test_the_divisor_is_the_clip_duration_not_the_request(self, user, ready_clip):
+        """Directly: the same listen value scores differently on clips of
+        different length. Under the old formula it could not — the divisor
+        came from the request."""
+        from backend.app.models import AudioClip
+
+        short = AudioClip.objects.create(
+            creator=user, title='short', category='comedy', status='ready',
+            duration_ms=10_000, semantic_vector=[0.1] * 384,
+            acoustic_vector=[0.1] * 128,
+        )
+        assert self._rate(user, short, listen_duration_ms=5_000, reel_position_ms=5_000) \
+            == pytest.approx(0.5)
+        assert self._rate(user, ready_clip, listen_duration_ms=5_000, reel_position_ms=5_000) \
+            == pytest.approx(5_000 / 60_000)
+
+    def test_negative_and_zero_listen_times_are_rejected_by_the_formula(self, user, ready_clip):
+        for bogus in (-1, 0):
+            rate = self._rate(
+                user, ready_clip,
+                listen_duration_ms=bogus, reel_position_ms=30_000,
+            )
+            assert 0.0 <= rate <= 1.0, f"listen={bogus} produced {rate}"
+
+
+class TestSingleSampleCannotPinTheGlobalScore:
+    """The second half of the exploit: one sample became the whole value.
+
+    Calls `_apply_completion_deltas` directly rather than driving it through
+    `flush_counters_to_pg`. The flusher reads the shared counter store, and
+    `_reset_backend_for_tests()` only drops the cached backend handle — it does
+    not clear the data, so a test that goes through Redis inherits whatever
+    earlier tests (or real dev telemetry) left behind. An earlier draft of this
+    class asserted against a value contaminated exactly that way, and reported
+    0.545 for a 0.5 baseline. The function is pure in its argument, so testing
+    it directly is both simpler and deterministic.
+    """
+
+    @staticmethod
+    def _apply(ready_clip, completion_sum, count):
+        from backend.app.tasks import _apply_completion_deltas
+
+        deltas = {
+            (str(ready_clip.id), '99'): {
+                'completion_sum': completion_sum,
+                'completion_count': count,
+            }
+        }
+        _apply_completion_deltas(deltas, 500)
+        ready_clip.refresh_from_db()
+        return ready_clip.avg_completion_rate
+
+    def test_one_beat_cannot_set_the_score(self, ready_clip):
+        ready_clip.avg_completion_rate = 0.5
+        ready_clip.save(update_fields=['avg_completion_rate'])
+
+        after = self._apply(ready_clip, 1.0, 1)
+
+        assert after < 1.0, (
+            "A single 1.0 sample set the global completion rate outright. "
+            "avg_completion_rate is 30% of the recommendation score, so one "
+            "user's one skip could promote a clip outright."
+        )
+        # (0.5 * 10 + 1.0) / 11 = 6/11 = 0.5454...
+        assert after == pytest.approx(6.0 / 11)
+
+    def test_many_samples_in_one_beat_still_cannot_exceed_one(self, ready_clip):
+        ready_clip.avg_completion_rate = 0.5
+        ready_clip.save(update_fields=['avg_completion_rate'])
+
+        # 100 users all reporting a full completion in a single beat.
+        after = self._apply(ready_clip, 100.0, 100)
+        assert after <= 1.0
+        assert after < 1.0, "Even 100 free samples must not reach a perfect score outright."
+
+    def test_repeated_genuine_full_completions_still_converge_upward(self, ready_clip):
+        """The blend must not become a permanent damper: a clip people really
+        do finish has to be able to reach 1.0."""
+        ready_clip.avg_completion_rate = 0.5
+        ready_clip.save(update_fields=['avg_completion_rate'])
+
+        for _ in range(200):
+            after = self._apply(ready_clip, 1.0, 1)
+
+        assert after == pytest.approx(1.0, abs=0.01), (
+            "After 200 genuine full completions the score should be ~1.0, "
+            "otherwise the metric stops tracking reality."
+        )
+
+    def test_a_low_score_is_recoverable(self, ready_clip):
+        """The converse: a clip nobody finishes must be able to fall."""
+        ready_clip.avg_completion_rate = 0.9
+        ready_clip.save(update_fields=['avg_completion_rate'])
+
+        for _ in range(200):
+            after = self._apply(ready_clip, 0.0, 1)
+
+        assert after == pytest.approx(0.0, abs=0.01)

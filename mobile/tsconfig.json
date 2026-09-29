@@ -1,6 +1,33 @@
 {
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
-    "strict": true
-  }
+    "strict": true,
+    /* Phase 1 opens with strict already on, so nothing lands in the new tree
+       that would fail CI later. The old app also had strict:true and still
+       shipped `navigation: any` in App.tsx:29 and FeedScreen.tsx:37, because
+       nothing resolved a real module path for it.
+
+       `baseUrl` is deliberately absent: TypeScript 6.0 deprecates it (TS5101)
+       and `paths` now resolves relative to this file, which is what we want
+       anyway — the alias must point at src/ from the project root, and a
+       `baseUrl` of "." would make `paths` values ambiguous with it. */
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    /* Explicit, because the default "all of node_modules/@types" is not enough
+       here: expo/tsconfig.base excludes node_modules and nothing re-includes the
+       global test types, so `describe`/`it`/`expect` resolved to nothing and
+       produced 130+ phantom errors that had nothing to do with the tests. */
+    "types": ["jest", "node", "react"]
+  },
+  "include": [
+    "**/*.ts",
+    "**/*.tsx",
+    ".expo/types/**/*.ts",
+    "expo-env.d.ts"
+  ],
+  "exclude": ["node_modules", "dist", "SALVAGE.ts"]
 }

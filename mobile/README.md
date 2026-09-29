@@ -16,14 +16,75 @@
 
 ## Current state
 
-`app.json` holds only the identity that survives the rewrite — bundle IDs
-`com.echoflow.audio`, `scheme: "echoflow"`, `UIBackgroundModes: ["audio"]`,
-and the microphone usage string. It is replaced by `app.config.ts` in task
-1.6, because `EXPO_PUBLIC_API_BASE_URL` has to be resolvable per EAS profile.
+**Phase 0 and Phase 1 are complete.** The app scaffolds, bundles for iOS and
+Android, typechecks clean, and passes 37 unit tests. What it does *not* do is
+play audio — that is Phase 2, and nothing in Phase 1 fetches a media token or
+touches `expo-audio` playback.
 
-`SALVAGE.ts` is a read-only reference of the patterns worth keeping from the
-old tree, each annotated with its original `file:line` and the reason it
-survived. **Delete it once Phase 1 is complete.**
+Verified at commit time:
+
+| Check | Result |
+|---|---|
+| `npx tsc --noEmit` | 0 errors |
+| `npx jest` | 37 passed / 3 suites |
+| `npx expo-doctor` | 21/21 checks passed |
+| `npx expo install --check` | dependencies up to date |
+| `npx expo export --platform ios` | 6.8 MB Hermes bundle |
+| `npx expo export --platform android` | bundles |
+
+**Not yet verified:** a running app on a simulator or device. The export proves
+Metro resolves the whole router tree; it does not prove a screen renders. First
+real boot is the next thing to do.
+
+### Layout
+
+```
+app/                          expo-router (D3 — file-based routing)
+  _layout.tsx                 providers, font gate, error boundary
+  index.tsx                   the auth gate — the only place routing is decided
+  +not-found.tsx              404 (the old app had zero deep-link handlers)
+  (auth)/login.tsx  (auth)/register.tsx
+  (tabs)/index|explore|studio|inbox|profile.tsx    placeholders, Phase 2-5
+src/
+  api/        client.ts (refresh mutex) · schema.ts (zod) · tokenStore.ts
+  design/     tokens.ts · typography.ts · shadows.ts · categories.ts · theme.tsx
+  components/ ui/ (primitives, Button) · ErrorBoundary · NetworkBanner
+  hooks/      useBackendStatus.ts
+  store/      auth.ts
+```
+
+### Two things that surprise people
+
+**`app.json` is gone, replaced by `app.config.ts`.** The base URL has to be
+resolvable per EAS build profile, and `app.json` cannot interpolate an
+environment variable. In SDK 57 the native splash also moved out of the
+top-level `splash` key (now PWA-only) into the `expo-splash-screen` plugin — a
+stale `splash` block typechecks but is silently ignored on iOS and Android.
+
+**`src/design/categories.ts` is the only place a category string is written.**
+`AudioClip.category` is free text server-side, and
+`/suggestions/?category=` matches on exact equality, so a near-miss like
+`"Lo-Fi"` vs `"Lo-Fi Beats"` returns an empty list rather than an error. The 5
+branded categories and 6 legacy values, and their colours, all come from that
+one file (decision O2).
+
+## Known friction
+
+**No committed lockfile.** The root `.gitignore:34` ignores
+`mobile/package-lock.json` (and `frontend/package-lock.json`) — a pre-existing
+repo convention, not something this branch introduced. It means `npm install`
+resolves fresh on every machine, so the SDK-aligned versions that
+`npx expo install` selected are not reproducible, and two developers can end up
+on different trees. Left alone deliberately: changing it affects `frontend/`
+too and is a repo-wide reproducibility decision, not a mobile one. Worth an
+explicit decision.
+
+**Typed routes need one command.** `experiments.typedRoutes` is on, but
+`.expo/types/router.d.ts` is generated and gitignored. Run `npx expo start` or
+`npx expo customize tsconfig.json` once after cloning, or `router.push('/…')`
+will not be typechecked.
+
+**`SALVAGE.ts` is temporary.** Delete it once Phase 1 is signed off.
 
 ## Requirements
 

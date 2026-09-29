@@ -165,13 +165,28 @@ class SuggestionViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        category = self.request.query_params.get('category') or 'all'
+        # `category` is a free-text CharField (models.py:112), NOT a
+        # choices/enum field. `filter(category='all')` is therefore an exact
+        # string match against the literal string "all", which matches zero
+        # rows — so `?category=all` AND a bare `/suggestions/` (same default)
+        # both returned 200 with an EMPTY list, never a 400. The client could
+        # not tell "no such category" from "nothing to show", and the mobile
+        # cold-start fallback silently served nothing.
+        #
+        # `all` is the documented sentinel for "do not filter" (the plan and
+        # the mobile task list both call `/suggestions/?category=all` for the
+        # cold-start fallback), so it must be handled as a no-op rather than
+        # passed to the ORM.
+        category = (self.request.query_params.get('category') or 'all').strip()
+        unfiltered = category.lower() in ('', 'all')
 
         queryset = AudioClip.objects.filter(
-            status='ready', category=category, moderation_approved=True,
+            status='ready', moderation_approved=True,
             # SECURITY: Same NC + SA exclusion as feed endpoints.
             is_noncommercial=False, requires_share_alike=False,
         )
+        if not unfiltered:
+            queryset = queryset.filter(category=category)
 
         # DECISION: Wrap the vector search in try/except. The architecture
         # audit warns that a Postgres/Redis hiccup in

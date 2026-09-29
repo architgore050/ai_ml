@@ -22,6 +22,7 @@ import { ErrorBoundary } from '../src/components/ErrorBoundary';
 import { useAuthStore } from '../src/store/auth';
 import { applyPlaybackAudioMode } from '../src/lib/audioMode';
 import { releasePlayer } from '../src/store/player';
+import { PlayerHost } from '../src/hooks/PlayerHost';
 
 /**
  * Root layout. Providers only — no navigation decisions, no data fetching.
@@ -82,7 +83,12 @@ export default function RootLayout() {
    *     current stream. Doing it once, at startup, is the only safe place.
    */
   useEffect(() => {
-    void applyPlaybackAudioMode();
+    // SECURITY/robustness: a rejecting `setAudioModeAsync` would otherwise be
+    // an unhandled rejection and audio would silently never be configured.
+    void applyPlaybackAudioMode().catch(() => {
+      // The mode is applied once and cached; a retry would not help, and the
+      // NetworkBanner already tells the user something is wrong.
+    });
     return () => releasePlayer();
   }, []);
 
@@ -100,6 +106,11 @@ export default function RootLayout() {
         <QueryClientProvider client={queryClient}>
           <ThemeProvider>
             <StatusBar style="light" />
+            {/* Owns the one AudioPlayer: creates it, mirrors its status into
+                the store, and registers lock-screen controls. Renders null.
+                Inside the providers but outside <Stack> so an auth-status flip
+                cannot unmount it and kill playback. */}
+            <PlayerHost />
             <ErrorBoundary>
               <Stack
                 screenOptions={{

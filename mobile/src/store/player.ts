@@ -85,9 +85,6 @@ export function releasePlayer(): void {
 export type PlaybackStatus =
   | 'idle'
   | 'minting'
-  | 'loading'
-  | 'playing'
-  | 'paused'
   | 'processing'
   /**
    * `unavailable` is ONE state for both 403 causes — unmoderated and
@@ -106,11 +103,51 @@ export type PlaybackStatus =
   | 'auth-required'
   | 'error';
 
+/**
+ * What the NATIVE player is doing, as reported by `useAudioPlayerStatus`.
+ *
+ * Separate from `CardStatus` on purpose. The two are written by different
+ * producers — the token lifecycle (`decidePlaybackAction`) and the native
+ * player — and collapsing them into one field makes them overwrite each other.
+ * That is not hypothetical: `decidePlaybackAction` returns `show: 'processing'`
+ * for a still-encoding clip, and a single shared `status` would be reset to
+ * `playing` by the next native tick, so the spinner would vanish.
+ *
+ * `ended` is why the plan's pacing rule can be implemented at all
+ * (`motion.pacing.completionThreshold`): natural completion must not be
+ * reported as a skip.
+ */
+export type PlaybackState =
+  | 'idle'
+  | 'loading'
+  | 'buffering'
+  | 'playing'
+  | 'paused'
+  | 'ended'
+  | 'error';
+
+/** The card's own state, from the token lifecycle. Not the player's state. */
+export type CardStatus =
+  | 'idle'
+  | 'minting'
+  | 'processing'
+  | 'unavailable'
+  | 'gone'
+  | 'auth-required'
+  | 'error';
+
 export type PlayerState = {
   queue: FeedClip[];
   activeIndex: number;
   handsFree: boolean;
-  status: PlaybackStatus;
+  /** Token-lifecycle state for the active card. See `CardStatus`. */
+  cardStatus: CardStatus;
+  /** Native player state. See `PlaybackState`. */
+  playback: PlaybackState;
+  /** expo-audio SECONDS. Never milliseconds — see the UNITS note above. */
+  currentTime: number;
+  /** expo-audio SECONDS. 0 until the source reports its duration. */
+  duration: number;
   /** Null until a load succeeds; the id actually playing, not the requested one. */
   playingClipId: string | null;
   error: string | null;
@@ -118,7 +155,12 @@ export type PlayerState = {
   setQueue: (clips: FeedClip[]) => void;
   setActiveIndex: (index: number) => void;
   toggleHandsFree: () => void;
-  setStatus: (status: PlaybackStatus, error?: string | null) => void;
+  setCardStatus: (status: CardStatus, error?: string | null) => void;
+  /**
+   * Apply a native status update. The ONLY writer of `playback`,
+   * `currentTime` and `duration`.
+   */
+  syncFromPlayer: (next: NativeStatusSnapshot) => void;
   /**
    * Return the store to its initial state, so a released player cannot leave
    * the UI asserting that audio is playing. See `releasePlayer`.
@@ -126,14 +168,52 @@ export type PlayerState = {
   reset: () => void;
 };
 
+/**
+ * The subset of expo-audio's `AudioStatus` this store reads.
+ *
+ * Declared structurally rather than imported so `syncFromPlayer` is testable
+ * without a native module, and so a field we do not consume cannot tempt a
+ * future edit into depending on it.
+ */
+export type NativeStatusSnapshot = {
+  currentTime: number;
+  duration: number;
+  playing: boolean;
+  isBuffering: boolean;
+  isLoaded: boolean;
+  didJustFinish: boolean;
+  error: string | null;
+};
+
+/** Order matters: the first matching branch wins, and error must win outright. */
+export function playbackStateFrom(snapshot: NativeStatusSnapshot): PlaybackState {
+  if (snapshot.error) return 'error';
+  if (snapshot.didJustFinish) return 'ended';
+  if (snapshot.isBuffering) return 'buffering';
+  if (snapshot.playing) return 'playing';
+  if (snapshot.isLoaded) return 'paused';
+  return 'idle';
+}
+
 const INITIAL: Pick<
   PlayerState,
-  'queue' | 'activeIndex' | 'handsFree' | 'status' | 'playingClipId' | 'error'
+  | 'queue'
+  | 'activeIndex'
+  | 'handsFree'
+  | 'cardStatus'
+  | 'playback'
+  | 'currentTime'
+  | 'duration'
+  | 'playingClipId'
+  | 'error'
 > = {
   queue: [],
   activeIndex: 0,
   handsFree: true,
-  status: 'idle',
+  cardStatus: 'idle',
+  playback: 'idle',
+  currentTime: 0,
+  duration: 0,
   playingClipId: null,
   error: null,
 };
@@ -144,7 +224,20 @@ export const usePlayerStore = create<PlayerState>((set) => ({
   setQueue: (clips) => set({ queue: clips }),
   setActiveIndex: (index) => set({ activeIndex: index }),
   toggleHandsFree: () => set((s) => ({ handsFree: !s.handsFree })),
-  setStatus: (status, error = null) => set({ status, error }),
+  setCardStatus: (cardStatus, error = null) => set({ cardStatus, error }),
+
+  syncFromPlayer: (next) => {
+    const playback = playbackStateFrom(next);
+    set({
+      playback,
+      currentTime: next.currentTime,
+      duration: next.duration,
+      // A native error is the only thing that writes `error` from this side.
+      // Card-level errors come from `setCardStatus`.
+      error: next.error ?? (playback === 'error' ? 'Playback failed' : null),
+    });
+  },
+
   reset: () => set({ ...INITIAL }),
 }));
 
@@ -187,7 +280,7 @@ export type LoadResult = 'loaded' | 'failed';
 export async function loadClip(clip: FeedClip, token: string): Promise<LoadResult> {
   const url = clip.hls_playlist_url;
   if (!url) {
-    usePlayerStore.getState().setStatus('error', 'clip has no hls_playlist_url');
+    usePlayerStore.getState().setCardStatus('error', 'clip has no hls_playlist_url');
     return 'failed';
   }
 
@@ -198,16 +291,28 @@ export async function loadClip(clip: FeedClip, token: string): Promise<LoadResul
       headers: { 'X-EchoFlow-Media-Token': token },
     });
     player.play();
-    // One `set` for status and playingClipId together. Two separate calls let
-    // a render observe `status: 'playing'` with the *previous* clip's
-    // `playingClipId` — the exact "wrong clip under the new card" hazard the
-    // field's docstring exists to prevent.
-    usePlayerStore.setState({ status: 'playing', playingClipId: clip.id, error: null });
+    // Reset the position for the new clip. NOT a claim that it is playing —
+    // that arrives from the native listener. `replace()` and `play()` return
+    // void and do not throw when the manifest 403s, so writing `playing` here
+    // would assert success for a clip that is silent, and on iOS
+    // `currentStatus()` hardcodes `error: nil` so nothing would ever correct
+    // it. The card would read "Now playing" for ever with no spinner and no
+    // error.
+    usePlayerStore.setState({
+      cardStatus: 'idle',
+      playingClipId: clip.id,
+      error: null,
+      currentTime: 0,
+      // Duration is only known once the source reports it; `duration_ms` from
+      // the feed is not the same thing (it is the backend's own measure) and
+      // using it here would make the scrubber jump.
+      duration: 0,
+    });
     return 'loaded';
   } catch (err) {
     usePlayerStore
       .getState()
-      .setStatus('error', err instanceof Error ? err.message : 'playback failed');
+      .setCardStatus('error', err instanceof Error ? err.message : 'playback failed');
     return 'failed';
   }
 }
@@ -216,13 +321,12 @@ export function pause(): void {
   // Must not create a player: after `releasePlayer()` this would resurrect a
   // native AVPlayer/ExoPlayer with no source just to pause nothing.
   getPlayerOrNull()?.pause();
-  const s = usePlayerStore.getState();
-  if (s.status === 'playing') s.setStatus('paused');
+  usePlayerStore.setState({ playback: 'paused' });
 }
 
 export function resume(): void {
   getPlayerOrNull()?.play();
-  usePlayerStore.getState().setStatus('playing');
+  usePlayerStore.setState({ playback: 'playing' });
 }
 
 /** `seconds` is expo-audio's unit. Callers converting from `duration_ms` use msToSeconds. */

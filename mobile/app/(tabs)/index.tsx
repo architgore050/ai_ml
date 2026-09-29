@@ -15,7 +15,14 @@ import { NetworkBanner } from '../../src/components/NetworkBanner';
 import { useBackendStatus } from '../../src/hooks/useBackendStatus';
 import { useFeedBuffer, useSuggestionsFallback } from '../../src/hooks/useFeedBuffer';
 import { usePlaybackToken, usePrefetchPlaybackToken } from '../../src/hooks/usePlaybackToken';
-import { loadClip, msToSeconds, pause, usePlayerStore } from '../../src/store/player';
+import {
+  loadClip,
+  msToSeconds,
+  pause,
+  usePlayerStore,
+  type CardStatus,
+  type PlaybackState,
+} from '../../src/store/player';
 import { decidePlaybackAction } from '../../src/lib/playbackDecision';
 import {
   clampIndex,
@@ -57,6 +64,14 @@ type ViewabilityInfo = {
   changed: ViewToken<FeedClip>[];
 };
 
+/**
+ * How long to wait before re-minting a token for a still-encoding clip.
+ *
+ * From the backend's own 409 path: the clip exists and is approved, only the
+ * HLS output is missing. 5s is the plan's value (task list 3.9).
+ */
+const PROCESSING_RETRY_MS = 5000;
+
 export default function Screen() {
   const backend = useBackendStatus();
   const feed = useFeedBuffer();
@@ -67,8 +82,12 @@ export default function Screen() {
 
   const clips = feed.clips.length > 0 ? feed.clips : fallback.clips;
   const setActiveIndex = usePlayerStore((s) => s.setActiveIndex);
-  const setStatus = usePlayerStore((s) => s.setStatus);
-  const status = usePlayerStore((s) => s.status);
+  const setCardStatus = usePlayerStore((s) => s.setCardStatus);
+  const cardStatus = usePlayerStore((s) => s.cardStatus);
+  // The native player's own state. Deliberately separate from `cardStatus`:
+  // they have different producers and must not overwrite each other, or a
+  // "still processing" spinner gets reset to "playing" by the next tick.
+  const playback = usePlayerStore((s) => s.playback);
 
   /** Guards the inter-reel pause. */
   const lastLoadAt = useRef(0);
@@ -203,14 +222,23 @@ export default function Screen() {
         return;
 
       case 'show':
-        setStatus(action.status === 'idle' ? 'minting' : action.status);
+        setCardStatus(action.status === 'idle' ? 'minting' : action.status);
+        if (action.status === 'processing') {
+          // 409: HLS is still being encoded. The plan requires a retry, and
+          // `usePlaybackToken.refresh()` is the escape hatch for exactly this
+          // — without it the function is unreachable API and a clip that
+          // finishes encoding 4s after the user swipes onto it shows
+          // "Still processing" until they swipe away and back.
+          const timer = setTimeout(() => token.refresh(), PROCESSING_RETRY_MS);
+          return () => clearTimeout(timer);
+        }
         return;
 
       case 'stop':
         // The 60-cap evicted the clip that was playing. Stop rather than leave
         // audio running for a reel that is no longer on screen.
         pause();
-        setStatus('idle');
+        setCardStatus('idle');
         return;
 
       case 'load-after': {
@@ -236,19 +264,20 @@ export default function Screen() {
       default:
         return;
     }
-  }, [token, activeClipId, setStatus, pause]);
+  }, [token, activeClipId, setCardStatus, pause]);
 
   const renderItem = useCallback(
     ({ item }: { item: FeedClip }) => (
       <ReelCard
         clip={item}
         active={item.id === activeClipId}
-        status={status}
+        cardStatus={cardStatus}
+        playback={playback}
         durationMs={item.duration_ms}
         height={viewport}
       />
     ),
-    [activeClipId, status, viewport],
+    [activeClipId, cardStatus, playback, viewport],
   );
 
   // The momentum handler reads the id list through a ref so it is not
@@ -335,13 +364,17 @@ export default function Screen() {
 function ReelCard({
   clip,
   active,
-  status,
+  cardStatus,
+  playback,
   durationMs,
   height,
 }: {
   clip: FeedClip;
   active: boolean;
-  status: string;
+  /** Token-lifecycle state. Terminal states outrank `playback`. */
+  cardStatus: CardStatus;
+  /** Native player state. Drives the play/pause affordance, not the copy. */
+  playback: PlaybackState;
   durationMs?: number;
   /** Measured viewport height. `flex: 1` alone resolves to zero here. */
   height: number;
@@ -354,7 +387,9 @@ function ReelCard({
       <View style={[styles.reelTint, { backgroundColor: tint, opacity: 0.08 }]} />
 
       <View style={styles.reelBody}>
-        <Text style={typography.microLabel}>{active ? 'Now playing' : clip.creator_name}</Text>
+        <Text style={typography.microLabel}>
+          {active && playback === 'playing' ? 'Now playing' : clip.creator_name}
+        </Text>
         <Text style={[typography.page, styles.reelTitle]} numberOfLines={2}>
           {clip.title}
         </Text>
@@ -378,29 +413,43 @@ function ReelCard({
           </Text>
         ) : null}
 
-        {active ? <CardStatus status={status} /> : null}
+        {active ? <CardStatusView cardStatus={cardStatus} playback={playback} /> : null}
       </View>
     </View>
   );
 }
 
-/** The four states the plan's error mapping requires be visually distinct. */
-function CardStatus({ status }: { status: string }) {
-  if (status === 'minting' || status === 'loading') {
+/**
+ * The card's own overlay.
+ *
+ * A terminal `cardStatus` wins over `playback`: a clip that is unavailable must
+ * not also be reporting a spinner, and an errored clip must not keep claiming to
+ * play. `playback` is what fills the gap the token lifecycle cannot — a native
+ * media failure on a clip whose token minted fine, which was previously
+ * reported as "Now playing" indefinitely because `replace()` does not throw.
+ */
+function CardStatusView({
+  cardStatus,
+  playback,
+}: {
+  cardStatus: CardStatus;
+  playback: PlaybackState;
+}) {
+  if (cardStatus === 'minting' || playback === 'loading' || playback === 'buffering') {
     return (
       <View style={styles.statusBox}>
         <Spinner />
       </View>
     );
   }
-  if (status === 'processing') {
+  if (cardStatus === 'processing') {
     return (
       <View style={styles.statusBox}>
         <Text style={typography.label}>Still processing — this clip is being encoded</Text>
       </View>
     );
   }
-  if (status === 'unavailable') {
+  if (cardStatus === 'unavailable') {
     return (
       <View style={styles.statusBox}>
         {/* SECURITY: one message for BOTH 403 causes (unmoderated and
@@ -410,7 +459,25 @@ function CardStatus({ status }: { status: string }) {
       </View>
     );
   }
-  if (status === 'error') {
+  if (cardStatus === 'gone') {
+    // Same copy as `unavailable` on purpose: a 404 versus a 403 is a different
+    // fact about the clip, and saying so tells a caller holding only a UUID
+    // whether the row was deleted versus gated. The states stay distinct in the
+    // store for retry logic; the copy does not distinguish them.
+    return (
+      <View style={styles.statusBox}>
+        <Text style={typography.label}>This clip is no longer available</Text>
+      </View>
+    );
+  }
+  if (cardStatus === 'auth-required') {
+    return (
+      <View style={styles.statusBox}>
+        <Text style={typography.label}>Sign in again to keep listening</Text>
+      </View>
+    );
+  }
+  if (cardStatus === 'error' || playback === 'error') {
     return (
       <View style={styles.statusBox}>
         <Text style={typography.label}>Could not play this clip</Text>

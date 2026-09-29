@@ -10,8 +10,10 @@ import {
   resume,
   secondsToMs,
   seekToSeconds,
+  playbackStateFrom,
   usePlayerStore,
   type LoadResult,
+  type NativeStatusSnapshot,
 } from '../player';
 import type { FeedClip } from '../../api/schema';
 
@@ -123,9 +125,13 @@ describe('the player instance', () => {
     expect(mockCreate).not.toHaveBeenCalled();
   });
 
-  it('removes the native player on release and clears the store', () => {
-    loadClip(clip(), 'tok');
-    expect(usePlayerStore.getState().status).toBe('playing');
+  it('removes the native player on release and clears the store', async () => {
+    await loadClip(clip(), 'tok');
+    usePlayerStore.getState().syncFromPlayer({
+      currentTime: 3, duration: 30, playing: true,
+      isBuffering: false, isLoaded: true, didJustFinish: false, error: null,
+    });
+    expect(usePlayerStore.getState().playback).toBe('playing');
     expect(usePlayerStore.getState().playingClipId).toBe('clip-a');
 
     releasePlayer();
@@ -135,7 +141,8 @@ describe('the player instance', () => {
     // Without this the store keeps claiming audio is playing, no dependency
     // changes, and no load is ever re-triggered — reachable on any Fast
     // Refresh of the root layout.
-    expect(usePlayerStore.getState().status).toBe('idle');
+    expect(usePlayerStore.getState().cardStatus).toBe('idle');
+    expect(usePlayerStore.getState().playback).toBe('idle');
     expect(usePlayerStore.getState().playingClipId).toBeNull();
   });
 });
@@ -168,15 +175,19 @@ describe('loadClip — the token and URL contract', () => {
     expect(second.headers['X-EchoFlow-Media-Token']).toBe('tok-2');
   });
 
-  it('plays and records the clip as playing in one state write', async () => {
+  it('records the clip and resets the position, but does NOT claim to be playing', async () => {
     await loadClip(clip(), 'tok');
     expect(player.play).toHaveBeenCalledTimes(1);
     const s = usePlayerStore.getState();
-    // Both fields together: two separate `set` calls let a render observe
-    // 'playing' with the previous clip's playingClipId.
-    expect(s.status).toBe('playing');
     expect(s.playingClipId).toBe('clip-a');
     expect(s.error).toBeNull();
+    expect(s.currentTime).toBe(0);
+    // `playback` stays whatever the native side says. `replace()` does not
+    // throw when the manifest 403s, so writing 'playing' here would assert
+    // success for a silent clip — and on iOS nothing could ever correct it,
+    // because currentStatus() hardcodes error: nil.
+    expect(s.playback).toBe('idle');
+    expect(s.cardStatus).toBe('idle');
   });
 
   it('fails without touching the player when the clip has no playlist', async () => {
@@ -184,7 +195,7 @@ describe('loadClip — the token and URL contract', () => {
     expect(result).toBe('failed');
     expect(player.replace).not.toHaveBeenCalled();
     expect(player.play).not.toHaveBeenCalled();
-    expect(usePlayerStore.getState().status).toBe('error');
+    expect(usePlayerStore.getState().cardStatus).toBe('error');
   });
 
   it('reports a native failure as an error rather than throwing', async () => {
@@ -193,12 +204,12 @@ describe('loadClip — the token and URL contract', () => {
     });
     const result: LoadResult = await loadClip(clip(), 'tok');
     expect(result).toBe('failed');
-    expect(usePlayerStore.getState().status).toBe('error');
+    expect(usePlayerStore.getState().cardStatus).toBe('error');
     expect(usePlayerStore.getState().error).toBe('AVPlayer blew up');
   });
 
   it('clears a previous error on a successful load', async () => {
-    usePlayerStore.getState().setStatus('error', 'stale failure');
+    usePlayerStore.getState().setCardStatus('error', 'stale failure');
     await loadClip(clip(), 'tok');
     expect(usePlayerStore.getState().error).toBeNull();
   });
@@ -231,17 +242,15 @@ describe('transport controls do not resurrect a released player', () => {
     expect(mockCreate).toHaveBeenCalledTimes(1);
   });
 
-  it('pause flips playing to paused', async () => {
+  it('pause records paused, without touching the card status', async () => {
     await loadClip(clip(), 'tok');
+    usePlayerStore.getState().setCardStatus('processing');
     pause();
     expect(player.pause).toHaveBeenCalled();
-    expect(usePlayerStore.getState().status).toBe('paused');
-  });
-
-  it('pause leaves a non-playing state alone', () => {
-    usePlayerStore.getState().setStatus('processing');
-    pause();
-    expect(usePlayerStore.getState().status).toBe('processing');
+    expect(usePlayerStore.getState().playback).toBe('paused');
+    // The card's own state is the token lifecycle's; pausing must not claim a
+    // still-encoding clip is merely paused.
+    expect(usePlayerStore.getState().cardStatus).toBe('processing');
   });
 
   it('seek passes seconds straight through, unrounded', async () => {
@@ -256,13 +265,20 @@ describe('store', () => {
   it('resets to its initial state', () => {
     usePlayerStore.getState().setQueue([clip()]);
     usePlayerStore.getState().setActiveIndex(4);
-    usePlayerStore.getState().setStatus('gone');
+    usePlayerStore.getState().setCardStatus('gone');
+    usePlayerStore.getState().syncFromPlayer({
+      currentTime: 5, duration: 10, playing: true,
+      isBuffering: false, isLoaded: true, didJustFinish: false, error: null,
+    });
     usePlayerStore.getState().reset();
 
     const s = usePlayerStore.getState();
     expect(s.queue).toEqual([]);
     expect(s.activeIndex).toBe(0);
-    expect(s.status).toBe('idle');
+    expect(s.cardStatus).toBe('idle');
+    expect(s.playback).toBe('idle');
+    expect(s.currentTime).toBe(0);
+    expect(s.duration).toBe(0);
     expect(s.playingClipId).toBeNull();
   });
 
@@ -272,9 +288,100 @@ describe('store', () => {
     expect(usePlayerStore.getState().handsFree).toBe(!before);
   });
 
-  it('setStatus clears the error when not given one', () => {
-    usePlayerStore.getState().setStatus('error', 'boom');
-    usePlayerStore.getState().setStatus('playing');
+  it('setCardStatus clears the error when not given one', () => {
+    usePlayerStore.getState().setCardStatus('error', 'boom');
+    usePlayerStore.getState().setCardStatus('minting');
     expect(usePlayerStore.getState().error).toBeNull();
+  });
+});
+
+describe('playbackStateFrom — the native status mapping', () => {
+  // The single most consequential function added in this stage. Before it,
+  // `loadClip` asserted "playing" from its own optimism and nothing could
+  // correct it, so a 403'd manifest showed "Now playing" for ever.
+  const snap = (o: Partial<NativeStatusSnapshot> = {}): NativeStatusSnapshot => ({
+    currentTime: 0,
+    duration: 0,
+    playing: false,
+    isBuffering: false,
+    isLoaded: false,
+    didJustFinish: false,
+    error: null,
+    ...o,
+  });
+
+  it('reports an error above everything else', () => {
+    // Even while "playing": a native error is the reason the user hears
+    // nothing, so it must not be masked by a stale playing flag.
+    expect(playbackStateFrom(snap({ error: '403', playing: true, isLoaded: true }))).toBe('error');
+  });
+
+  it('reports natural completion as ended, not paused', () => {
+    // The plan's pacing rule keys on progress >= 0.99, and Phase 3 must not
+    // report a finished clip as a skip. `ended` is what makes that
+    // distinguishable.
+    expect(playbackStateFrom(snap({ didJustFinish: true, playing: false }))).toBe('ended');
+  });
+
+  it('reports buffering ahead of playing', () => {
+    // A stalled stream is still flagged `playing` on Android, so checking
+    // playing first would hide the spinner.
+    expect(playbackStateFrom(snap({ isBuffering: true, playing: true }))).toBe('buffering');
+  });
+
+  it('reports playing', () => {
+    expect(playbackStateFrom(snap({ playing: true, isLoaded: true }))).toBe('playing');
+  });
+
+  it('reports a loaded but stopped player as paused', () => {
+    expect(playbackStateFrom(snap({ isLoaded: true }))).toBe('paused');
+  });
+
+  it('reports nothing loaded as idle', () => {
+    expect(playbackStateFrom(snap())).toBe('idle');
+  });
+});
+
+describe('syncFromPlayer', () => {
+  const snap = (o: Partial<NativeStatusSnapshot> = {}): NativeStatusSnapshot => ({
+    currentTime: 0, duration: 0, playing: false, isBuffering: false,
+    isLoaded: false, didJustFinish: false, error: null, ...o,
+  });
+
+  it('mirrors currentTime and duration in SECONDS', () => {
+    usePlayerStore.getState().syncFromPlayer(snap({ currentTime: 12.5, duration: 90 }));
+    const s = usePlayerStore.getState();
+    // Never milliseconds. `clip.duration_ms` is the backend's own measure and
+    // is NOT the same value, so it is not used here.
+    expect(s.currentTime).toBe(12.5);
+    expect(s.duration).toBe(90);
+  });
+
+  it('does not disturb the card status', () => {
+    usePlayerStore.getState().setCardStatus('processing');
+    usePlayerStore.getState().syncFromPlayer(snap({ playing: true, isLoaded: true }));
+    // The two have different producers; a native tick must not reset a
+    // still-encoding clip's spinner to "playing".
+    expect(usePlayerStore.getState().cardStatus).toBe('processing');
+    expect(usePlayerStore.getState().playback).toBe('playing');
+  });
+
+  it('surfaces a native error message', () => {
+    usePlayerStore.getState().syncFromPlayer(snap({ error: 'manifest 403' }));
+    expect(usePlayerStore.getState().playback).toBe('error');
+    expect(usePlayerStore.getState().error).toBe('manifest 403');
+  });
+
+  it('clears a previous native error on the next healthy tick', () => {
+    usePlayerStore.getState().syncFromPlayer(snap({ error: 'boom' }));
+    usePlayerStore.getState().syncFromPlayer(snap({ playing: true, isLoaded: true }));
+    expect(usePlayerStore.getState().error).toBeNull();
+  });
+
+  it('does not wipe a card-level error set by the token lifecycle', () => {
+    usePlayerStore.getState().setCardStatus('unavailable');
+    usePlayerStore.getState().syncFromPlayer(snap({ isLoaded: true }));
+    expect(usePlayerStore.getState().error).toBeNull();
+    expect(usePlayerStore.getState().cardStatus).toBe('unavailable');
   });
 });

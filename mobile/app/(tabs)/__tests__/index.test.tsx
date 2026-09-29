@@ -64,17 +64,26 @@ jest.mock('../../../src/store/player', () => {
     loadClip: jest.fn(),
     pause: jest.fn(),
     msToSeconds: (ms: number) => ms / 1000,
+    playbackStateFrom: jest.fn(() => 'idle'),
+    // Mirrors the real store's shape, including the split between the card's
+    // token state and the native player state. A stub with a single `status`
+    // would let the screen render while hiding the very confusion this stage
+    // removed.
     usePlayerStore: create((set: (p: unknown) => void) => ({
       queue: [],
       activeIndex: 0,
       handsFree: true,
-      status: 'idle',
+      cardStatus: 'idle',
+      playback: 'idle',
+      currentTime: 0,
+      duration: 0,
       playingClipId: null as string | null,
       error: null as string | null,
       setQueue: () => {},
       setActiveIndex: () => {},
       toggleHandsFree: () => {},
-      setStatus: (s: string) => set({ status: s }),
+      setCardStatus: (cardStatus: string) => set({ cardStatus }),
+      syncFromPlayer: () => {},
       reset: () => {},
     })),
   };

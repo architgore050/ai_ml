@@ -29,7 +29,7 @@ The overview said "read ALL the relevant files". These were read in full:
 
 These change the work. They are corrections, not nitpicks.
 
-### 1.1 The SDK pin in D1 is stale. `expo` `latest` is now **SDK 57**.
+### 1.1 The SDK pin in D1 was stale. `expo` `latest` is now **SDK 57**.
 
 Verified against the npm registry today:
 
@@ -38,17 +38,20 @@ latest: 57.0.25 · sdk-57: 57.0.25 · sdk-56: 56.0.22 · sdk-55: 55.0.31
 canary: 58.0.0-canary-20260909
 ```
 
-D1 says "Expo SDK 55". That is two stable releases behind, and
+D1 said "Expo SDK 55". That is two stable releases behind, and
 `npx create-expo-app` with no pin will scaffold **57**. So the plan's version
-constraint does not describe what the command will actually do, which means it
-cannot be followed literally.
+constraint did not describe what the command would actually do, which means it
+could not be followed literally.
 
-**This is owner decision O1 (§5).** It is not mine to pick: 57 is `latest` and
-gets the newest `expo-audio` (currently `57.0.5`, i.e. aligned to 57, not 55),
-but 55 is what the doc was written against. Pick a number, then **pin every
-dependency with `npx expo install`**, never by hand-editing version ranges —
+**RESOLVED — owner selected SDK 57** (2026-09-29). Rationale: 55 was two stable
+releases stale; `expo-audio` is at `57.0.5`, i.e. aligned to 57; and a
+brand-new scaffold has no migration cost, so "stay conservative" buys nothing
+here. D1 is amended in `mobile-rebuild-plan.md` to say SDK 57.
+
+**Loading consequence:** with the SDK pinned, **every dependency must be
+installed with `npx expo install`** — never a hand-written version range.
 `expo install` is the only thing that knows which version of a package is
-aligned to which SDK.
+aligned to which SDK, and writing `^57.x` by hand is how the lockfile rots.
 
 ### 1.2 The old app is on **SDK 52**, not 55.
 
@@ -105,14 +108,14 @@ Meanwhile there are two incompatible vocabularies in the repo:
 | `mobile/src/screens/UploadScreen.tsx:17-24` | Field Recordings · Ambient & Drone · Synthesizer · Cyberpunk · Lo-Fi Beats · Speech & Poetry |
 | Plan §13 `CATS` (from `sample_frontend2`) | instrumental · funny · news · science · music |
 
-The backend accepts both. The 5 design-source categories also carry brand
-colours (`#00e5a0`, `#f59e0b`, `#60a5fa`, `#8b5cf6`, `#ff6b35`) that the old
-taxonomy has no mapping for, and `/suggestions/?category=X` filters on exact
-string equality. **Clips already in the database carry the old 6 values**, so
-switching the picker to the design-source 5 does not re-label existing data.
+The backend accepts both. The 5 design-source categories carry brand colours
+(`#00e5a0`, `#f59e0b`, `#60a5fa`, `#8b5cf6`, `#ff6b35`) that the old taxonomy
+has no mapping for, and `/suggestions/?category=X` filters on exact string
+equality. Clips already in the database carry the old 6, so adding the 5 does
+not re-label existing data.
 
-This is owner decision **O2 (§5)**. It is a real fork: design fidelity vs.
-continuity with stored data.
+**RESOLVED — union with a neutral fallback** (2026-09-29). See §5 O2 for the
+rule and the reasoning.
 
 ---
 
@@ -140,12 +143,16 @@ Not corrections, but they change how the tasks are written.
 - **Three assets are referenced and none exist.** `app.json:7` `icon.png`,
   `:10` `splash.png`, `:27` `adaptive-icon.png`. There is no `mobile/assets/`
   directory at all. Every build of the old app fails at bundle time.
-- **`surface-bright` is defined twice with different values.**
-  `globals.css:11` → `#38393c`; `tailwind.config.js:14` → `#282a2c`, which is
-  `globals.css`'s `--surface-container-high`. One is wrong and it is not
-  recorded which. This is one of the "16 catalogued design-extraction defects"
-  the plan defers; it has to be resolved **before** `tokens.ts` is written, or
-  the wrong value gets typed in and looks authoritative forever.
+- **`surface-bright` was defined twice with different values.**
+  `globals.css:11` → `#38393c`; `tailwind.config.js:15` → `#282a2c`, which is
+  `globals.css`'s `--surface-container-high` (`:15`). **RESOLVED in favour of
+  `globals.css` (2026-09-29) — see §5 O3.** The override is genuine, not a
+  wash: `globals.css` keeps `--surface-bright` as a step *above*
+  `--surface-container-highest` (`#333537`, `:16`), making a 6-step ascending
+  brightness ramp, and it does the same in the light theme (`#ffffff` `:100` vs
+  `#e2dcd4` `:105`). `tailwind.config.js` collapsed two distinct steps into one
+  label. So `globals.css` is internally consistent in **both** themes and the
+  Tailwind mapping is the error.
 - **`babel.config.js:5` puts `react-native-reanimated/plugin` in the plugin
   list.** `babel-preset-expo` includes the Reanimated plugin on recent SDKs and
   warns about the manual one. Start from a fresh template, do not carry this
@@ -224,17 +231,88 @@ remembered summary loses the detail.
 
 ---
 
-## 5. Owner decisions needed before 1.1
+## 5. Owner decisions — all three answered 2026-09-29
 
-Three forks I will not pick alone. Each is cheap now and expensive later.
+Phase 1 is unblocked. Recording the answers and the reasoning, because a
+decision without its reason is a decision nobody can revisit.
 
-| # | Decision | Options | My recommendation, with reasoning |
-|---|---|---|---|
-| **O1** | Target Expo SDK | 55 (`sdk-55`, what D1 says) · 56 · **57** (`latest`) | **57**, then amend D1. Reasoning: 55 is two stable releases stale; `expo-audio` is already at `57.0.5` so 57 is where audio support is best; and a brand-new scaffold has no migration cost, so "stay conservative" buys nothing here. The real risk of 57 is `expo-audio` API churn, which is lowest on the newest SDK. Amend D1 in the plan so the doc stops lying. |
-| **O2** | Category taxonomy | design-source 5 (instrumental/funny/news/science/music) · old 6 (Field Recordings/…) · union with a fallback colour | **Design-source 5, plus a documented neutral fallback for unknown values.** Reasoning: they are the only ones with brand colours, the plan's CATS line depends on them, and `suggestions?category=` filters by exact string so a fixed 5 keeps the filter pills honest. Cost: existing clips keep their old values and need the fallback. If you want continuity instead, take the old 6 and drop the CATS colours. |
-| **O3** | `surface-bright` | `globals.css:11` `#38393c` · `tailwind.config.js:14` `#282a2c` | **Needs your call — I cannot resolve it from the code.** The other four surface steps run `#0c0e10 → #1a1c1e → #1e2022 → #282a2c → #333537` in `globals.css`, which makes `#38393c` the odd one out and `tailwind`'s value the consistent one. But `globals.css` is the file the plan names as authoritative, and it says `#38393c`. If `globals.css` is right, the 5-step ramp has a gap. Say which, and it goes in `tokens.ts` with a comment saying which file won. |
+| # | Decision | Answer |
+|---|---|---|
+| **O1** | Target Expo SDK | **SDK 57** |
+| **O2** | Category taxonomy | **Union: 5 branded + neutral fallback** |
+| **O3** | `surface-bright` | **`#38393c`** (`globals.css:11`) |
 
-Two smaller ones, flagging rather than asking:
+### O1 — SDK 57
+
+`latest` at the time of decision was 57.0.25, two stable releases past the 55
+the plan had pinned. Three factors pointed the same way: `expo-audio` (the
+reason D2 chose it over `react-native-track-player`) is at `57.0.5`, so 57 is
+where its support is best; the app is being scaffolded from nothing, so
+conservatism buys nothing — there is no migration risk to avoid; and the oldest
+supported runtime of the three is the one most likely to need a re-pin within
+a year. `expo-av` is gone by 55+, so the choice is between 55/56/57 and the
+newest of those is the least work.
+
+**Binding constraint:** pin the SDK, then install every dependency with
+`npx expo install`. Hand-written ranges will drift from the SDK's compatible
+set and the failure surfaces later as a native-module mismatch at build time,
+not as a version warning.
+
+### O2 — union, 5 branded + neutral fallback
+
+**The rule, which collapses to something simple: 5 branded, everything else
+neutral.** That covers the legacy 6 the old app wrote *and* any unknown value
+arriving from a future backend change or a scraped clip, so there is no third
+case to enumerate and no per-value colour table to maintain.
+
+| Group | Values | Colour |
+|---|---|---|
+| Branded (5) | instrumental · funny · news · science · music | `#00e5a0` · `#f59e0b` · `#60a5fa` · `#8b5cf6` · `#ff6b35` |
+| Neutral (everything else) | Field Recordings · Ambient & Drone · Synthesizer · Cyberpunk · Lo-Fi Beats · Speech & Poetry · *and any unknown string* | `--outline` `#9d8e84` |
+
+Why union over picking one: the 5 have brand colours and drive the design, but
+the 6 are what existing rows actually contain, and `suggestions?category=`
+filters on exact string equality — dropping either set makes those filters lie.
+`#9d8e84` is an existing token (`--outline`), so the fallback adds no new
+colour to the system.
+
+**Accepted costs, stated rather than discovered later:** the upload picker
+carries 11 rows (sort branded first, then legacy alphabetically); and the 11
+strings must be spelled byte-identical to stored values, because a
+near-miss like `"Lo-Fi"` vs `"Lo-Fi Beats"` is a silently empty filter, not a
+400. Pin them in one `src/design/categories.ts` and derive the picker,
+suggestions pills and colour lookup from it — one source, so the three views
+cannot disagree.
+
+### O3 — `surface-bright: #38393c`
+
+The two sources disagreed, so the tiebreak was internal consistency:
+
+```
+globals.css:11        --surface-bright: #38393c        ← chosen
+globals.css:15        --surface-container-high: #282a2c
+globals.css:16        --surface-container-highest: #333537
+tailwind.config.js:15 'surface-bright': '#282a2c'      ← collides with :15
+```
+
+`globals.css` keeps `surface-bright` as a step **above**
+`container-highest`, giving a 6-step ascending brightness ramp
+`#0c0e10 → #1a1c1e → #1e2022 → #282a2c → #333537 → #38393c`, and it does the
+same in the light theme (`#ffffff` over `#e2dcd4`). `tailwind.config.js`
+assigned `surface-bright` the value of `container-high`, collapsing two
+distinct steps into one label. So the two candidates were not equally valid:
+`globals.css` is coherent in both themes, the Tailwind mapping is not.
+
+`#38393c` is also the file D7 names authoritative, which is why the plan's
+token table is a list of `globals.css` values with Tailwind contributing only
+the `boxShadow` glows. In `tokens.ts`, `surface.bright` is `#38393c` with a
+comment naming `globals.css:11` and noting that `tailwind.config.js:15`
+disagrees — so the next reader does not "fix" it back.
+
+### Two smaller ones, decided without an owner
+
+Neither is a fork, so neither needed asking. Recorded so the reasoning is not
+re-litigated during Phase 1.
 
 - **`terms_version` source.** Fetch `current_terms_version` from
   `GET /legal/compliance/` at registration-screen mount (1.15). Hardcoding
@@ -285,10 +363,11 @@ tailwind-only entries marked:
 ```
 FONT      Lexend 300–900                     globals.css:1
 BG        #121416                            :53
-SURFACES  #0c0e10 / #1a1c1e / #1e2022 / #282a2c / #333537
-                                                 :12-16
-          surface-bright  ← O3 UNRESOLVED     globals.css:11 says #38393c
-                                                 tailwind:14 says #282a2c
+SURFACES  #0c0e10 / #1a1c1e / #1e2022 / #282a2c / #333537 / #38393c
+                                                 :12-16 then :11
+          ↑ last value is surface-bright, a step ABOVE container-highest.
+            O3: globals.css wins over tailwind.config.js:15, which collapsed
+            it onto #282a2c. Comment this in tokens.ts.
 BRAND     terracotta #e8a87c (:56) · hover #d4956a (:64) · 135° gradient
 2ND       sage #aad0b1 (:29)        3RD  honey-gold #f1ce6d (:35)
 LIKE/ERR  #ffb4ab (:37)                    (white icon + count, salmon glow)
@@ -309,7 +388,8 @@ Z         nav 200 < sheet 800 < toast 5000 < onboarding 7000 < netbanner 8000
 GLYPHS    22 icon · 9 nav · 10 count · 11 label · 13 body · 20 title · 28 page
 TRACKING  +0.02em title → +0.08em uppercase micro-labels
 PACING    1000ms after progress ≥ 0.99, then advance
-CATS      see O2
+CATS      5 branded + everything else neutral --outline #9d8e84
+          (O2 — full table in §5)
 ```
 
 The `tap-target: 64px` token exists and the web violates it everywhere (plan
@@ -360,10 +440,10 @@ on every icon-only control. Do not copy `64px` as the target — copy it as the
 
 Work top to bottom. Each line is a commit boundary or an explicit checkpoint.
 
-**Decide first**
-- [ ] O1 — target Expo SDK (55 / 56 / **57**). Amend D1 in `mobile-rebuild-plan.md` to match
-- [ ] O2 — category taxonomy (design 5 / old 6 / union+fallback)
-- [ ] O3 — `surface-bright`: `#38393c` or `#282a2c`
+**Decide first** — ✅ all three answered 2026-09-29, see §5
+- [x] O1 — **SDK 57** (`latest` 57.0.25). D1 amended in `mobile-rebuild-plan.md`. Install every dep with `npx expo install`
+- [x] O2 — **union: 5 branded, everything else neutral `#9d8e84`**. Single source `src/design/categories.ts`, byte-identical strings
+- [x] O3 — **`surface-bright: #38393c`** (`globals.css:11`). 6-step ramp; `tailwind.config.js:15` was wrong
 
 **Phase 0 — remove (one commit)**
 - [ ] 0.1 Record baseline: 3313 LOC, 125 hex, 8 `StyleSheet.create`
@@ -376,8 +456,8 @@ Work top to bottom. Each line is a commit boundary or an explicit checkpoint.
 - [ ] 0.8 `git commit` — Phase 0
 
 **Phase 1a — scaffold**
-- [ ] 1.1 `create-expo-app` into a temp dir, pinned to O1's SDK
-- [ ] 1.2 Check the generated SDK matches O1
+- [ ] 1.1 `create-expo-app` into a temp dir, pinned to **SDK 57**
+- [ ] 1.2 Check the generated SDK matches 57
 - [ ] 1.3 Adopt into `mobile/`, keeping name/version/private
 - [ ] 1.4 Confirm no committed `ios/`+`android/`
 - [ ] 1.5 `npx expo install` the full dependency set — no hand-written versions
@@ -387,12 +467,13 @@ Work top to bottom. Each line is a commit boundary or an explicit checkpoint.
 - [ ] 1.9 Add `typecheck` / `test` / `lint` scripts
 
 **Phase 1b — design system**
-- [ ] 1.10 `src/design/tokens.ts` — §6 value table, with O3 resolved and a comment naming the winning file
+- [ ] 1.10 `src/design/tokens.ts` — §6 value table, `surface.bright = #38393c` with a comment naming `globals.css:11` and noting `tailwind.config.js:15` disagrees
 - [ ] 1.11 `src/design/shadows.ts` — `Platform.select` glow
 - [ ] 1.12 `src/design/typography.ts` + `useFonts` gating first paint
 - [ ] 1.13 `src/design/theme.tsx` — dark only
-- [ ] 1.14 `src/components/ui/` — Glass, Chip, Button, Sheet, Toast, Spinner, Waveform, Equalizer
-- [ ] 1.15 Confirm none of the "not ported" list leaked in
+- [ ] 1.14 `src/design/categories.ts` — O2: 5 branded + neutral fallback, one source for picker/pills/colours
+- [ ] 1.15 `src/components/ui/` — Glass, Chip, Button, Sheet, Toast, Spinner, Waveform, Equalizer
+- [ ] 1.16 Confirm none of the "not ported" list leaked in
 
 **Phase 1c — API layer**
 - [ ] 1.16 `src/api/client.ts` — mutex rewritten, rotation required, timeout, 204, `ApiError`, `skipAuth`, 429 backoff

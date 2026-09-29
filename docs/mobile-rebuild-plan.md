@@ -504,7 +504,7 @@ history; the salvage list in [§20](#20-salvage-list) captures the few
 
 | # | Decision | Rejected | Why |
 |---|---|---|---|
-| D1 | **Expo SDK — pin before Phase 1** (see note below) | bare RN | `expo-secure-store`, `expo-audio` (with the background-playback plugin), `expo-blur`, `expo-updates` all need native config; CNG writes `ios/`/`android/` at build time so no checked-in native project rots. No Expo UI kit — vanilla RN primitives keep ejecting possible.<br><br>**AMENDED 2026-09-29.** This row originally read "Expo SDK 55". Verified against the npm registry on that date: `latest` is **57.0.25**, `sdk-56` is `56.0.22`, `sdk-55` is `55.0.31` — so 55 was two stable releases stale *and* `npx create-expo-app` unpinned would scaffold 57, meaning the pin as written could not be followed literally. The old app is on **SDK 52** (`package.json:17`), so the real jump is 52 → 57: three majors across the New Architecture default flip and the `expo-av` → `expo-audio` migration at once. There is nothing worth upgrading in place, so Phase 1 is a scaffold, not an upgrade. **`expo-audio` is at `57.0.5`**, i.e. aligned to 57, which is the argument for picking the newest. Once chosen, every dependency must be installed with `npx expo install` rather than hand-edited version ranges — `expo install` is the only thing that knows which version of a package matches which SDK. See `2026-09-29-mobile-phase-0-1-detail.md` §1.1 and §5 (decision O1). |
+| D1 | **Expo SDK 57, managed workflow, `expo prebuild` (CNG)** | bare RN | `expo-secure-store`, `expo-audio` (with the background-playback plugin), `expo-blur`, `expo-updates` all need native config; CNG writes `ios/`/`android/` at build time so no checked-in native project rots. No Expo UI kit — vanilla RN primitives keep ejecting possible.<br><br>**AMENDED 2026-09-29 (owner-approved).** This row originally read "Expo SDK 55". Verified against the npm registry on that date: `latest` is **57.0.25**, `sdk-56` is `56.0.22`, `sdk-55` is `55.0.31` — so 55 was two stable releases stale *and* `npx create-expo-app` unpinned would scaffold 57, meaning the pin as written could not be followed literally. **Owner selected SDK 57.** The old app is on **SDK 52** (`package.json:17`), so the real jump is 52 → 57: three majors across the New Architecture default flip and the `expo-av` → `expo-audio` migration at once. There is nothing worth upgrading in place, so Phase 1 is a scaffold, not an upgrade. `expo-audio` is at `57.0.5`, i.e. aligned to 57. **Every dependency must be installed with `npx expo install`** rather than hand-edited version ranges — `expo install` is the only thing that knows which version of a package matches which SDK, and writing `^57.x` by hand is how the lockfile rots. Decisions recorded in `2026-09-29-mobile-phase-0-1-detail.md` §5 (O1). |
 | D2 | **`expo-audio`, not `react-native-track-player`** | RNTP | SDK 55's config plugin ships `AudioControlsService` (Android MediaSessionService) and `UIBackgroundMode: audio` (iOS) automatically, including lock-screen controls. Also natively HLS-capable and — critically — supports **`AudioSource.headers`**, which is the transport A1/A2 exist to feed. |
 | D3 | **`expo-router` (file-based)** | React Navigation | Deep linking, typed routes and universal links come for free. The old app declared `scheme: "echoflow"` and had zero handlers; expo-router fixes that structurally. Auth via route groups `app/(auth)/` vs `app/(tabs)/`. |
 | D4 | **TanStack Query v5 (server) + Zustand (client) + MMKV/SecureStore** | React Context | Defects 1 and 3 above are both symptoms of hand-rolled cache state. TanStack Query owns every server read; Zustand holds only player/auth/preferences. Tokens → `expo-secure-store` (Keychain/Keystore), not MMKV. |
@@ -644,6 +644,7 @@ From `sample_frontend2/src/styles/globals.css` + `tailwind.config.js` →
 ```
 FONT      Lexend 300–900 (@expo-google-fonts/lexend); weight + tracking do the work
 BG        #121416      SURFACES  #0c0e10 / #1a1c1e / #1e2022 / #282a2c / #333537
+                                                 + surface-bright #38393c
 BRAND     terracotta #e8a87c → hover #d4956a   (135° gradient, #000 text)
 2ND       sage #aad0b1    3RD  honey-gold #f1ce6d
 LIKE/ERR  #ffb4ab (white icon + count on top, salmon glow)
@@ -661,18 +662,24 @@ Z         nav 200 < sheet 800 < toast 5000 < onboarding 7000 < netbanner 8000
 PACING    1000ms after progress ≥ 0.99, then advance
 CATS      instrumental #00e5a0 · funny #f59e0b · news #60a5fa · science #8b5cf6 · music #ff6b35
           waveform → to top: ${c}, sage | progress → 90deg: ${c}, terracotta
-CATS      UNRESOLVED — two vocabularies collide. `AudioClip.category` is
-          free text (`models.py:112`, `CharField(max_length=50, blank=True)`,
-          no `choices`), so the backend accepts either. The old app used 6
-          (Field Recordings / Ambient & Drone / Synthesizer / Cyberpunk /
-          Lo-Fi Beats / Speech & Poetry, `UploadScreen.tsx:17-24`); the design
-          source uses 5 (instrumental / funny / news / science / music) and
-          only the 5 have brand colours. `/suggestions/?category=X` filters on
-          exact string equality, so the choice determines whether the filter
-          pills are honest. Clips already in the DB carry the OLD 6, so
-          switching the picker does not re-label stored data — it needs a
-          documented neutral fallback colour for unknown values. Open decision
-          O2 in `2026-09-29-mobile-phase-0-1-detail.md` §5.
+CATS      5 branded (instrumental #00e5a0 · funny #f59e0b · news #60a5fa ·
+          science #8b5cf6 · music #ff6b35) + the 6 legacy values the old app
+          wrote (Field Recordings · Ambient & Drone · Synthesizer · Cyberpunk ·
+          Lo-Fi Beats · Speech & Poetry) in neutral --outline #9d8e84
+          waveform → to top: ${c}, sage | progress → 90deg: ${c}, terracotta
+
+          **Union with a neutral fallback (owner-approved 2026-09-29).**
+          `AudioClip.category` is free text (`models.py:112`,
+          `CharField(max_length=50, blank=True)`, no `choices`), so both
+          vocabularies validate server-side and clips already in the DB carry
+          the legacy 6. The rule collapses cleanly: **5 branded, everything
+          else neutral** — so the legacy 6 and any unknown value from a future
+          backend change or a scraped clip share one neutral, and there is no
+          third case to enumerate. `--outline` #9d8e84 is the existing muted
+          token, so the fallback costs no new colour. Cost accepted: 11 rows in
+          the picker, sorted branded-first. `/suggestions/?category=` filters on
+          exact string equality, so the 11 must be spelled byte-identical to
+          what is stored. Prior decision O2.
 ```
 
 ### Ported from `frontend/src` because `sample_frontend2` lacks it

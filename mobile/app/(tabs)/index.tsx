@@ -140,7 +140,7 @@ export default function Screen() {
         const timer = setTimeout(() => {
           if (!clipForTimer) return;
           lastLoadAt.current = Date.now();
-          void loadClip(clipForTimer, action.token, usePlayerStore.getState().loadGeneration);
+          void loadClip(clipForTimer, action.token);
         }, action.waitMs);
         return () => clearTimeout(timer);
       }
@@ -148,7 +148,7 @@ export default function Screen() {
       case 'load': {
         if (!clip) return;
         lastLoadAt.current = Date.now();
-        void loadClip(clip, action.token, usePlayerStore.getState().loadGeneration);
+        void loadClip(clip, action.token);
         return;
       }
 

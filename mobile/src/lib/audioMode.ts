@@ -26,11 +26,19 @@ export const PLAYBACK_AUDIO_MODE: AudioMode = {
 
   // Continue while backgrounded. expo-audio's config plugin wires
   // AudioControlsService (Android MediaSession) and UIBackgroundMode: audio
-  // (iOS), so lock-screen transport controls work.
+  // (iOS).
   //
-  // ANDROID CAVEAT, from the SDK's own docs: sustained background playback
-  // also needs `setActiveForLockScreen(...)`, without which the OS stops it
-  // after ~3 minutes. That is a follow-up — the screen is not the place for it.
+  // LOCK-SCREEN CONTROLS ARE NOT RELIABLE HERE, and that is a deliberate
+  // trade, not an oversight. The SDK documents twice that `setActiveForLockScreen`
+  // requires `interruptionMode: 'doNotMix'`; with 'duckOthers' (chosen above so
+  // a clip does not pause the user's own music) the OS may not associate lock
+  // screen controls with this player. The owner chose ducking over lock-screen
+  // reliability on 2026-09-29.
+  //
+  // `setActiveForLockScreen` is still worth calling: on ANDROID it is required
+  // for sustained background playback independently of the interruption mode,
+  // and without it the OS stops playback after ~3 minutes. That call belongs in
+  // the root layout next to the player, not in this module.
   shouldPlayInBackground: true,
 
   // Explicit, not inherited. Playback must not hold a recording-capable

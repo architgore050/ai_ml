@@ -37,12 +37,15 @@ export const msToSeconds = (ms: number): number => ms / 1000;
 /** s (expo-audio) → ms (backend). */
 export const secondsToMs = (seconds: number): number => Math.round(seconds * 1000);
 
-const msToS = msToSeconds;
-const sToMs = secondsToMs;
-
 let instance: AudioPlayer | null = null;
 
-/** The one player. Created on first call; `null` only before first use. */
+/**
+ * The one player, created on demand.
+ *
+ * Lazy so importing this module never touches a native module, and
+ * constructible outside React so the load logic is testable in plain Jest.
+ * The instance is still a single app-wide singleton.
+ */
 export function getPlayer(): AudioPlayer {
   if (!instance) {
     instance = createAudioPlayer(null, { updateInterval: 500 } satisfies AudioPlayerOptions);
@@ -50,10 +53,33 @@ export function getPlayer(): AudioPlayer {
   return instance;
 }
 
-/** Release the native player. Call from the root component's effect cleanup. */
+/**
+ * The player if it exists, else `null`. **Does not create one.**
+ *
+ * `pause`/`resume`/`seekToSeconds` must use this. They used to call
+ * `getPlayer()`, which after `releasePlayer()` would happily construct a fresh
+ * AVPlayer/ExoPlayer with no source purely to pause nothing — resurrecting a
+ * native resource on a call that cannot do anything useful.
+ */
+export function getPlayerOrNull(): AudioPlayer | null {
+  return instance;
+}
+
+/**
+ * Release the native player and clear the store's claim that something is
+ * playing. Call from the root component's effect cleanup.
+ *
+ * Clearing the store is not optional. The effect body creates nothing, so its
+ * cleanup can fire at any time relative to the component that actually uses the
+ * player — and reachable today on any Fast Refresh of `_layout.tsx`. Without
+ * the reset the store keeps `status: 'playing'` and `playingClipId` for a
+ * player that no longer exists, and since no dependency changes, **no load is
+ * ever re-triggered**: playback is dead behind a "Now playing" card.
+ */
 export function releasePlayer(): void {
   instance?.remove();
   instance = null;
+  usePlayerStore.getState().reset();
 }
 
 export type PlaybackStatus =
@@ -83,13 +109,6 @@ export type PlaybackStatus =
 export type PlayerState = {
   queue: FeedClip[];
   activeIndex: number;
-  /**
-   * Monotonic guard against out-of-order loads. A `load()` bumps it; a load
-   * that resolves with a stale generation is discarded. Without this a slow
-   * load can resolve after a fast one and win, leaving the wrong clip playing
-   * under the new card (plan §10 "Race guard").
-   */
-  loadGeneration: number;
   handsFree: boolean;
   status: PlaybackStatus;
   /** Null until a load succeeds; the id actually playing, not the requested one. */
@@ -100,29 +119,36 @@ export type PlayerState = {
   setActiveIndex: (index: number) => void;
   toggleHandsFree: () => void;
   setStatus: (status: PlaybackStatus, error?: string | null) => void;
+  /**
+   * Return the store to its initial state, so a released player cannot leave
+   * the UI asserting that audio is playing. See `releasePlayer`.
+   */
+  reset: () => void;
 };
 
-export const usePlayerStore = create<PlayerState>((set) => ({
+const INITIAL: Pick<
+  PlayerState,
+  'queue' | 'activeIndex' | 'handsFree' | 'status' | 'playingClipId' | 'error'
+> = {
   queue: [],
   activeIndex: 0,
-  loadGeneration: 0,
   handsFree: true,
   status: 'idle',
   playingClipId: null,
   error: null,
+};
+
+export const usePlayerStore = create<PlayerState>((set) => ({
+  ...INITIAL,
 
   setQueue: (clips) => set({ queue: clips }),
-  setActiveIndex: (index) => set({ activeIndex: index, loadGeneration: usePlayerStore.getState().loadGeneration + 1 }),
+  setActiveIndex: (index) => set({ activeIndex: index }),
   toggleHandsFree: () => set((s) => ({ handsFree: !s.handsFree })),
   setStatus: (status, error = null) => set({ status, error }),
+  reset: () => set({ ...INITIAL }),
 }));
 
-/** The current generation, for callers that need to stamp a load. */
-export function currentGeneration(): number {
-  return usePlayerStore.getState().loadGeneration;
-}
-
-export type LoadResult = 'loaded' | 'stale' | 'failed';
+export type LoadResult = 'loaded' | 'failed';
 
 /**
  * Point the player at `clip` using `token`, and play it.
@@ -137,62 +163,69 @@ export type LoadResult = 'loaded' | 'stale' | 'failed';
  * player can use: the `ef_hls_token` cookie is HttpOnly+Secure and neither
  * AVPlayer nor ExoPlayer's default data source would ever send it.
  *
- * `generation` is captured BEFORE the await so a superseded load can detect it
- * has been overtaken. `replace()` is synchronous, but `play()` and the
- * subsequent load-completion handling are not, and the token mint that precedes
- * this call is where the real await is.
+ * ## There is no generation guard here, and there is not meant to be
+ * This function is `async` for the caller's ergonomics but contains **no
+ * `await`** — `replace()` and `play()` return `void` in expo-audio (they were
+ * Promises in expo-av; awaiting them is a no-op at best). Every statement
+ * therefore runs in one synchronous block, so no load can interleave with
+ * another and a "stale generation" check could only ever compare a value with
+ * itself. A previous revision carried exactly such a check, plus a `generation`
+ * parameter and a `'stale'` result, and all three were unreachable.
+ *
+ * The real ordering guarantees, both outside this function:
+ *
+ *  - `usePlaybackToken`'s `cancelled` flag drops a superseded token mint, so a
+ *    slow mint for a swiped-past reel cannot land after the current one.
+ *  - `decidePlaybackAction`'s `load-after` arm is cleared by its effect's own
+ *    cleanup, so a deferred load cannot fire for a clip the user has left.
+ *
+ * Both were verified by test in `lib/__tests__/playbackDecision.test.ts` and
+ * `hooks/__tests__/usePlaybackToken.test.ts`. Adding a real guard here needs a
+ * genuinely async body first; a ceremonial one is worse than none, because it
+ * documents a safety property the code does not have.
  */
-export async function loadClip(
-  clip: FeedClip,
-  token: string,
-  generation: number,
-): Promise<LoadResult> {
+export async function loadClip(clip: FeedClip, token: string): Promise<LoadResult> {
   const url = clip.hls_playlist_url;
   if (!url) {
     usePlayerStore.getState().setStatus('error', 'clip has no hls_playlist_url');
     return 'failed';
   }
 
-  // A newer load started while this one was in flight → this is stale.
-  if (generation !== currentGeneration()) return 'stale';
-
-  usePlayerStore.getState().setStatus('loading');
-
   try {
     const player = getPlayer();
-    // NOTE: replace()/play() return VOID in expo-audio (they were Promises in
-    // expo-av). Awaiting them would be a no-op at best.
     player.replace({
       uri: url,
       headers: { 'X-EchoFlow-Media-Token': token },
     });
     player.play();
-
-    if (generation !== currentGeneration()) return 'stale';
-    usePlayerStore.getState().setStatus('playing');
-    usePlayerStore.setState({ playingClipId: clip.id });
+    // One `set` for status and playingClipId together. Two separate calls let
+    // a render observe `status: 'playing'` with the *previous* clip's
+    // `playingClipId` — the exact "wrong clip under the new card" hazard the
+    // field's docstring exists to prevent.
+    usePlayerStore.setState({ status: 'playing', playingClipId: clip.id, error: null });
     return 'loaded';
   } catch (err) {
-    if (generation !== currentGeneration()) return 'stale';
-    usePlayerStore.getState().setStatus('error', err instanceof Error ? err.message : 'playback failed');
+    usePlayerStore
+      .getState()
+      .setStatus('error', err instanceof Error ? err.message : 'playback failed');
     return 'failed';
   }
 }
 
 export function pause(): void {
-  getPlayer().pause();
+  // Must not create a player: after `releasePlayer()` this would resurrect a
+  // native AVPlayer/ExoPlayer with no source just to pause nothing.
+  getPlayerOrNull()?.pause();
   const s = usePlayerStore.getState();
   if (s.status === 'playing') s.setStatus('paused');
 }
 
 export function resume(): void {
-  getPlayer().play();
+  getPlayerOrNull()?.play();
   usePlayerStore.getState().setStatus('playing');
 }
 
 /** `seconds` is expo-audio's unit. Callers converting from `duration_ms` use msToSeconds. */
 export function seekToSeconds(seconds: number): void {
-  void getPlayer().seekTo(seconds);
+  void getPlayerOrNull()?.seekTo(seconds);
 }
-
-export { msToS, sToMs };

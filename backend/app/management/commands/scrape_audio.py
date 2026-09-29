@@ -29,7 +29,7 @@ import django
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.conf import settings
 from django.contrib.auth import get_user_model
 
@@ -129,6 +129,29 @@ class Command(BaseCommand):
                                  'is suppressed.')
 
     def handle(self, *args, **options):
+        # SECURITY: master kill switch. `SCRAPER_ENABLED` defaults False.
+        # The license classifier is the only writer of the
+        # is_noncommercial / requires_share_alike columns that the feed's
+        # rights gate reads, so importing third-party audio is an explicit
+        # operator decision, not a default. See settings.py.
+        #
+        # Deliberately raised as CommandError, not a warning: a partially
+        # imported catalog is worse than none, and an operator who believed
+        # the import ran must not be left believing it did.
+        if not getattr(settings, 'SCRAPER_ENABLED', False):
+            raise CommandError(
+                'The audio scraper is disabled (SCRAPER_ENABLED is not set).\n'
+                'It classifies third-party licences into '
+                'AudioClip.is_noncommercial / requires_share_alike, which are '
+                'the only input to the feed rights gate and to '
+                'POST /media/playback-token/. Before enabling it, re-verify a '
+                "source's licensing by hand and read "
+                'docs/EXPLAIN/scraping/03-licensing-safety.md. The classifier '
+                'has failed open once (Freesound "Attribution NonCommercial" '
+                'was classified as plain CC-BY) and is covered by '
+                'backend/app/tests/test_scraper_licensing.py.'
+            )
+
         # Resolve which sources to run
         if options['source'] and options['sources']:
             self.stdout.write(self.style.ERROR(
@@ -524,8 +547,19 @@ class Command(BaseCommand):
         finally:
             try:
                 if local_input and os.path.exists(local_input):
-                    if not local_input.startswith(settings.MEDIA_ROOT):
-                        os.remove(local_input)
+                    # `settings.MEDIA_ROOT` no longer exists — it was removed
+                    # with the S3 migration (originals live in object storage
+                    # via the FileField). Touching it raised AttributeError
+                    # from django.conf, which the bare `except` below
+                    # swallowed, so scratch files were never cleaned up and
+                    # accumulated in the container. The scratch dir is
+                    # authoritative for "is this ours to delete".
+                    scratch_root = os.path.abspath(
+                        getattr(settings, 'SCRAPER_SCRATCH_DIR', '') or ''
+                    )
+                    resolved = os.path.abspath(local_input)
+                    if not scratch_root or resolved.startswith(scratch_root + os.sep):
+                        os.remove(resolved)
             except Exception:
                 pass
 

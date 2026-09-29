@@ -393,6 +393,33 @@ SCRAPER_KAGGLE_LOCAL_PATH = os.getenv('SCRAPER_KAGGLE_LOCAL_PATH', '')
 SCRAPER_ALLOW_NC = os.getenv('SCRAPER_ALLOW_NC', 'False').lower() in ('1', 'true', 'yes')
 SCRAPER_ALLOW_SHARE_ALIKE = os.getenv('SCRAPER_ALLOW_SHARE_ALIKE', 'False').lower() in ('1', 'true', 'yes')
 
+# SECURITY: master kill switch for the importer, default OFF.
+#
+# The license classifier (`ai_ml/scrapers/base.py::normalize_license`) is the
+# ONLY writer of `AudioClip.is_noncommercial` / `requires_share_alike`, which
+# are the only input to the feed's rights gate (`views/feed.py`,
+# `services/entitlements.py`) and therefore to
+# `POST /media/playback-token/{id}/`. Those columns are not settable through
+# the API, so this switch is what keeps third-party content out of the
+# catalog entirely.
+#
+# It defaults OFF because the classifier had a live fail-open (Freesound
+# "Attribution NonCommercial" classified as plain CC-BY, writing
+# `is_noncommercial=False` onto NC audio). That is fixed and covered by
+# `test_scraper_licensing.py`, but a rights gate that has already failed open
+# once should not be re-enabled purely because the bug is closed — an operator
+# should re-verify a source's licensing by hand and then set
+# SCRAPER_ENABLED=True deliberately.
+#
+# This gates the two ENTRY POINTS only (`scrape_audio` and
+# `scrape_and_import`). The library stays importable and its tests keep
+# running, so the classifier cannot rot while the importer is switched off.
+#
+# Note `SCRAPER_ALLOW_LICENSES` (above) is dead: it was superseded by the
+# family map in `base.py` and has no readers. Left in place only so an
+# existing env file does not break on import.
+SCRAPER_ENABLED = os.getenv('SCRAPER_ENABLED', 'False').lower() in ('1', 'true', 'yes')
+
 # DECISION: Connector-specific API keys are namespaced with SCRAPER_* to keep
 # the env surface consistent with existing SCRAPER_* settings. Sources that
 # require a key return [] + WARNING when absent (freesound pattern).

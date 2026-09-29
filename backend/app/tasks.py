@@ -928,6 +928,20 @@ def scrape_and_import(self, source_name, limit=5, clip_length=300, allow_nc=None
         is_share_alike_license,
     )
     from django.conf import settings as dj_settings
+
+    # SECURITY: master kill switch, same as the management command. Raising
+    # rather than returning a string so a caller that ignores the return
+    # value cannot mistake "refused" for "imported nothing".
+    if not getattr(dj_settings, 'SCRAPER_ENABLED', False):
+        raise RuntimeError(
+            'scrape_and_import refused: SCRAPER_ENABLED is not set. The '
+            'license classifier is the only writer of AudioClip.'
+            'is_noncommercial / requires_share_alike, which gate the feed and '
+            'POST /media/playback-token/. Re-verify a source\'s licensing by '
+            'hand before enabling — see '
+            'docs/EXPLAIN/scraping/03-licensing-safety.md.'
+        )
+
     module = SOURCES.get(source_name)
     if not module:
         raise RuntimeError(f"Unknown source: {source_name}")

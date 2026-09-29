@@ -25,11 +25,8 @@ backend/media
 /frontend/node_modules
 *.vite
 backend/media/
-/ai_ml/scrapers
-backend/app/tests/test_scraper.py
 mobile/package-lock.json
 frontend/package-lock.json
-backend/scratch/scraper_logs
 backend/scratch/scraper_logs
 #frontend/sample_frontend/.env
 

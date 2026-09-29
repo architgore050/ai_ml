@@ -257,8 +257,7 @@ class TestFlushTelemetryInvalidation:
         fake_client.set.return_value = True  # SETNX: first time
         fake_client.xgroup_create.side_effect = Exception('BUSYGROUP')
 
-        with patch.object(tasks, 'cache') as fake_cache:
-            fake_cache.client.get_client.return_value = fake_client
+        with patch('redis.from_url', return_value=fake_client):
             result = tasks.flush_telemetry_stream.run(
                 max_events=500, block_ms=10,
             )
@@ -295,8 +294,7 @@ class TestFlushTelemetryInvalidation:
         fake_client.set.side_effect = [True, False]
         fake_client.xgroup_create.side_effect = Exception('BUSYGROUP')
 
-        with patch.object(tasks, 'cache') as fake_cache:
-            fake_cache.client.get_client.return_value = fake_client
+        with patch('redis.from_url', return_value=fake_client):
             tasks.flush_telemetry_stream.run(max_events=500, block_ms=10)
 
         # Cache was invalidated (the first SETNX succeeded).
@@ -333,8 +331,18 @@ class TestFlushTelemetryInvalidation:
         # `from .services.interactions import invalidate_user_vectors_cache`
         # INSIDE the function (deferred to avoid a top-level circular
         # import between tasks.py and services/interactions.py).
-        with patch.object(tasks, 'cache') as fake_cache:
-            fake_cache.client.get_client.return_value = fake_client
+        #
+        # The stream client is patched at `redis.from_url`, NOT at
+        # `tasks.cache`. flush_telemetry_stream builds its own redis-py
+        # client (tasks.py, inside the function body) rather than using
+        # django_redis's pooled one, because that pool survives Celery's
+        # prefork and can hand back a broken socket on xreadgroup.
+        # Patching `tasks.cache` therefore had no effect at all: the task
+        # dialled the REAL Redis, found the stream empty, and returned
+        # "No events to flush." before reaching bulk_create — so every
+        # assertion below was vacuous, and each run also left a stray
+        # `cg:telemetry-flush` consumer group on the live instance.
+        with patch('redis.from_url', return_value=fake_client):
             with patch(
                 'backend.app.services.interactions.invalidate_user_vectors_cache',
                 side_effect=ConnectionError('cache down'),

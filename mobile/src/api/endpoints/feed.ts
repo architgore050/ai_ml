@@ -1,5 +1,14 @@
+import { z } from 'zod';
+
 import { apiFetch } from '../client';
-import { feedClipSchema, parseFeedResponse, playbackTokenSchema, type FeedResponse, type PlaybackToken } from '../schema';
+import {
+  feedClipSchema,
+  parseFeedResponse,
+  playbackTokenSchema,
+  type FeedClip,
+  type FeedResponse,
+  type PlaybackToken,
+} from '../schema';
 
 /**
  * Feed + playback-token endpoints. Thin and typed, mirroring
@@ -46,24 +55,59 @@ export async function getFeedPage(): Promise<FeedResponse> {
  * near-miss ("Lo-Fi" vs "Lo-Fi Beats") is a silently EMPTY result set rather
  * than an error. Use the values from `src/design/categories.ts` verbatim.
  *
+ * `all` is the one exception and is now honoured as "unfiltered" server-side
+ * (`SuggestionViewSet.get_queryset`). It used to be matched literally against
+ * a free-text column, so it matched nothing — which is why this caller
+ * previously hardcoded `music` as a workaround and a cold start could only
+ * ever show one category.
+ *
  * The backend's docstring for this viewset still says `/suggestions/explore/`;
  * that route does not exist. The registered route is the flat
  * `/suggestions/` (urls.py), which is what this calls.
+ *
+ * Results are **validated**, not cast. The old signature returned
+ * `clips: unknown[]` and the caller did `rows as FeedClip[]`, so a drifted
+ * serializer surfaced as an undefined-property crash inside `ReelCard` — and
+ * a row with no `id` became an `undefined` `keyExtractor`, which corrupts
+ * VirtualizedList cell reuse rather than failing loudly.
  */
 export async function getSuggestions(
   category?: string,
   cursor?: string | null,
-): Promise<{ clips: unknown[]; next: string | null }> {
+): Promise<{ clips: FeedClip[]; next: string | null }> {
   const params = new URLSearchParams();
   if (category) params.set('category', category);
   if (cursor) params.set('cursor', cursor);
   const query = params.toString();
   const raw = await apiFetch(`/suggestions/${query ? `?${query}` : ''}`);
-  const parsed = raw as { results?: unknown[]; next?: string | null };
-  return {
-    clips: Array.isArray(parsed.results) ? parsed.results : [],
-    next: parsed.next ?? null,
-  };
+  const parsed = z
+    .object({
+      results: z.array(feedClipSchema).default([]),
+      // DRF's CursorPagination returns an ABSOLUTE url here, not an opaque
+      // cursor. Handing the whole url back as `?cursor=` makes
+      // `decode_cursor` base64-decode the url characters into garbage and
+      // raise InvalidCursor (400), so extract the query parameter.
+      next: z.string().nullable().default(null),
+    })
+    .parse(raw);
+  return { clips: parsed.results, next: cursorFromNextUrl(parsed.next) };
+}
+
+/**
+ * Pull the opaque `cursor` out of DRF's absolute `next` url.
+ *
+ * Returns `null` for anything that is not a parseable url with a cursor, so a
+ * pagination bug degrades to "one page" instead of a 400 on the next call.
+ */
+export function cursorFromNextUrl(next: string | null | undefined): string | null {
+  if (!next) return null;
+  try {
+    return new URL(next).searchParams.get('cursor');
+  } catch {
+    // A bare cursor rather than a full url is also accepted, so the helper is
+    // not the thing that breaks if DRF ever changes its shape.
+    return next.includes('cursor=') ? (next.split('cursor=')[1] ?? null) : null;
+  }
 }
 
 /** Re-validate a single clip's feed shape (used after a 409 clears to ready). */

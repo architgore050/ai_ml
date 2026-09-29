@@ -28,6 +28,7 @@ backend/media/
 mobile/package-lock.json
 frontend/package-lock.json
 backend/scratch/scraper_logs
+mobile/coverage/
 #frontend/sample_frontend/.env
 
 # Docker specific

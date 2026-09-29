@@ -4,6 +4,8 @@ import { PlayerProvider } from "./stores/player";
 import { Header } from "./components/common/Header";
 import { BottomNav } from "./components/navigation/BottomNav";
 import { NetworkBanner } from "./components/common/NetworkBanner";
+import { ErrorBoundary } from "./components/common/ErrorBoundary";
+import { SessionNotice, useSessionAnnouncer } from "./components/common/SessionAnnouncer";
 import { MiniPlayer } from "./components/feed/MiniPlayer";
 import { OnboardingModal } from "./components/feed/OnboardingModal";
 import { FeedPage } from "./pages/Feed";
@@ -126,12 +128,34 @@ const MainContent: React.FC = () => {
   );
 };
 
+/**
+ * Gate between the authenticated app and the login page.
+ *
+ * The session notice lives here rather than inside `MainContent` because
+ * session expiry is the event that *causes* `MainContent` to render
+ * `LoginPage` — a notice rendered inside the authenticated tree would be torn
+ * down by the very transition it needs to explain.
+ */
+const AuthenticatedApp: React.FC = () => {
+  const { message, dismiss } = useSessionAnnouncer();
+  const { isAuthenticated } = useAuth();
+
+  return (
+    <>
+      <SessionNotice message={message} onDismiss={dismiss} />
+      {isAuthenticated ? <MainContent /> : <LoginPage />}
+    </>
+  );
+};
+
 export default function App() {
   return (
-    <AuthProvider>
-      <PlayerProvider>
-        <MainContent />
-      </PlayerProvider>
-    </AuthProvider>
+    <ErrorBoundary>
+      <AuthProvider>
+        <PlayerProvider>
+          <AuthenticatedApp />
+        </PlayerProvider>
+      </AuthProvider>
+    </ErrorBoundary>
   );
 }

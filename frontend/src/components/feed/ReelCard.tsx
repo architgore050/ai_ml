@@ -104,7 +104,7 @@ export const ReelCard: React.FC<ReelCardProps> = ({
     e.stopPropagation();
     const speeds = [1, 1.25, 1.5, 2];
     const nextIndex = (speeds.indexOf(playbackRate) + 1) % speeds.length;
-    setRate(speeds[nextIndex]);
+    setRate(speeds[nextIndex] ?? 1);
   };
 
   const formatTime = (sec: number) => {

@@ -338,14 +338,16 @@ export const PlayerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     const currentIndex = queue.findIndex((c) => c.id === currentClip.id);
     const nextIndex = (currentIndex + 1) % queue.length;
-    playClip(queue[nextIndex]);
+    const next = queue[nextIndex];
+    if (next) playClip(next);
   };
 
   const prevClip = () => {
     if (!currentClip || queue.length === 0) return;
     const currentIndex = queue.findIndex((c) => c.id === currentClip.id);
     const prevIndex = (currentIndex - 1 + queue.length) % queue.length;
-    playClip(queue[prevIndex]);
+    const prev = queue[prevIndex];
+    if (prev) playClip(prev);
   };
 
   const setRate = (rate: number) => {

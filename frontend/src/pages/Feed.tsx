@@ -56,8 +56,9 @@ export const FeedPage: React.FC<FeedPageProps> = ({ onOpenCreatorProfile, onOpen
       setQueue(data.results);
 
       // Auto-play the first reel if none playing
-      if (data.results.length > 0 && !currentClip) {
-        playClip(data.results[0], data.results);
+      const firstClip = data.results[0];
+      if (firstClip && !currentClip) {
+        playClip(firstClip, data.results);
       }
     } catch (err: any) {
       setErrorMsg(err?.message || "Failed to load audio feed");

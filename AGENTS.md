@@ -440,14 +440,39 @@ POST /webhooks/revenuecat/    # Webhook endpoint (Phase 2 — HMAC verified when
 - **HLS output**: Stored under `media/hls/{clip_id}/` on local disk. Not S3-backed yet. `cleanup_orphan_hls` Celery task (daily 03:00 UTC) prunes directories older than 1 day that are not in the `AudioClip` table — bounded to 1000 keys/run.
 
 ## Scraping / Ingestion
+> **⚠ BROKEN as of 2026-09-29 — both entry points fail at import.** `5c9c2d6 "removed scraper"`
+> deleted the license helpers from `ai_ml/scrapers/base.py` (`normalize_license`,
+> `license_features`, `license_allows_commercial`, `is_noncommercial_license`,
+> `is_share_alike_license`, `resolve_podcast_rss` — 0 definitions remain anywhere in
+> the tree) but both callers below still import them from that module, so neither
+> will start. The commands are kept here for reference; see the "Session Learnings"
+> entry for 2026-09-29. Restoring the helpers or finishing the removal is a
+> **product decision that has not been made**.
+
 ```bash
-# Management command
+# Management command  (currently ImportError — see warning above)
 python manage.py scrape_audio --source=wikimedia --limit=3 --clip-length=30
 
-# Celery task
+# Celery task  (currently ImportError — see warning above)
 python -c "from backend.app.tasks import scrape_and_import; scrape_and_import.delay('internet_archive', limit=5)"
 ```
-Sources: wikimedia, internet_archive, freesound (needs `FREESOUND_API_KEY`), kaggle (needs `SCRAPER_KAGGLE_LOCAL_PATH`). Respects `robots.txt`. Allowed licenses configurable via `SCRAPER_ALLOW_LICENSES`. Source connectors live in `ai_ml/scrapers/sources/`; the `scrape_audio` management command + `scrape_and_import` Celery task remain in `backend/app/`.
+Sources that still exist: wikimedia, internet_archive, freesound (needs `FREESOUND_API_KEY`), kaggle (needs `SCRAPER_KAGGLE_LOCAL_PATH`). Respects `robots.txt`. Source connectors live in `ai_ml/scrapers/sources/`. **The A3 licensing gate is unaffected** — `views/feed.py` and `services/entitlements.py::is_license_restricted` read the DB columns `is_noncommercial`/`requires_share_alike`, not the missing helpers. Only the scraper's ability to *classify* a license is gone.
+
+### Seeding media for local development
+The scraper being broken does not block local media work. `backend/scripts/seed_clips.py`
+seeds real audio through the genuine upload path (`POST /clips/` →
+`POST /clips/{id}/approve-moderation/` → `process_audio_to_hls`), one clip at a time:
+```bash
+python3 backend/scripts/seed_clips.py --dry-run   # validate the manifest, upload nothing
+python3 backend/scripts/seed_clips.py             # upload + approve + wait for ready
+python3 backend/scripts/seed_clips.py --resume    # skip already-uploaded tracks
+```
+Then trigger a feed refill so the new clips reach `GET /feed/`:
+```bash
+docker compose -f docker-compose.local.yml --env-file .env.local \
+  exec celery_feed_local python -c "from backend.app.tasks import refill_user_feed; print(refill_user_feed(<user_id>))"
+```
+`GET /feed/` is a **destructive `lpop`**, so each call drains up to 10 ids; re-run the refill after you have consumed the queue.
 
 ## Frontend (sample only)
 ```bash
@@ -584,15 +609,17 @@ REVENUECAT_SYNC_INTERVAL_MINUTES=360    # 6 hours
 
 ## Testing & Linting
 - Test framework: **pytest** + `pytest-django`, installed in the `api` image. Run via `docker compose exec web pytest …` — see [Running Tests](#running-tests) for the full command set.
-- Test files live under `backend/app/tests/` (24 files: `test_adversarial_pass3.py`, `test_auth_regulatory.py`, `test_counter_store.py`, `test_db_router.py`, `test_feed_pool.py`, `test_hls_token.py`, `test_https_termination.py`, `test_integration_concurrency.py`, `test_integration_pgvector.py`, `test_metrics_endpoint.py`, `test_metrics.py`, `test_observability_tui.py`, `test_orphan_cleanup.py`, `test_scraper.py`, `test_security_and_validation.py`, `test_sentry.py`, `test_services_comments.py`, `test_services_follows.py`, `test_services_interactions.py`, `test_services_shares.py`, `test_services_uploads.py`, `test_settings.py`, `test_smoke.py`, `test_system_health.py`, `test_task_publisher.py`).
+- Test files live under `backend/app/tests/` (34 files: `test_adversarial_pass3.py`, `test_auth_regulatory.py`, `test_content_moderation.py`, `test_counter_store.py`, `test_db_router.py`, `test_erasure.py`, `test_feed_license_filter.py`, `test_feed_pool.py`, `test_group_c.py`, `test_hls_token.py`, `test_https_termination.py`, `test_integration_concurrency.py`, `test_integration_pgvector.py`, `test_metrics_endpoint.py`, `test_metrics.py`, `test_mobile_contract.py`, `test_observability_tui.py`, `test_orphan_cleanup.py`, `test_redis_url_precedence.py`, `test_reports.py`, `test_revenuecat.py`, `test_security_and_validation.py`, `test_sentry.py`, `test_services_comments.py`, `test_services_follows.py`, `test_services_interactions.py`, `test_services_shares.py`, `test_services_uploads.py`, `test_settings.py`, `test_share_pipeline.py`, `test_smoke.py`, `test_system_health.py`, `test_task_publisher.py`, `test_throttling.py`). The 8 `test_scraper*` files were deleted 2026-09-29 as orphaned — see the count note below.
 - All tests run against PostgreSQL in Docker. No SQLite fallback.
 - No linting/formatter config (no `.eslintrc` at root, no `pyproject.toml`, no `ruff.toml`).
 - CI: `.github/workflows/django.yml` runs migrations + the test suite via Docker. Blocks merges on failure.
-- **Current count (2026-09-28): 357 passed, 38 failed, 6 skipped.** Measured on the local stack; treat the number as approximate — the failing set drifts between runs (see below).
+- **Current count (2026-09-29): 554 passed, 3 failed, 6 skipped.** Measured on the local stack. No `--ignore` flags are needed any more (the 4 collection-error modules were deleted 2026-09-29; see below).
   - **6 skipped** = 6 live-nginx-environmental (`TestLiveNginxTerminator` and friends need the full `docker compose up` stack, not the local one).
-  - **38 failed** are pre-existing and unrelated to any recent change: 30+ in `test_scraper_sources.py` / `test_scraper_youtube.py` (network/API-key dependent), 4 in `test_task_publisher.py` and 1 in `test_feed_license_filter.py`. None are in the files a given change touches — **check the failing set against your diff rather than trusting the total.**
-  - **4 modules fail to *collect*** and must be excluded with `--ignore`: `test_scraper.py`, `test_scraper_license_helpers.py`, `test_scraper_state.py`, `test_scraper_state_segments.py` — all import `ai_ml.scrapers.state`, deleted in `5c9c2d6 "removed scraper"` while `scrape_audio.py` and the tests still import it.
-  - **A further ~4 failures are flaky** under a contended stack: `test_counter_store` / `test_revenuecat` / `test_services_interactions` share Redis state and pass in isolation. Compare failure **sets** across >=2 runs against a stashed baseline; a single run proves nothing about regressions.
+  - **3 failed**, all in `test_task_publisher.py::TestFlushTelemetryInvalidation`. These are **deterministic, not flaky** — they fail identically in isolation and in the full suite, so the "~4 flaky failures" note that used to live here was wrong. They are **pre-existing and not root-caused**; the test patches `tasks.cache` and then asserts against the real `django.core.cache` object, so it asserts state the patched code path does not own. Left alone deliberately: the behaviour under test (A3 cache invalidation after `flush_telemetry_stream`) is live and real, so deleting the test would drop a genuine guard. **Do not delete it — fix the patch target when someone picks it up.**
+  - The previous count was **37 failed**, and AGENTS.md described them as "network/API-key dependent". **That was wrong** — none of them touched the network. They were orphaned tests left behind by `5c9c2d6 "removed scraper"`, which deleted 10 files / 407 lines including all of `ai_ml/scrapers/sources/` but touched **0** test files. The tests asserted against modules that no longer existed (`musopen`, `openverse`, `librivox`, `pixabay`, `podcast_index`, `bbc_sound_effects`, `free_music_archive`, `loc_national_jukebox`, `usgov_audio`, `youtube`, `youtube_shorts`, `state`, and the symbols `downloader.DownloadError` / `download_with_retries` / `normalizer.split_into_segments` / `uploader.save_clip_segments`). 8 test files were deleted 2026-09-29 on that basis; `test_feed_license_filter.py` was **repaired** instead of deleted because it guards a live security property.
+  - **⚠ The same removal broke production code, not just tests.** `ai_ml/scrapers/base.py` no longer defines `normalize_license`, `license_features`, `license_allows_commercial`, `is_noncommercial_license`, `is_share_alike_license` or `resolve_podcast_rss` (0 definitions anywhere in the tree), yet both `backend/app/management/commands/scrape_audio.py:39` and `backend/app/tasks.py:925` (`scrape_and_import`) still import them from `ai_ml.scrapers.base`. **`scrape_audio` therefore fails at import time** — the documented scraping entry point in this file is dead until the license helpers are restored or the scraper is deleted properly. `scrape_audio.py` additionally calls `downloader.download_with_retries` (:441), `uploader.save_clip_segments` (:450) and catches `downloader.DownloadError` (:500), none of which exist any more.
+  - The **A3 licensing gate is unaffected** and still enforced: `views/feed.py` and `services/entitlements.py::is_license_restricted` read the DB columns `is_noncommercial` / `requires_share_alike`, not the missing scraper helpers. Only the scraper's ability to *classify* a license is broken. Mobile Phase 2 does not touch the scraper.
+  - Still worth the discipline: compare failure **sets** across >=2 runs against a stashed baseline rather than trusting a total. Verified 2026-09-29: two consecutive runs produced byte-identical failure sets, so the numbers above are stable.
 - **Root cause of 178 `auth_group does not exist` errors:** The old conftest.py used a SQLite override hack that bypassed real migrations. The fix was to make Docker/Postgres the only test environment. The new `conftest.py` auto-creates `echoflow_test` DB, installs pgvector on `template1`, and handles session teardown.
 - **docker-compose.test.yml** — test-only stack (db, redis, minio, web). No nginx, no celery workers. Run with: `docker compose -f docker-compose.yml -f docker-compose.test.yml up --build -d` then `docker compose exec -e PYTHONPATH=/app web pytest backend/app/tests/ --tb=short`.
 - **Recent fixes (2026-09-07):**
@@ -677,7 +704,9 @@ Keep entries concise. Link to docs instead of inlining long explanations.
   - **Web:** read nothing from the body. The cookie is HttpOnly and the browser attaches it to every `/hls/*` request.
   - **Native (React Native / Expo):** send the header. AVPlayer does not read `NSHTTPCookieStorage` and ExoPlayer's `DefaultHttpDataSource` sends no `Cookie` header, so neither shares state with the app's HTTP client — and the cookie is `HttpOnly`+`Secure`, so the app cannot read it back to attach it manually. Attach the token via the player's per-source `headers` (expo-audio applies them to the manifest *and* every segment). See `docs/EXPLAIN/decisions/2026-09-28-native-media-auth-and-cgnat-throttling.md`.
   - The body token is **opt-in** and the default body is unchanged, because `HttpOnly` exists to stop script from reading a bearer credential. Both transports carry the same HMAC string; signature, `exp` and per-clip scope are enforced identically.
+  - **Cookie-first precedence will fool you when testing with `requests`.** `playback-token` sets `ef_hls_token` with `path=/hls/`, so a `requests.Session` that has *ever* minted a token will silently attach the cookie to `/hls/*` and a "no token" probe returns **200/206, not 403**. That is the cookie working, not a bypass. To test the header transport, `session.cookies.clear()` first, or use a fresh session. Verified 2026-09-29: 403 (no credential) → 206 (cookie) → 403 (cleared) → 200 (header only).
 - **Bind-mounted source ≠ reloaded process**: the local stack bind-mounts the repo at `/app`, so a Python edit is on disk instantly — but gunicorn imported the module at startup and does not re-read it. Editing a view then curling the running stack exercises the OLD code, while pytest (fresh import) passes and `grep` in the container shows the new code. **Restart `web_local` before trusting any curl against a Python change.** `wrangler dev` does not have this problem.
+- **…and the three workers do not even see the edit** (2026-09-29): `celery_media_local` / `celery_feed_local` / `celery_beat_local` have **no `/app` bind mount at all** — they run the image baked at build time, so a `backend/` fix needs `docker build` or a `docker cp` **plus a restart** (the prefork parent holds the old bytecode; copying the file while it runs changes nothing). `web_local` and `celery_local` are bind-mounted and only need a restart. Check `docker inspect <svc> --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' | grep /app` before assuming an edit took effect.
 - **A stale `REDIS_BROKER_URL` in `.env.local` silently wins over compose's `REDIS_BROKER_HOST` (fixed 2026-09-29)**: the assignment was `os.getenv("REDIS_BROKER_URL", build_redis_url("REDIS_BROKER"))`, so an old URL in the env file beat the service name compose had just set — defeating the HOST/PORT split that exists *because* base64 Redis passwords break Kombo URL parsing. Symptom is nasty and misdiagnosable: the local stack publishes to a broker owned by the **other** compose project, two independent codebases race for the same `celery` queue, and a brand-new task dies with `NotRegistered` about half the time (measured **2/6**). It looks like "Celery never runs my task". `resolve_redis_url()` now prefers `{prefix}_HOST`; all three `.env.*.example` templates set exactly one form, so none of them change. If a new task mysteriously never fires, check this first.
 - **A stale `django-redis` connection 500s, it does not 503**: `ConnectionInterrupted` out of the throttle check turns `POST /auth/login/` into a 500 debug page. Transient, clears on retry — re-run before investigating.
 - **Never construct a media URL client-side**: use `hls_playlist_url` verbatim. Do not prefix the API base onto it — the HLS origin is the edge (`PUBLIC_HLS_ENDPOINT_URL`), often a different host and port from the API, and in `edge` style it is bucket-less. Both existing frontends did this and it is wrong; see `docs/FRONTEND-REQUIREMENTS.md` §4.7.
@@ -806,6 +835,25 @@ Durable, repo-specific knowledge. Append a concise entry at the end of each sess
 - **No phone dev loop.** `PUBLIC_HLS_ENDPOINT_URL` is hardcoded to `localhost:19443` (a phone's `localhost` is the phone) and `docker/certs/localhost.crt` does not cover a LAN IP. Cert setup is manual per owner decision; runbook section not yet written.
 - Suite flakiness: `test_counter_store` / `test_revenuecat` / `test_services_interactions` fail non-deterministically under a contended stack and pass in isolation. Compare failure **sets** across >=2 runs vs a stashed baseline; a single run proves nothing.
 - Mobile app itself is **not started** — the rewrite plan is `docs/mobile-rebuild-plan.md` §8-17. Backend items still blocking feature parity are tabulated in §17.
+
+---
+
+### 2026-09-29 — mobile Phase 2: real-media seed + four latent bugs
+**Learned:**
+- **`celery_media_local`, `celery_feed_local` and `celery_beat_local` run a BAKED image with no `/app` bind mount** (only `web_local` and `celery_local` bind-mount the repo). Any `backend/` edit is invisible to them until a rebuild or a `docker cp`. This is the same trap as the existing "bind-mounted source ≠ reloaded process" note, one level worse: not a stale process, a stale *image*.
+- **A stale `REDIS_BROKER_URL` in `.env.local` (172.28.0.x) beat compose's `REDIS_BROKER_HOST`** because those three workers predate the 2026-09-29 `resolve_redis_url` fix. They published Celery tasks to a dead broker while `web_local` published to the live one — so uploads enqueued and then nothing ran. The 2026-09-29 fix is correct; it just had not reached the baked images. Fix: delete `REDIS_BROKER_URL` / `REDIS_CACHE_URL` from `.env.local` and let HOST/PORT win.
+- **Orphan containers from another project can silently consume your queue.** `echoflow_revnuecat-prod-celery_media-1` was up 23h on `-Q heavy_media` against the same broker, stealing every `process_audio_to_hls` task. It presented as "the worker receives 0 tasks". Check `docker ps -a | grep -v <your project>` and decode a `LINDEX` of the queue to see whose clip IDs are in there.
+- **`from ..services` in `backend/app/tasks.py` killed EVERY HLS encode** at the moderation step (`ModuleNotFoundError: backend.services`). `tasks.py` is at `backend/app/`, so it needs `.services`; only files a level deeper use `..services`. Nothing had HLS'd successfully before this.
+
+**Changed:**
+- `backend/app/tasks.py` (import), `backend/app/views/content.py` + `backend/EchoFlow/settings.py` + `backend/app/tests/test_throttling.py` (throttle scopes), `backend/scripts/seed_clips.py` (new), `docker-compose.local.yml` (media worker concurrency 2→1), 8 deleted orphaned `test_scraper*` files, `backend/app/tests/test_feed_license_filter.py` (repaired).
+- Commits: `7e39e52` (import), `936de67` (throttle scopes), `6b3da27` (seed + compose).
+- Decision: `docs/EXPLAIN/decisions/2026-09-29-clip-throttle-scopes.md`.
+
+**Open:**
+- **`scrape_audio` and the `scrape_and_import` task are dead at import time** — both import license helpers that no longer exist in `ai_ml/scrapers/base.py`. Not touched by mobile Phase 2; needs a decision (restore helpers or delete the scraper properly).
+- `test_task_publisher.py::TestFlushTelemetryInvalidation` (3) still fails deterministically, not root-caused.
+- Media worker image still needs a rebuild for the `tasks.py` import fix to be permanent; currently `docker cp`'d in.
 
 ---
 

@@ -56,9 +56,25 @@ class FeedLicenseFilterTests(TestCase):
     def test_fallback_excludes_nc_and_sa(self):
         # When Redis is empty / errors, the feed falls back to a trending
         # query. Force the primary path to fail by mocking Redis to raise.
+        #
+        # FIX (2026-09-29): this patched `feed_view.redis_client`, a
+        # module-level name that no longer exists. `FastFeedViewSet.list`
+        # now acquires the client *inside* the request
+        # (`redis_client = cache.client.get_client()`, feed.py:74), so the
+        # patch was silently a no-op and the test exercised the happy path —
+        # it asserted the fallback's NC/SA exclusion without ever reaching the
+        # fallback.
+        #
+        # The replacement patches the module-level NAME `cache` in feed.py,
+        # not the shared cache object. Patching the object
+        # (`feed_view.cache.client.get_client`) also breaks DRF's throttle,
+        # which reads the same cache in `initial()` — i.e. before the view
+        # body and therefore before the try/except that produces the
+        # fallback — so the error escapes as a 500 instead. Rebinding the name
+        # scopes the fault to feed.py only.
         from backend.app.views import feed as feed_view
-        with patch.object(feed_view, 'redis_client') as rc:
-            rc.llen.side_effect = Exception('redis down')
+        with patch.object(feed_view, 'cache') as fake_cache:
+            fake_cache.client.get_client.side_effect = Exception('redis down')
             resp = self.client.get(self.url)
         self.assertEqual(resp.status_code, 200)
         ids = {r['id'] for r in resp.data['results']}

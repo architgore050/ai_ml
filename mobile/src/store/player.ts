@@ -63,8 +63,21 @@ export type PlaybackStatus =
   | 'playing'
   | 'paused'
   | 'processing'
+  /**
+   * `unavailable` is ONE state for both 403 causes — unmoderated and
+   * licence-restricted. The server sends two different messages; distinguishing
+   * them would leak moderation or licensing state to a caller holding only a
+   * UUID, so `classifyTokenError` collapses them and this must stay collapsed.
+   */
   | 'unavailable'
+  /** 404: the clip does not exist. Same copy as `unavailable` by choice. */
   | 'gone'
+  /**
+   * 401: the session died, so `onSessionExpired` is already navigating to
+   * login. Kept distinct from `error` so the card says "sign in again"
+   * instead of a false "could not play this clip".
+   */
+  | 'auth-required'
   | 'error';
 
 export type PlayerState = {

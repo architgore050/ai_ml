@@ -122,8 +122,11 @@ export const feedOkSchema = handRolledSchema(feedClipSchema).extend({
 });
 
 /**
- * 202 cold-start. `retry_after_ms` is a *server hint* (1500ms default) — the
+ * 202 cold-start marker. `retry_after_ms` is a *server hint* (1500ms) — the
  * client must honour it rather than inventing its own backoff.
+ *
+ * Kept as a single definition; it was previously duplicated as
+ * `feedDegradedSchema` (byte-identical, referenced only by its own test).
  * @see docs/FRONTEND-REQUIREMENTS.md §4.8
  */
 export const feedDegradedSchema = z.object({
@@ -139,9 +142,7 @@ export type FeedDegraded = z.infer<typeof feedDegradedSchema>;
  * WHY THIS UNION EXISTS: `apiFetch` returns the parsed body and throws on
  * non-2xx, so **the HTTP status is not available to the caller** — 200 and 202
  * are both "success" by that contract. The two are told apart by their SHAPE
- * instead: a 202 has no `results` array (it carries `retry_after_ms` and
- * nothing to render), while a 200 always does. `parseFeedResponse` does that
- * discrimination in one place so no caller has to re-derive it.
+ * instead, in `parseFeedResponse`, so no caller has to re-derive it.
  *
  * The alternative — teaching `apiFetch` to surface `status` — would change
  * every existing call site's return type for the benefit of one endpoint, so
@@ -160,26 +161,49 @@ export type FeedResponse =
 /**
  * Parse a `GET /feed/` body into a discriminated result.
  *
- * `queue_health` is how full the user's Redis queue was *before* this page was
- * popped. A low value plus a short `results` array is the signal to refill.
+ * The discriminator is the **presence of `retry_after_ms`**, and it has to be.
+ *
+ * The previous version gated the cold branch on the *absence* of `results`,
+ * on the documented belief that "a 202 carries no results at all". That is
+ * false. `views/feed.py:92-100` returns:
+ *
+ *     {"results": [], "message": "Preparing your feed...",
+ *      "retry_after_ms": 1500, "degraded": true}
+ *
+ * `results: []` is present, so `Array.isArray([])` is true, the cold branch
+ * was skipped entirely, and the body parsed as a normal *empty* 200 page.
+ * Verified by running the real body through the old code:
+ *
+ *     REAL 202  -> {"kind":"ok","clips":[],"queueHealth":0,"degraded":true}
+ *
+ * Every downstream consequence was live and silent:
+ *   - `retry_after_ms` was never read, so the server's cool-down hint was
+ *     never honoured (the entire point of the 202);
+ *   - `coolingDown` never became true, so the "finding more for you" state was
+ *     unreachable;
+ *   - a brand-new user's personalised feed never arrived — the first cold
+ *     load set zero clips and nothing ever re-requested, dropping them onto
+ *     the cold-start fallback for the whole session;
+ *   - once the buffer sat between 1 and 14 clips, the refill effect re-armed
+ *     on every `loading` toggle with no delay: a tight `lpop` loop against a
+ *     drained queue, each iteration publishing another `refill_user_feed`
+ *     Celery task.
+ *
+ * `retry_after_ms` is the correct discriminator because it is **unique to the
+ * 202**: neither the primary 200 (`views/feed.py:123-127`) nor the degraded
+ * trending 200 (`views/feed.py:148-153`) sets it. `degraded` alone is
+ * ambiguous — both 200 fallbacks set it — and `results` is not a discriminator
+ * at all, since an empty `results` is legal in both.
+ *
+ * A malformed body has neither `retry_after_ms` nor `results`, so it falls
+ * through to the strict 200 parse and throws. A 500 never reaches here at all
+ * (`apiFetch` throws `ApiError` on non-2xx), so a DRF error body is not
+ * misread as a cold start.
  */
 export function parseFeedResponse(raw: unknown): FeedResponse {
-  // Discriminate by SHAPE, since `apiFetch` discards the status (200 and 202
-  // are both "success" to it).
-  //
-  // A 202 carries no `results` at all. That test alone is too lenient: the
-  // degraded marker's fields are all optional, so a *malformed* body would
-  // also lack `results` and be silently reported as a cold start — producing
-  // an empty feed with no error, which is exactly the silent failure plan D5
-  // is about. So require evidence of an actual 202 (the server's hint, or the
-  // degraded flag) before accepting it; otherwise fall through to the strict
-  // 200 parse, which throws on a shape it does not recognise.
-  const hasResults = Array.isArray((raw as { results?: unknown })?.results);
-  if (!hasResults) {
-    const cold = feedDegradedMarkerSchema.safeParse(raw);
-    if (cold.success && (cold.data.retry_after_ms != null || cold.data.degraded != null)) {
-      return { kind: 'cold', retryAfterMs: cold.data.retry_after_ms ?? 1500 };
-    }
+  const cold = feedDegradedMarkerSchema.safeParse(raw);
+  if (cold.success && cold.data.retry_after_ms != null) {
+    return { kind: 'cold', retryAfterMs: cold.data.retry_after_ms };
   }
 
   const ok = feedOkSchema.parse(raw);
@@ -187,6 +211,7 @@ export function parseFeedResponse(raw: unknown): FeedResponse {
     kind: 'ok',
     clips: ok.results,
     queueHealth: ok.queue_health ?? 0,
+
     degraded: ok.degraded,
   };
 }

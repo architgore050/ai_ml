@@ -37,18 +37,33 @@ describe('parseFeedResponse', () => {
     }
   });
 
-  it('reads a 202 cold-start and surfaces the server hint', () => {
-    const result = parseFeedResponse({ retry_after_ms: 1500, degraded: true });
+  it('reads a 202 cold-start from the REAL server body', () => {
+    // Verbatim from `views/feed.py:92-100`. The previous fixture was
+    // `{retry_after_ms, degraded}` with no `results` key — a shape the server
+    // never sends — so it passed against a parser that misread the real body as
+    // a normal empty 200. The `results: []` below is the whole point.
+    const result = parseFeedResponse({
+      results: [],
+      message: 'Preparing your feed...',
+      retry_after_ms: 1500,
+      degraded: true,
+    });
     expect(result).toEqual({ kind: 'cold', retryAfterMs: 1500 });
   });
 
-  it('falls back to the documented 1500ms when the hint is absent', () => {
-    // Do not invent your own backoff: the server's documented default is the
-    // floor, and a shorter client retry just burns requests.
-    expect(parseFeedResponse({ degraded: true })).toEqual({
-      kind: 'cold',
-      retryAfterMs: 1500,
+  it('does not treat a degraded 200 as a cold start', () => {
+    // `degraded` alone is ambiguous: BOTH 200 fallbacks set it
+    // (views/feed.py:148-153 trending, :123-127 primary with the flag echoed).
+    // Only `retry_after_ms` is unique to the 202, so it is the only safe
+    // discriminator. This is the test that pins the choice.
+    const result = parseFeedResponse({
+      next: 'auto_trigger',
+      queue_health: 0,
+      results: [clip('a')],
+      degraded: true,
     });
+    expect(result.kind).toBe('ok');
+    if (result.kind === 'ok') expect(result.clips).toHaveLength(1);
   });
 
   it('does not mistake an empty 200 page for a 202', () => {
@@ -58,6 +73,15 @@ describe('parseFeedResponse', () => {
     const result = parseFeedResponse({ next: 'auto_trigger', queue_health: 0, results: [] });
     expect(result.kind).toBe('ok');
     if (result.kind === 'ok') expect(result.clips).toHaveLength(0);
+  });
+
+  it('rejects a malformed body rather than reporting an empty feed', () => {
+    // A body with neither `results` nor `retry_after_ms` is not a cold start.
+    // The old parser accepted `{degraded: true}` alone as one, so a 500-shaped
+    // or truncated response became a silent empty feed with no error.
+    expect(() => parseFeedResponse({ detail: 'Server Error' })).toThrow();
+    expect(() => parseFeedResponse({})).toThrow();
+    expect(() => parseFeedResponse(null)).toThrow();
   });
 
   it('carries the degraded flag through so the UI can say so', () => {

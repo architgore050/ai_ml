@@ -7,7 +7,8 @@ import { NetworkBanner } from '../../src/components/NetworkBanner';
 import { useBackendStatus } from '../../src/hooks/useBackendStatus';
 import { useFeedBuffer, useSuggestionsFallback } from '../../src/hooks/useFeedBuffer';
 import { usePlaybackToken, usePrefetchPlaybackToken } from '../../src/hooks/usePlaybackToken';
-import { loadClip, msToSeconds, usePlayerStore } from '../../src/store/player';
+import { loadClip, msToSeconds, pause, usePlayerStore } from '../../src/store/player';
+import { decidePlaybackAction } from '../../src/lib/playbackDecision';
 import { categoryColor, categoryLabel } from '../../src/design/categories';
 import { spacing, surface } from '../../src/design/tokens';
 import { typography } from '../../src/design/typography';
@@ -43,10 +44,12 @@ export default function Screen() {
   const backend = useBackendStatus();
   const insets = useSafeAreaInsets();
   const feed = useFeedBuffer();
-  const fallback = useSuggestionsFallback('music', feed.clips.length === 0 && !feed.loading);
+  // `all` is now honoured server-side as "no category filter"; it used to be
+  // matched literally against a free-text column and matched nothing, which is
+  // why this hardcoded `music`. A cold start could only ever show one category.
+  const fallback = useSuggestionsFallback('all', feed.clips.length === 0 && !feed.loading);
 
   const clips = feed.clips.length > 0 ? feed.clips : fallback.clips;
-  const activeIndex = usePlayerStore((s) => s.activeIndex);
   const setActiveIndex = usePlayerStore((s) => s.setActiveIndex);
   const setStatus = usePlayerStore((s) => s.setStatus);
   const status = usePlayerStore((s) => s.status);
@@ -69,6 +72,7 @@ export default function Screen() {
     () => clips.findIndex((c) => c.id === activeClipId),
     [clips, activeClipId],
   );
+  const activeClip = activeIndexById >= 0 ? clips[activeIndexById] : undefined;
   const token = usePlaybackToken(activeClipId);
 
   // Prefetch the NEXT clip so a swipe does not stall on a token mint.
@@ -82,40 +86,76 @@ export default function Screen() {
     if (activeIndexById >= 0) setActiveIndex(activeIndexById);
   }, [activeIndexById, setActiveIndex]);
 
-  // Map the token lifecycle onto the player, with the generation guard so a
-  // slow load cannot win a race against a faster later one.
+  /**
+   * Map the token lifecycle onto the player.
+   *
+   * The *decision* lives in `lib/playbackDecision.ts` and is unit-tested; this
+   * effect only performs it. Two things are load-bearing about the dependency
+   * array and must not be "tidied":
+   *
+   *  - `clips` is NOT a dependency. The array identity changes on every
+   *    refill, so including it re-ran this effect and called `loadClip` again
+   *    for the clip already playing — restarting the audio under the user with
+   *    no visible cause. `activeClip` is read through a ref instead, so a
+   *    refill cannot retrigger a load.
+   *
+   *  - The generation is read at call time, and `loadClip` is synchronous, so
+   *    the "race guard" is really an ordering guarantee: the effect below
+   *    always issues loads in order, and a superseded timer is cleared by the
+   *    effect's own cleanup.
+   */
+  const activeClipRef = useRef<FeedClip | undefined>(undefined);
+  activeClipRef.current = activeClip;
+
   useEffect(() => {
-    if (token.status === 'processing') {
-      // HLS is not produced yet. Poll-ish: the card shows a spinner and the
-      // user swipes on. Retrying is the feed's job, not this effect's.
-      setStatus('processing');
-      return;
-    }
-    if (token.status === 'unavailable' || token.status === 'gone') {
-      setStatus('unavailable');
-      return;
-    }
-    if (token.status !== 'ready' || !activeClipId) {
-      setStatus(token.status === 'minting' ? 'minting' : 'idle');
-      return;
-    }
+    const clip = activeClipRef.current;
+    const action = decidePlaybackAction({
+      token,
+      activeClipId,
+      activeClipMissing: activeClipId !== null && !clip,
+      activeClipHasNoPlaylist: Boolean(activeClipId) && !clip?.hls_playlist_url,
+      sinceLastLoadMs: Date.now() - lastLoadAt.current,
+    });
 
-    const clip = clips.find((c) => c.id === activeClipId);
-    if (!clip) return;
+    switch (action.kind) {
+      case 'none':
+        return;
 
-    const now = Date.now();
-    const sinceLast = now - lastLoadAt.current;
-    if (sinceLast < INTER_REEL_PAUSE_MS) {
-      const timer = setTimeout(() => {
+      case 'show':
+        setStatus(action.status === 'idle' ? 'minting' : action.status);
+        return;
+
+      case 'stop':
+        // The 60-cap evicted the clip that was playing. Stop rather than leave
+        // audio running for a reel that is no longer on screen.
+        pause();
+        setStatus('idle');
+        return;
+
+      case 'load-after': {
+        // Stop the outgoing clip NOW. Deferring only the load leaves it
+        // audible for the full pause and then severs it mid-word on replace().
+        pause();
+        const clipForTimer = clip;
+        const timer = setTimeout(() => {
+          if (!clipForTimer) return;
+          lastLoadAt.current = Date.now();
+          void loadClip(clipForTimer, action.token, usePlayerStore.getState().loadGeneration);
+        }, action.waitMs);
+        return () => clearTimeout(timer);
+      }
+
+      case 'load': {
+        if (!clip) return;
         lastLoadAt.current = Date.now();
-        void loadClip(clip, token.token, usePlayerStore.getState().loadGeneration);
-      }, INTER_REEL_PAUSE_MS - sinceLast);
-      return () => clearTimeout(timer);
-    }
+        void loadClip(clip, action.token, usePlayerStore.getState().loadGeneration);
+        return;
+      }
 
-    lastLoadAt.current = now;
-    void loadClip(clip, token.token, usePlayerStore.getState().loadGeneration);
-  }, [token.status, 'token' in token ? token.token : null, activeClipId, clips, setStatus]);
+      default:
+        return;
+    }
+  }, [token, activeClipId, setStatus, pause]);
 
   const renderItem = useCallback(
     ({ item }: { item: FeedClip }) => (

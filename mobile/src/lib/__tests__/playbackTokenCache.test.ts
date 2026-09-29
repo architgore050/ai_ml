@@ -112,9 +112,15 @@ describe('playbackTokenCache', () => {
   });
 
   describe('error classification (plan §11 error mapping)', () => {
+    // Every classified state carries the clipId it describes. That is not
+    // decoration: `usePlaybackToken` is `useState`, so it lags its input by a
+    // render, and a consumer must be able to tell A's 403 from B's. See the
+    // `TokenState` docstring.
+
     it('409 means still encoding, not an error', () => {
-      expect(classifyTokenError(new ApiError({ status: 409, body: {} }))).toEqual({
+      expect(classifyTokenError(new ApiError({ status: 409, body: {} }), 'clip-a')).toEqual({
         status: 'processing',
+        clipId: 'clip-a',
       });
     });
 
@@ -125,25 +131,29 @@ describe('playbackTokenCache', () => {
       // about moderation or licensing.
       const moderation = classifyTokenError(
         new ApiError({ status: 403, body: { detail: 'Content not available.' } }),
+        'clip-a',
       );
       const licensing = classifyTokenError(
         new ApiError({ status: 403, body: { detail: 'Clip not available.' } }),
+        'clip-a',
       );
-      expect(moderation).toEqual({ status: 'unavailable' });
+      expect(moderation).toEqual({ status: 'unavailable', clipId: 'clip-a' });
       expect(licensing).toEqual(moderation);
       expect(JSON.stringify(moderation)).not.toContain('Content');
       expect(JSON.stringify(moderation)).not.toContain('Clip');
     });
 
     it('404 is distinct from 403', () => {
-      expect(classifyTokenError(new ApiError({ status: 404, body: {} }))).toEqual({
+      expect(classifyTokenError(new ApiError({ status: 404, body: {} }), 'clip-a')).toEqual({
         status: 'gone',
+        clipId: 'clip-a',
       });
     });
 
     it('a non-HTTP failure is an error, not a tombstone', () => {
-      expect(classifyTokenError(new Error('Network request failed'))).toEqual({
+      expect(classifyTokenError(new Error('Network request failed'), 'clip-a')).toEqual({
         status: 'error',
+        clipId: 'clip-a',
         message: 'Network request failed',
       });
     });

@@ -34,32 +34,73 @@ const cache = new Map<string, CachedToken>();
 /** De-duplicates concurrent mints of one clip. */
 const inflight = new Map<string, Promise<CachedToken>>();
 
+/**
+ * Which clip a state describes.
+ *
+ * Carried on EVERY variant, not just `ready`, because the lag is not specific
+ * to tokens. `useState` lags its input by one render, so on the render where
+ * `clipId` moves A→B the hook still holds A's *whole* previous state — token,
+ * or 403, or 409. A consumer that branches on `status` alone would render A's
+ * error on B's card.
+ *
+ * `usePlaybackToken` resets the state to `{status:'minting', clipId:null}` for
+ * the superseded clip, and a consumer compares `clipId` before acting, so a
+ * stale read is a cheap no-op instead of a wrong-clip 403 or a wrong tombstone.
+ */
+type TokenState = { clipId: string | null };
+
 export type TokenStatus =
-  | { status: 'ready'; token: string }
-  | { status: 'minting' }
+  /**
+   * A usable token. `clipId` is the clip the token is FOR, not the clip the
+   * hook was called with. Tokens are per-clip scoped at the edge
+   * (`workers/hls-token-worker/src/token.ts` checks the requested path's clip
+   * prefix against the token's `c` claim), so a token presented for a
+   * different clip is rejected with 403 — on the manifest and every segment.
+   */
+  | ({ status: 'ready'; token: string } & TokenState)
+  | ({ status: 'minting' } & TokenState)
   /** HLS not produced yet — the clip is still encoding. Retry. */
-  | { status: 'processing' }
+  | ({ status: 'processing' } & TokenState)
   /** Unmoderated OR licence-restricted. ONE state for both: the server sends two
    *  different 403 messages, and telling them apart would leak moderation or
    *  licensing state to a caller who holds nothing but a UUID. */
-  | { status: 'unavailable' }
-  | { status: 'gone' }
-  | { status: 'error'; message: string };
+  | ({ status: 'unavailable' } & TokenState)
+  | ({ status: 'gone' } & TokenState)
+  /**
+   * `auth-required` is separate from a generic error because the two need
+   * different client actions: 401 means the session is dead and the app is
+   * already navigating to login via `onSessionExpired`, so the card should say
+   * "sign in again", not "could not play this clip". Folding it into `error`
+   * showed a false playback diagnosis for a screen before the redirect landed.
+   */
+  | ({ status: 'auth-required' } & TokenState)
+  | ({ status: 'error'; message: string } & TokenState);
 
 /** Map a thrown error onto the state the UI renders. */
-export function classifyTokenError(err: unknown): TokenStatus {
+export function classifyTokenError(err: unknown, clipId: string | null = null): TokenStatus {
   if (!(err instanceof ApiError)) {
-    return { status: 'error', message: err instanceof Error ? err.message : 'Unknown error' };
+    return {
+      status: 'error',
+      clipId,
+      message: err instanceof Error ? err.message : 'Unknown error',
+    };
   }
   switch (err.status) {
-    case 409:
-      return { status: 'processing' };
+    case 401:
+      return { status: 'auth-required', clipId };
     case 403:
-      return { status: 'unavailable' };
+      return { status: 'unavailable', clipId };
     case 404:
-      return { status: 'gone' };
+      return { status: 'gone', clipId };
+    case 409:
+      return { status: 'processing', clipId };
+    case 429:
+      // The token endpoint is throttled at 300/min. A fast scroller plus
+      // prefetching can reach it, and a 429 is retryable — so it must not be
+      // presented as a permanent per-clip failure.
+      return { status: 'error', clipId, message: 'Too many requests' };
     default:
-      return { status: 'error', message: err.message };
+      return { status: 'error', clipId, message: err.message };
   }
 }
 

@@ -16,16 +16,36 @@ import {
  * lives in `lib/playbackTokenCache.ts` so it is testable without a renderer.
  * This only manages the lifecycle: one in-flight resolution per clipId, and
  * dropping results from a superseded effect run.
+ *
+ * ## Why every state carries `clipId`
+ * `useState` does not update until the hook's own effect runs, which is AFTER
+ * the render commits. So on the render where `clipId` moves A→B, this hook
+ * still returns A's state. The feed screen's load effect is declared after
+ * this one and re-runs on the same commit, so it read `token.token` as
+ * **A's** token and called `loadClip(clipB, A_TOKEN)`.
+ *
+ * Tokens are per-clip scoped at the edge, so that 403s the manifest — on
+ * every single swipe, prefetched or not. The `cancelled` flag below prevents
+ * the *reverse* direction (a slow A mint landing after B's), but it cannot
+ * help the consumer, which already read the stale value synchronously.
+ *
+ * The fix is to make the staleness visible: `clipId` travels with the state,
+ * and `STALE` (clipId `null`) means "this describes nothing yet". A consumer
+ * that checks `clipId === activeClipId` is then structurally incapable of
+ * acting on a previous clip's token.
  */
 export function usePlaybackToken(
   clipId: string | null,
   enabled = true,
 ): TokenStatus & { refresh: () => void } {
-  const [state, setState] = useState<TokenStatus>({ status: 'minting' });
+  const [state, setState] = useState<TokenStatus>({ status: 'minting', clipId: null });
   const [nonce, setNonce] = useState(0);
 
   useEffect(() => {
-    if (!clipId || !enabled) return;
+    if (!clipId || !enabled) {
+      setState({ status: 'minting', clipId: null });
+      return;
+    }
 
     // A newer effect run (clipId / enabled / nonce changed) owns the state now.
     // Without this, a slow mint for a swiped-past reel lands after the new
@@ -34,17 +54,17 @@ export function usePlaybackToken(
 
     const cached = peekToken(clipId);
     if (cached) {
-      setState({ status: 'ready', token: cached.token });
+      if (!cancelled) setState({ status: 'ready', clipId, token: cached.token });
       return;
     }
 
-    setState({ status: 'minting' });
+    setState({ status: 'minting', clipId });
     getOrMintToken(clipId)
       .then((entry) => {
-        if (!cancelled) setState({ status: 'ready', token: entry.token });
+        if (!cancelled) setState({ status: 'ready', clipId, token: entry.token });
       })
       .catch((err: unknown) => {
-        if (!cancelled) setState(classifyTokenError(err));
+        if (!cancelled) setState(classifyTokenError(err, clipId));
       });
 
     return () => {

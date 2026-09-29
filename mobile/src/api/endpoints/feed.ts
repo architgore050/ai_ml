@@ -41,7 +41,11 @@ export const NATIVE_CLIENT_VALUE = 'native';
  * so the buffer grows monotonically instead.
  *
  * 200 → `{results, next:'auto_trigger', queue_health, degraded?}`
- * 202 → `{retry_after_ms}` (cold queue; no results)
+ * 202 → `{results: [], message, retry_after_ms, degraded: true}` (cold queue)
+ *
+ * Note the 202 body DOES carry `results: []` — see the `parseFeedResponse`
+ * docstring for why the discriminator has to be `retry_after_ms` and not the
+ * absence of results.
  */
 export async function getFeedPage(): Promise<FeedResponse> {
   const raw = await apiFetch('/feed/');

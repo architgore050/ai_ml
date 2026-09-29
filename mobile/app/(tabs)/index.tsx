@@ -1,14 +1,29 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FlatList, StyleSheet, Text, View, type ViewToken } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import {
+  FlatList,
+  StyleSheet,
+  Text,
+  View,
+  type LayoutChangeEvent,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
+  type ViewToken,
+} from 'react-native';
 
-import { Spinner } from '../../src/components/ui/Button';
+import { Button, Spinner } from '../../src/components/ui/Button';
 import { NetworkBanner } from '../../src/components/NetworkBanner';
 import { useBackendStatus } from '../../src/hooks/useBackendStatus';
 import { useFeedBuffer, useSuggestionsFallback } from '../../src/hooks/useFeedBuffer';
 import { usePlaybackToken, usePrefetchPlaybackToken } from '../../src/hooks/usePlaybackToken';
 import { loadClip, msToSeconds, pause, usePlayerStore } from '../../src/store/player';
 import { decidePlaybackAction } from '../../src/lib/playbackDecision';
+import {
+  clampIndex,
+  clipIdAtIndex,
+  indexFromOffset,
+  itemLayout,
+  unambiguousViewableId,
+} from '../../src/lib/feedViewport';
 import { categoryColor, categoryLabel } from '../../src/design/categories';
 import { spacing, surface } from '../../src/design/tokens';
 import { typography } from '../../src/design/typography';
@@ -32,9 +47,11 @@ import type { FeedClip } from '../../src/api/schema';
  * through token mints.
  */
 
-const VISIBILITY_THRESHOLD = 0.7;
-const INTER_REEL_PAUSE_MS = 1000;
-
+/**
+ * Not re-exported from `react-native` in RN 0.86, so declared here. `ViewToken`
+ * has no `percentVisible` in this version, which is part of why reel selection
+ * uses `onMomentumScrollEnd` rather than sorting viewable items by prominence.
+ */
 type ViewabilityInfo = {
   viewableItems: ViewToken<FeedClip>[];
   changed: ViewToken<FeedClip>[];
@@ -42,7 +59,6 @@ type ViewabilityInfo = {
 
 export default function Screen() {
   const backend = useBackendStatus();
-  const insets = useSafeAreaInsets();
   const feed = useFeedBuffer();
   // `all` is now honoured server-side as "no category filter"; it used to be
   // matched literally against a free-text column and matched nothing, which is
@@ -58,11 +74,76 @@ export default function Screen() {
   const lastLoadAt = useRef(0);
   const [activeClipId, setActiveClipId] = useState<string | null>(null);
 
+  /**
+   * Measured viewport height. NOT `window.height`: the tab bar is
+   * `layout.navClearance` (100px), so a reel is the window minus the bar.
+   *
+   * The cells need this. `ReelCard`'s root was `flex: 1`, and a FlatList cell
+   * is wrapped in a View with **no style** — so in Yoga `flex: 1` implies
+   * `flexBasis: 0%` inside an auto-height parent, which resolves to **zero
+   * height**, with the children overflowing. `pagingEnabled` then has no page
+   * height to snap to. This is the single most likely reason nothing appeared
+   * on screen, and it cannot be caught by `tsc` or a unit test.
+   *
+   * Until it is non-zero the list is not rendered at all (see below).
+   */
+  const [viewport, setViewport] = useState(0);
+  const listRef = useRef<FlatList<FeedClip>>(null);
+
+  const onListLayout = useCallback((e: LayoutChangeEvent) => {
+    const h = Math.round(e.nativeEvent.layout.height);
+    // Guard against a resize loop: only commit a real change.
+    setViewport((prev) => (prev === h ? prev : h));
+  }, []);
+
+  const getItemLayout = useCallback(
+    (_data: ArrayLike<FeedClip> | null | undefined, index: number) =>
+      itemLayout(viewport, index),
+    [viewport],
+  );
+
+  /**
+   * `getItemLayout` claims every cell is exactly `viewport` tall. If that is
+   * ever wrong (a slow measurement, a not-yet-rendered cell), RN throws here
+   * rather than silently scrolling to the wrong reel. Retrying after a frame
+   * with the now-measured layout is the documented recovery.
+   */
+  const onScrollToIndexFailed = useCallback(
+    (info: { index: number; averageItemLength: number }) => {
+      requestAnimationFrame(() => {
+        const i = clampIndex(info.index, clips.length);
+        if (i === null) return;
+        listRef.current?.scrollToIndex({ index: i, animated: true });
+      });
+    },
+    [clips.length],
+  );
+
+  /**
+   * The canonical "the user has landed on reel N" signal.
+   *
+   * Replaces viewability as the primary mechanism. `onMomentumScrollEnd` does
+   * not fire on mount, so viewability still selects the first reel — but only
+   * when exactly one item is viewable, which is only true at rest. Mid-snap
+   * both reels exceed the 70% threshold and `viewableItems` is not ordered by
+   * prominence, so acting on it there re-selects the reel being left.
+   */
+  const onMomentumScrollEnd = useCallback(
+    (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      const index = indexFromOffset(e.nativeEvent.contentOffset.y, viewport);
+      const id = clipIdAtIndex(clipIdsRef.current, index);
+      if (id) setActiveClipId((prev) => (prev === id ? prev : id));
+    },
+    [viewport],
+  );
+
+  const clipIdsRef = useRef<string[]>([]);
+
   const onViewableItemsChanged = useRef(({ viewableItems }: ViewabilityInfo) => {
-    const first = viewableItems[0];
-    if (!first) return;
-    const id = (first.item as FeedClip).id;
-    setActiveClipId((prev) => (prev === id ? prev : id));
+    const id = unambiguousViewableId(
+      viewableItems.map((v) => (v.item as FeedClip).id),
+    );
+    if (id) setActiveClipId((prev) => (prev === id ? prev : id));
   }).current;
 
   const viewabilityConfig = useRef({ itemVisiblePercentThreshold: 70 }).current;
@@ -164,10 +245,17 @@ export default function Screen() {
         active={item.id === activeClipId}
         status={status}
         durationMs={item.duration_ms}
+        height={viewport}
       />
     ),
-    [activeClipId, status],
+    [activeClipId, status, viewport],
   );
+
+  // The momentum handler reads the id list through a ref so it is not
+  // re-created on every refill (a new callback identity on a scrolling
+  // VirtualizedList is wasteful, and the ids are already in the closure of the
+  // render that produced them).
+  clipIdsRef.current = clips.map((c) => c.id);
 
   if (feed.loading && clips.length === 0) {
     return (
@@ -181,33 +269,56 @@ export default function Screen() {
   }
 
   return (
-    <View style={[styles.fill, { backgroundColor: surface.base }]}>
+    <View
+      style={[styles.fill, { backgroundColor: surface.base }]}
+      onLayout={onListLayout}
+    >
       <NetworkBanner status={backend} />
-      <FlatList
-        data={clips}
-        keyExtractor={(c) => c.id}
-        renderItem={renderItem}
-        pagingEnabled
-        showsVerticalScrollIndicator={false}
-        onViewableItemsChanged={onViewableItemsChanged}
-        viewabilityConfig={viewabilityConfig}
-        // Keeps the buffer shallow: these are full-bleed reels, and holding
-        // dozens of them mounted is what made the old feed stutter.
-        initialNumToRender={2}
-        windowSize={3}
-        removeClippedSubviews
-        ListEmptyComponent={
-          <View style={styles.center}>
-            <Text style={typography.title}>Nothing to play yet</Text>
-            <Text style={[typography.bodySecondary, styles.emptyBody]}>
-              {feed.coolingDown
-                ? 'Finding more for you…'
-                : 'Upload a clip, or pull to refresh once the feed has refilled.'}
-            </Text>
-          </View>
-        }
-        ListFooterComponent={<View style={{ height: insets.bottom + spacing.stack }} />}
-      />
+      {viewport === 0 ? (
+        // Not yet measured. Rendering the list here would produce the
+        // zero-height cells described above; the first `onLayout` resolves it
+        // within a frame.
+        <View style={styles.center}>
+          <Spinner label="Loading feed" />
+        </View>
+      ) : (
+        <FlatList
+          ref={listRef}
+          data={clips}
+          keyExtractor={(c) => c.id}
+          renderItem={renderItem}
+          pagingEnabled
+          getItemLayout={getItemLayout}
+          showsVerticalScrollIndicator={false}
+          onViewableItemsChanged={onViewableItemsChanged}
+          viewabilityConfig={viewabilityConfig}
+          onMomentumScrollEnd={onMomentumScrollEnd}
+          // Keeps the buffer shallow: these are full-bleed reels, and holding
+          // dozens of them mounted is what made the old feed stutter.
+          initialNumToRender={2}
+          windowSize={3}
+          removeClippedSubviews
+          onScrollToIndexFailed={onScrollToIndexFailed}
+          ListEmptyComponent={
+            <View style={styles.center}>
+              <Text style={typography.title}>Nothing to play yet</Text>
+              <Text style={[typography.bodySecondary, styles.emptyBody]}>
+                {feed.coolingDown
+                  ? 'Finding more for you…'
+                  : feed.error
+                    ? // A transport failure is not a statement about content,
+                      // and there is no pull-to-refresh on this list, so the
+                      // copy has to offer the action that actually exists.
+                      "We couldn't load the feed."
+                    : 'Upload a clip to get started.'}
+              </Text>
+              {feed.error ? (
+                <Button label="Try again" onPress={feed.refresh} style={styles.retry} />
+              ) : null}
+            </View>
+          }
+        />
+      )}
     </View>
   );
 }
@@ -226,17 +337,20 @@ function ReelCard({
   active,
   status,
   durationMs,
+  height,
 }: {
   clip: FeedClip;
   active: boolean;
   status: string;
   durationMs?: number;
+  /** Measured viewport height. `flex: 1` alone resolves to zero here. */
+  height: number;
 }) {
   const tint = categoryColor(clip.category);
   const seconds = durationMs ? Math.round(msToSeconds(durationMs)) : null;
 
   return (
-    <View style={styles.reel}>
+    <View style={[styles.reel, { height }]}>
       <View style={[styles.reelTint, { backgroundColor: tint, opacity: 0.08 }]} />
 
       <View style={styles.reelBody}>
@@ -310,6 +424,9 @@ const styles = StyleSheet.create({
   fill: { flex: 1 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: spacing.stack },
   emptyBody: { textAlign: 'center', marginTop: spacing.gutter },
+  // `flex: 1` is kept only as a fallback for a zero-height prop; the explicit
+  // `height` from the measured viewport is what actually sizes the cell. See
+  // the `viewport` docstring for why this cannot be left to the layout engine.
   reel: { flex: 1, justifyContent: 'flex-end' },
   // RN 0.86 exposes `absoluteFill` only; `absoluteFillObject` is gone.
   reelTint: { ...StyleSheet.absoluteFill, opacity: 0.08 },
@@ -324,4 +441,5 @@ const styles = StyleSheet.create({
   },
   tags: { opacity: 0.7 },
   statusBox: { marginTop: spacing.marginMobile },
+  retry: { marginTop: spacing.gutter },
 });

@@ -4,13 +4,7 @@
     "slug": "echoflow-mobile",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
-    "splash": {
-      "image": "./assets/splash.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#0A0A0A"
-    },
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.echoflow.audio",
@@ -23,10 +17,6 @@
     },
     "android": {
       "package": "com.echoflow.audio",
-      "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#0A0A0A"
-      },
       "permissions": [
         "android.permission.RECORD_AUDIO",
         "android.permission.MODIFY_AUDIO_SETTINGS",
@@ -34,15 +24,6 @@
         "android.permission.FOREGROUND_SERVICE"
       ]
     },
-    "scheme": "echoflow",
-    "plugins": [
-      [
-        "expo-av",
-        {
-          "microphonePermission": "Allow EchoFlow to access your microphone for recording audio reels."
-        }
-      ],
-      "expo-asset"
-    ]
+    "scheme": "echoflow"
   }
 }

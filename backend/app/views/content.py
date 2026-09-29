@@ -17,6 +17,7 @@ from ..models import AudioClip, Report, TakedownRequest
 from ..serializers import AudioUploadSerializer, FeedClipSerializer, PublicClipSerializer
 from ..services import content_moderation as moderation_svc
 from ..services import uploads as uploads_svc
+from ..services.entitlements import is_license_restricted
 from ..services.hls_token import COOKIE_NAME, generate_playback_token, verify_token
 
 logger = logging.getLogger(__name__)
@@ -425,6 +426,37 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
                 AudioClip.objects.filter(creator=request.user), pk=pk
             )
 
+        # SECURITY: refuse to mint a 30-day credential for content that has
+        # not cleared moderation, or that may not be redistributed. This is
+        # not a nicety — it is the only enforcement point that works.
+        #
+        # A share token is not a distinct token type. It is a media token
+        # minted with a 30-day TTL (see the DECISION note above), and
+        # `validatePlaybackToken` on the validating edge checks only format,
+        # HMAC, version, expiry and clip scope — it has no notion of "share"
+        # versus "media". The token is also carried in the share URL itself
+        # (`?s=<token>`), so anyone the link is forwarded to holds a working
+        # 30-day credential for that clip.
+        #
+        # That means a play-time-only gate can be bypassed outright: the owner
+        # mints, hands the raw token to the recipient, and the recipient
+        # presents it to the edge directly, never touching play_shared. Both
+        # ends have to refuse.
+        if not clip.moderation_approved:
+            return Response(
+                {"detail": "Clip is not approved for sharing."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if is_license_restricted(clip):
+            logger.warning(
+                "share link refused: licence-restricted clip=%s nc=%s sa=%s",
+                clip.id, clip.is_noncommercial, clip.requires_share_alike,
+            )
+            return Response(
+                {"detail": "This clip may not be shared outside EchoFlow."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         clip_key = uploads_svc.clip_storage_key(clip)
         if clip_key is None:
             # Nothing has been transcoded, so there is no media to grant.
@@ -478,6 +510,34 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
         if clip_key is None:
             return Response(
                 {"detail": "Clip media is not ready."}, status=status.HTTP_409_CONFLICT
+            )
+
+        # SECURITY: the licence gate. `moderation_approved` above answers "is
+        # this content allowed to exist publicly", which is a different
+        # question from "may it be redistributed to a third party".
+        #
+        # NC and SA clips are excluded from every feed and suggestion query
+        # (feed.py:115/137/173) and refused by PlaybackTokenView via
+        # resolve_clip_access -> is_license_restricted. Before this check the
+        # A4 path had no equivalent: an owner of an NC clip could mint a
+        # 30-day link and any *anonymous* caller could exchange it for a 600s
+        # media token — serving exactly what the feed is built to withhold.
+        # This is the control that services/entitlements.py's own docstring
+        # says this module must provide ("it lives here rather than inline in
+        # PlaybackTokenView because the share pipeline (A4) needs the same
+        # answer"). It was not being called.
+        #
+        # Checked after the media key so an unencoded clip still reports 409
+        # rather than 403: a caller with a valid link for a clip that is
+        # mid-encode should be told to retry, not that it is forbidden.
+        if is_license_restricted(clip):
+            logger.warning(
+                "share play refused: licence-restricted clip=%s nc=%s sa=%s",
+                clip.id, clip.is_noncommercial, clip.requires_share_alike,
+            )
+            return Response(
+                {"detail": "This clip may not be shared outside EchoFlow."},
+                status=status.HTTP_403_FORBIDDEN,
             )
 
         token = request.data.get('s') or request.query_params.get('s')

@@ -24,6 +24,7 @@ Most of this file is about that.
 import pytest
 
 from backend.app.models import AudioClip
+from backend.app.services.hls_token import COOKIE_NAME
 
 pytestmark = pytest.mark.django_db
 
@@ -476,3 +477,154 @@ class TestVerifyToken:
         settings.MEDIA_TOKEN_TTL_SECONDS = 600
         payload = verify_token(generate_playback_token(1, "hls/x"))
         assert payload["exp"] - payload["iat"] == 600
+
+
+# ---------------------------------------------------------------------------
+# Licence gate on the share pipeline
+# ---------------------------------------------------------------------------
+
+class TestLicenceRestrictedClipsCannotBePlayedViaShareLink:
+    """REGRESSION: the A4 share path had no licence gate at all.
+
+    ``play_shared`` filtered on ``moderation_approved`` only and never called
+    ``is_license_restricted``. The module ``services/entitlements.py`` opens
+    with "it lives here rather than inline in PlaybackTokenView because the
+    share pipeline (A4) needs the same answer" — and the share pipeline never
+    called it. ``content.py`` did not import it at all.
+
+    The concrete bypass: an owner of a NonCommercial or ShareAlike clip
+    mints a 30-day link (``share_link`` did not check the licence either),
+    and any **anonymous** caller exchanges it at ``POST /clips/{id}/play/``
+    for a 600s media token plus the ``ef_hls_token`` cookie. That serves
+    exactly the audio every feed and suggestion query withholds
+    (``feed.py:115/137/173``) and that ``PlaybackTokenView`` refuses at
+    ``views/media.py:228`` — the control documented there as "now closed".
+
+    ``test_share_pipeline.py`` previously contained no reference to
+    ``noncommercial`` or ``share_alike``, which is why this survived.
+    """
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [("is_noncommercial", True), ("requires_share_alike", True)],
+    )
+    def test_a_licence_restricted_clip_cannot_be_played(self, owner, clip, field, value):
+        from rest_framework.test import APIClient
+
+        share = authed(owner).post(
+            f"/clips/{clip.id}/share-link/", {}, format="json"
+        ).json()
+
+        setattr(clip, field, value)
+        clip.save(update_fields=[field])
+
+        response = APIClient().post(
+            f"/clips/{clip.id}/play/", {"s": share["token"]}, format="json"
+        )
+        assert response.status_code == 403, (
+            f"{field}={value} must be refused by the share path. A 200 here "
+            "means an anonymous caller can stream a clip the feed "
+            "deliberately never serves."
+        )
+        # The credential must not be issued either — status alone is not the
+        # guarantee, the absence of a cookie is.
+        assert response.cookies.get(COOKIE_NAME) is None, (
+            "A media token cookie was issued for a licence-restricted clip."
+        )
+
+    def test_the_gate_is_evaluated_at_play_time_not_at_mint_time(self, owner, clip):
+        """Mirrors the moderation test: the check belongs where a takedown or
+        a licence re-classification can actually stop playback, which is the
+        exchange — not the mint."""
+        from rest_framework.test import APIClient
+
+        share = authed(owner).post(
+            f"/clips/{clip.id}/share-link/", {}, format="json"
+        ).json()
+        # Link was minted while the clip was clean, so it is valid.
+        assert APIClient().post(
+            f"/clips/{clip.id}/play/", {"s": share["token"]}, format="json"
+        ).status_code == 200
+
+        clip.is_noncommercial = True
+        clip.save(update_fields=["is_noncommercial"])
+
+        assert APIClient().post(
+            f"/clips/{clip.id}/play/", {"s": share["token"]}, format="json"
+        ).status_code == 403, (
+            "A link minted before re-classification must stop working. If the "
+            "licence is only checked at mint time, an existing 30-day link "
+            "outlives the restriction."
+        )
+
+    def test_a_clean_clip_is_unaffected(self, owner, clip):
+        """Guard against the gate being so broad it breaks normal sharing."""
+        from rest_framework.test import APIClient
+
+        share = authed(owner).post(
+            f"/clips/{clip.id}/share-link/", {}, format="json"
+        ).json()
+        response = APIClient().post(
+            f"/clips/{clip.id}/play/", {"s": share["token"]}, format="json"
+        )
+        assert response.status_code == 200
+        assert response.cookies.get(COOKIE_NAME) is not None
+
+    def test_the_refusal_does_not_confirm_the_clip_exists(self, owner, clip):
+        """A licence refusal must look like any other refusal, so the endpoint
+        cannot be used to probe which clip ids exist and how they are
+        classified."""
+        from rest_framework.test import APIClient
+
+        share = authed(owner).post(
+            f"/clips/{clip.id}/share-link/", {}, format="json"
+        ).json()
+        clip.is_noncommercial = True
+        clip.save(update_fields=["is_noncommercial"])
+
+        licensed = APIClient().post(
+            f"/clips/{clip.id}/play/", {"s": share["token"]}, format="json"
+        )
+        bogus = APIClient().post(
+            f"/clips/{clip.id}/play/", {"s": "not-a-real-token"}, format="json"
+        )
+        assert licensed.status_code == bogus.status_code == 403
+        assert licensed.json() == bogus.json(), (
+            "The licence refusal must not be distinguishable from an invalid "
+            "token, or the endpoint becomes an oracle for clip licensing "
+            "state."
+        )
+
+
+class TestShareLinkRefusesUnapprovedAndLicensedClips:
+    """`share_link` is owner-scoped, so these are not privilege escalations —
+    they are the endpoint issuing 30-day, unrevocable credentials for content
+    that should not be shareable. Fixed alongside the play-side gate so the
+    two cannot disagree."""
+
+    def test_an_unapproved_clip_cannot_get_a_link(self, owner, clip):
+        clip.moderation_approved = False
+        clip.save(update_fields=["moderation_approved"])
+
+        response = authed(owner).post(
+            f"/clips/{clip.id}/share-link/", {}, format="json"
+        )
+        assert response.status_code == 403
+        assert "token" not in response.json()
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [("is_noncommercial", True), ("requires_share_alike", True)],
+    )
+    def test_a_licence_restricted_clip_cannot_get_a_link(self, owner, clip, field, value):
+        setattr(clip, field, value)
+        clip.save(update_fields=[field])
+
+        response = authed(owner).post(
+            f"/clips/{clip.id}/share-link/", {}, format="json"
+        )
+        assert response.status_code == 403, (
+            "Refusing at play time alone still hands the owner a token that "
+            "can be replayed anywhere the play gate is not consulted."
+        )
+        assert "token" not in response.json()

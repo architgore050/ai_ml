@@ -560,19 +560,47 @@ class TestN13ViewsetScope:
 
 
 # ---------------------------------------------------------------------------
-# N14 — CORS regex too wide
+# N14 — CORS regex too wide  (SUPERSEDED, see below)
 # ---------------------------------------------------------------------------
 class TestN14CORSRegex:
-    """Audit N14: CORS_URLS_REGEX = r'^.*$' matches every URL."""
+    """Audit N14 originally asserted CORS_URLS_REGEX != r'^.*$'.
 
-    def test_cors_regex_not_wildcard(self):
+    That assertion was weak in a way that mattered: it compared STRINGS, so it
+    passed against r'$.^' (a never-matcher that disabled CORS entirely) and
+    its failure message advised narrowing to "a specific path like
+    r'^/media/.*$'". Following that advice would have re-broken production,
+    because /auth/, /feed/ and /clips/ are all legitimate cross-origin
+    browser calls — only /admin/ and /metrics/ are excluded.
+
+    The real invariant is behavioural, not textual: the middleware must be
+    ENABLED for API paths. Full regression net in test_cors.py. These two
+    tests stay here to keep the N14 audit id greppable and to pin the two
+    specific shapes that have now each caused a production outage.
+    """
+
+    def test_cors_regex_is_not_a_never_matcher(self):
+        """r'$.^' (the 2026-09-29 outage) matched nothing, so is_enabled() was
+        always False and no response carried an Access-Control-* header."""
         from django.conf import settings
-        regex = getattr(settings, 'CORS_URLS_REGEX', None)
-        # Either removed (None) or narrower than r'^.*$'
-        assert regex is None or regex != r'^.*$', (
-            f"CORS_URLS_REGEX = {regex!r} — matches every URL. Should be "
-            "removed (None) or narrowed to a specific path like r'^/media/.*$'."
+        import re
+        regex = settings.CORS_URLS_REGEX
+        assert re.match(regex, '/feed/'), (
+            f"CORS_URLS_REGEX = {regex!r} does not match /feed/ — this "
+            "disables CORS for the entire API. See test_cors.py."
         )
+
+    def test_cors_regex_is_not_media_only(self):
+        """r'^/media/.*$' would leave login, refresh, feed and uploads
+        without CORS headers. Reject it by behaviour, not by string."""
+        from django.conf import settings
+        import re
+        regex = settings.CORS_URLS_REGEX
+        for path in ('/auth/login/', '/feed/', '/clips/'):
+            assert re.match(regex, path), (
+                f"CORS_URLS_REGEX = {regex!r} excludes {path}. Every browser "
+                "call is cross-origin in production; do not scope CORS to a "
+                "single path prefix. See test_cors.py."
+            )
 
 # ---------------------------------------------------------------------------
 # N-bug — TagsViewSet.initialize_vectors silently dead: tags__overlap on

@@ -32,17 +32,40 @@ CORS_ALLOWED_ORIGINS = os.environ.get('DJANGO_CORS_ALLOWED_ORIGINS', 'http://loc
 # to False on line 63, making the env var dead code. Removed for clarity.
 CORS_ALLOW_ALL_ORIGINS = False
 
-# N14 fix: CORS_URLS_REGEX was r'^.*$' which sent CORS headers to
-# every URL (including /admin/, /auth/, /metrics/). The actual security
-# boundary is CORS_ALLOWED_ORIGINS, but the wide regex serves no
-# purpose. The /media/ Django route was removed when S3Storage was
-# adopted (per docs/stateful-media-storage-at-scale.md and
-# media_urls.py:18-37 — playback URLs come from signed S3 URLs, not
-# from a Django route). Set to an empty regex (never matches) so
-# django-cors-headers never applies CORS via the regex path. The
-# middleware will still apply CORS_ALLOWED_ORIGINS to all responses
-# that flow through its check_origin method.
-CORS_URLS_REGEX = r'$.^'  # matches nothing (negative lookahead on start)
+# CORS: match every path EXCEPT /admin/ and /metrics/, which no browser
+# origin legitimately calls.
+#
+# HISTORY — this was previously r'$.^' ("match nothing"), on the reasoning
+# that the origin allowlist would still be applied "to all responses that
+# flow through its check_origin method". That method does not exist.
+# django-cors-headers 4.9.0 gates the entire middleware on
+#     is_enabled = re.match(CORS_URLS_REGEX, path_info) or check_signal(req)
+# and check_signal() only fires the `check_request_enabled` signal, to which
+# nothing in this repo subscribes. So the regex matched nothing, is_enabled
+# was always False, and NO response ever carried Access-Control-*.
+# In production the frontend is a separate origin by design
+# (Cloudflare Pages app.echoflow.in -> API api.echoflow.in), so every
+# browser request was rejected at preflight and the deployed app could not
+# function at all.
+#
+# The regex is NOT the security boundary and must not be treated as one.
+# CORS_ALLOWED_ORIGINS (above) is: a response only gets
+# Access-Control-Allow-Origin when the request's Origin is allowlisted, and
+# CORS_ALLOW_ALL_ORIGINS is False. Sending headers to a non-allowlisted
+# origin is inert — that origin's JS cannot read them.
+#
+# Note /auth/ is deliberately NOT excluded, despite an earlier comment
+# suggesting it. Login and token refresh are cross-origin browser calls; the
+# same is true of /media/playback-token/ for the HLS cookie handshake.
+CORS_URLS_REGEX = r'^(?!/(admin|metrics)/).*$'
+
+# Required for the HLS handshake: the playback-token endpoint sets the
+# HttpOnly `ef_hls_token` cookie and the client sends
+# `credentials: 'include'` (see frontend/src/api/client.ts getPlaybackToken).
+# Without this the browser drops the Set-Cookie and every /hls/* request 403s
+# even with a valid token. Safe alongside the allowlist: the library echoes
+# the specific allowlisted origin, never `*`.
+CORS_ALLOW_CREDENTIALS = True
 
 CORS_ALLOW_METHODS = [
     'GET',
@@ -66,6 +89,10 @@ CORS_ALLOW_HEADERS = [
 CORS_EXPOSE_HEADERS = [
     'Content-Range',   # ← browser needs this to know segment boundaries
     'Accept-Ranges',
+    # ← the client is required to honour 429 backoff. DRF sends this on every
+    #   throttle response; without exposing it the browser hides it from JS
+    #   on a cross-origin request and the client cannot back off.
+    'Retry-After',
 ]
 
 # Application definition

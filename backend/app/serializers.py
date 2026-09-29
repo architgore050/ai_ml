@@ -86,7 +86,7 @@ def request_user(context: dict):
     return user
 
 
-def following_annotation(viewer):
+def following_annotation(viewer, creator_ref='creator_id'):
     """`Exists` annotation for the B2 `user_is_following` fast path.
 
     `FeedClipSerializer.get_is_following` checks `hasattr(obj,
@@ -94,6 +94,15 @@ def following_annotation(viewer):
     `user_has_liked`. Any queryset that serialises more than one clip should
     `.annotate(**following_annotation(request.user))` to stay at one query
     instead of one per clip.
+
+    `creator_ref` is the OuterRef path to the *creator being tested*. It
+    defaults to `'creator_id'`, which is correct when the queryset is of
+    AudioClip. A queryset that reaches the clip through a relation — e.g.
+    `ShareEventSerializer.clip` is a nested `FeedClipSerializer`, so
+    `GET /share/` and `GET /share/inbox/` serialise clips from a ShareEvent
+    queryset — must pass `'clip__creator_id'`. Without the argument that
+    raises FieldError at queryset construction, not at render time, so it
+    fails loudly rather than silently falling back to N+1.
 
     Exported so views and the serializer module do not each grow their own
     copy of the subquery, which is how the two drift apart.
@@ -111,7 +120,7 @@ def following_annotation(viewer):
     # manager. Outered on the AudioClip row so Postgres evaluates it once.
     return {
         'user_is_following': Exists(
-            viewer.following.filter(pk=OuterRef('creator_id'))
+            viewer.following.filter(pk=OuterRef(creator_ref))
         )
     }
 

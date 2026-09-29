@@ -246,3 +246,91 @@ class TestSendShareValidation:
         )
         assert response.status_code in (401, 403)
         assert not ShareEvent.objects.exists()
+
+
+class TestShareListQueryCount:
+    """B7: `ShareEventSerializer.clip` is a nested `FeedClipSerializer`, so
+    both share read endpoints serialise a LIST of clips through the same
+    serializer as the feed — and neither annotated.
+
+    Three per-row queries fired for every share:
+      - `creator_name` walking clip.creator with no select_related
+      - `is_liked`  falling through to a per-row UserInteraction lookup
+      - `is_following` falling through to a per-row Follow lookup
+
+    The third is a regression from 21846fe, which added the field to
+    `FeedClipSerializer` and annotated the five clip endpoints but not these
+    two. Measured +24% query count on both.
+
+    These are the only tests in the repo that assert query counts on a real
+    endpoint for this serializer. The two in test_is_following.py measure
+    hand-built querysets that no view uses, which is how a 10-query feed page
+    got a green suite — so the counts here are deliberately measured against
+    the shipped view, not a reconstruction of it.
+    """
+
+    @staticmethod
+    def _seed_shares(n, receiver, django_user_model):
+        author = django_user_model.objects.create_user(
+            username="qauthor", email="q@example.com", password="pw-12345"
+        )
+        for i in range(n):
+            clip = AudioClip.objects.create(
+                creator=author,
+                title=f"Clip {i}",
+                category="music",
+                status="ready",
+                moderation_approved=True,
+                duration_ms=4000,
+            )
+            clip.hls_playlist_url = f"hls/{clip.id}/master.m3u8"
+            clip.save(update_fields=["hls_playlist_url"])
+            ShareEvent.objects.create(
+                sender=author, receiver=receiver, clip=clip
+            )
+
+    def test_share_list_query_count_is_flat(self, receiver, django_user_model,
+                                           django_assert_num_queries):
+        self._seed_shares(4, receiver, django_user_model)
+        client = authed(receiver)
+        # One warm-up so schema/prepared-statement setup is not counted.
+        client.get("/share/")
+        with django_assert_num_queries(3):
+            response = client.get("/share/")
+        assert response.status_code == 200
+        assert len(response.json()["results"]) == 4
+
+    def test_inbox_query_count_is_flat(self, receiver, django_user_model,
+                                       django_assert_num_queries):
+        self._seed_shares(4, receiver, django_user_model)
+        client = authed(receiver)
+        client.get("/share/inbox/")
+        with django_assert_num_queries(2):
+            response = client.get("/share/inbox/")
+        assert response.status_code == 200
+        assert len(response.json()) == 4
+
+    def test_the_list_is_deterministically_ordered(self, receiver, django_user_model,
+                                                   django_assert_num_queries):
+        """ShareEvent has no Meta.ordering and DRF paginates this queryset, so
+        an unordered page can repeat or skip rows. Assert the order exists and
+        that no UnorderedObjectListWarning is raised."""
+        import warnings
+        from django.core.paginator import UnorderedObjectListWarning
+
+        self._seed_shares(3, receiver, django_user_model)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            response = authed(receiver).get("/share/")
+        assert response.status_code == 200
+        assert not any(
+            issubclass(w.category, UnorderedObjectListWarning) for w in caught
+        ), "GET /share/ is paginating an unordered queryset."
+
+    def test_includes_is_following_on_the_nested_clip(self, sender, receiver,
+                                                     shareable):
+        """The field B2 added has to actually arrive on this path, or the
+        annotation is pointless and the fallback is silently back."""
+        post_share(sender, shareable, receiver.id)
+        data = authed(receiver).get("/share/inbox/").json()
+        assert data[0]["clip"]["is_following"] is False

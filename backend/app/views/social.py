@@ -15,18 +15,55 @@ mixin set makes POST /share/ return 405 Method Not Allowed instead of
 import logging
 
 from django.contrib.auth import get_user_model
+from django.db.models import Exists, OuterRef
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, mixins, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from ..models import AudioClip, ShareEvent
-from ..serializers import ShareEventSerializer
+from ..models import AudioClip, ShareEvent, UserInteraction
+from ..serializers import ShareEventSerializer, following_annotation
 from ..services import follows as follows_svc
 from ..services import shares as shares_svc
 from ..services.entitlements import is_license_restricted
 
 logger = logging.getLogger(__name__)
+
+
+def _annotated_clip_prefetch(viewer):
+    """Prefetch `clip` as a queryset carrying the serializer's fast paths.
+
+    B7. Annotating the `ShareEvent` queryset does NOT work here, and the
+    reason is easy to get wrong: `ShareEventSerializer.clip` is a nested
+    `FeedClipSerializer`, so the object being serialised is the **AudioClip**,
+    not the ShareEvent. An annotation placed on the ShareEvent row is never
+    seen by `FeedClipSerializer.get_is_liked` / `get_is_following`, which
+    look for `user_has_liked` / `user_is_following` on the clip. Measured:
+    annotating the ShareEvent left both falling through to per-row queries
+    (4 shares -> 10 queries, 2 of them per clip).
+
+    `select_related` cannot carry annotations either. A `Prefetch` with its own
+    annotated queryset does: the clips arrive in one extra query with the
+    annotations attached, and Django caches one AudioClip per distinct clip id,
+    so a clip shared by five senders is fetched and evaluated once.
+    """
+    from django.db.models import Prefetch
+
+    return Prefetch(
+        'clip',
+        queryset=AudioClip.objects
+        .select_related('creator')
+        .annotate(
+            user_has_liked=Exists(
+                UserInteraction.objects.filter(
+                    clip=OuterRef('pk'),
+                    user=viewer,
+                    interaction_type='like',
+                )
+            ),
+            **following_annotation(viewer),
+        ),
+    )
 
 User = get_user_model()
 
@@ -45,7 +82,16 @@ class ShareViewSet(
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return ShareEvent.objects.filter(receiver=self.request.user)
+        return ShareEvent.objects.filter(
+            receiver=self.request.user
+        ).select_related('sender').prefetch_related(
+            _annotated_clip_prefetch(self.request.user)
+            # Deterministic order. `ShareEvent` has no Meta.ordering, and
+            # DRF paginates this queryset, so without an explicit order_by
+            # Postgres may return rows in any order and a row can appear on
+            # two pages or on none (UnorderedObjectListWarning). `-id` breaks
+            # ties when two shares share a created_at.
+        ).order_by('-created_at', '-id')
 
     def get_throttles(self):
         # SECURITY: Per-action throttle dispatch (mirrors the pattern in
@@ -152,7 +198,8 @@ class ShareViewSet(
         shares = (
             ShareEvent.objects
             .filter(receiver=request.user)
-            .select_related('sender', 'clip')
+            .select_related('sender')
+            .prefetch_related(_annotated_clip_prefetch(request.user))
             .order_by('-created_at')
         )
         serializer = ShareEventSerializer(shares, many=True)

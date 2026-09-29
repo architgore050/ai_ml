@@ -133,6 +133,81 @@ export const feedDegradedSchema = z.object({
 });
 export type FeedDegraded = z.infer<typeof feedDegradedSchema>;
 
+/**
+ * A `GET /feed/` response, whichever status it arrived with.
+ *
+ * WHY THIS UNION EXISTS: `apiFetch` returns the parsed body and throws on
+ * non-2xx, so **the HTTP status is not available to the caller** — 200 and 202
+ * are both "success" by that contract. The two are told apart by their SHAPE
+ * instead: a 202 has no `results` array (it carries `retry_after_ms` and
+ * nothing to render), while a 200 always does. `parseFeedResponse` does that
+ * discrimination in one place so no caller has to re-derive it.
+ *
+ * The alternative — teaching `apiFetch` to surface `status` — would change
+ * every existing call site's return type for the benefit of one endpoint, so
+ * the discrimination is kept local.
+ */
+export const feedDegradedMarkerSchema = z.object({
+  retry_after_ms: z.number().optional(),
+  detail: z.string().optional(),
+  degraded: z.boolean().optional(),
+});
+
+export type FeedResponse =
+  | { kind: 'ok'; clips: FeedClip[]; queueHealth: number; degraded?: boolean }
+  | { kind: 'cold'; retryAfterMs: number };
+
+/**
+ * Parse a `GET /feed/` body into a discriminated result.
+ *
+ * `queue_health` is how full the user's Redis queue was *before* this page was
+ * popped. A low value plus a short `results` array is the signal to refill.
+ */
+export function parseFeedResponse(raw: unknown): FeedResponse {
+  // Discriminate by SHAPE, since `apiFetch` discards the status (200 and 202
+  // are both "success" to it).
+  //
+  // A 202 carries no `results` at all. That test alone is too lenient: the
+  // degraded marker's fields are all optional, so a *malformed* body would
+  // also lack `results` and be silently reported as a cold start — producing
+  // an empty feed with no error, which is exactly the silent failure plan D5
+  // is about. So require evidence of an actual 202 (the server's hint, or the
+  // degraded flag) before accepting it; otherwise fall through to the strict
+  // 200 parse, which throws on a shape it does not recognise.
+  const hasResults = Array.isArray((raw as { results?: unknown })?.results);
+  if (!hasResults) {
+    const cold = feedDegradedMarkerSchema.safeParse(raw);
+    if (cold.success && (cold.data.retry_after_ms != null || cold.data.degraded != null)) {
+      return { kind: 'cold', retryAfterMs: cold.data.retry_after_ms ?? 1500 };
+    }
+  }
+
+  const ok = feedOkSchema.parse(raw);
+  return {
+    kind: 'ok',
+    clips: ok.results,
+    queueHealth: ok.queue_health ?? 0,
+    degraded: ok.degraded,
+  };
+}
+
+/**
+ * `POST /media/playback-token/{id}/` — the native transport.
+ *
+ * `token` is present ONLY when the request sent `X-EchoFlow-Client: native`.
+ * Without that header the body is `{"status":"ok"}` and the credential travels
+ * as an HttpOnly cookie, which a native player cannot use (it has no shared
+ * cookie jar). So on this platform a missing `token` is a CONTRACT VIOLATION,
+ * not a soft no-op — hence `.refine` rather than `.optional()`.
+ */
+export const playbackTokenSchema = z
+  .object({
+    status: z.literal('ok'),
+    token: z.string().min(1),
+  })
+  .refine((v) => v.status === 'ok', { message: 'playback token: unexpected status' });
+export type PlaybackToken = z.infer<typeof playbackTokenSchema>;
+
 /* ------------------------------------------------------------------ */
 /* Auth                                                                 */
 /* ------------------------------------------------------------------ */

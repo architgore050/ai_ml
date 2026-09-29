@@ -14,10 +14,25 @@ let refreshPromise: Promise<string | null> | null = null;
 // 2. Audio mode. from audioPlayer.ts:19-25
 //    Retarget to expo-audio's setAudioModeAsync.
 //    Allows recording is now explicit: false for playback, true for capture.
+//
+//    CORRECTED 2026-09-29: the keys below were the expo-av names
+//    (`playsInSilentModeIOS`, `staysActiveInBackground`,
+//    `shouldDuckAndroid`) and NONE of them exist in expo-audio. Verified
+//    against node_modules/expo-audio/build/Audio.types.d.ts:
+//      playsInSilentMode          (was playsInSilentModeIOS)
+//      interruptionMode           (was shouldDuckAndroid: boolean)
+//                                    'doNotMix' | 'duckOthers' | 'mixWithOthers'
+//      shouldPlayInBackground     (was staysActiveInBackground)
+//      allowsRecording            (explicit now; default false)
+//      shouldRouteThroughEarpiece (default false -> routes to speaker)
+//    Note `interruptionModeAndroid` exists but is deprecated in favour of
+//    `interruptionMode`, which now works on both platforms.
 const AUDIO_MODE_PLAYBACK = {
-  playsInSilentModeIOS: true,
-  staysActiveInBackground: true,
-  shouldDuckAndroid: true,
+  playsInSilentMode: true,
+  interruptionMode: 'duckOthers',
+  shouldPlayInBackground: true,
+  allowsRecording: false,
+  shouldRouteThroughEarpiece: false,
 };
 
 // 3. Recording preset. from UploadScreen.tsx:58-60
@@ -47,6 +62,24 @@ const IDENTITY = {
 };
 // NOTE: 'echoflow' was declared in the old app and had ZERO handlers.
 // D3 (expo-router) makes it real for the first time.
+
+// 6. expo-audio API migration hazards. Verified 2026-09-29 against
+//    node_modules/expo-audio/build/Audio.types.d.ts (@ expo-audio ~57.0.5).
+//    These are silent — nothing throws, the numbers are just wrong.
+//      a) TIME IS IN SECONDS. `player.status.currentTime` / `.duration` are
+//         seconds (expo-av's `positionMillis`/`durationMillis` were ms). The
+//         backend sends `duration_ms`. So the conversion is /1000 going in and
+//         *1000 going out. Getting this wrong silently corrupts the
+//         completion-rate telemetry that drives the recommender (defect 2).
+//      b) play(), pause() and replace() return VOID, not Promise. `await`
+//         on them is meaningless; anything sequencing off the result hangs
+//         or runs early.
+//      c) seekTo(seconds) takes SECONDS. seekTo(30) is 30s, not 30ms.
+//      d) A player created with a source holds a REFERENCE to that source.
+//         `player.replace({uri, headers})` is how you swap it, and it is
+//         also how you re-attach a refreshed media token. Do not use
+//         `preload()` for tokenized media: it caches by source, so it pins
+//         a credential that will expire long before the audio is needed.
 
 // DISCARD ---------------------------------------------------------------
 // App.tsx navigation ....... bottom tabs, `navigation: any`, no linking,

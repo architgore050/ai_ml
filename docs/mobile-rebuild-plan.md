@@ -1034,7 +1034,7 @@ Keep as **patterns**, not code:
 | Keep | Discard |
 |---|---|
 | The `apiFetch` single-flight `refreshPromise` mutex — a correct port of the web client including `ROTATE_REFRESH_TOKENS` handling. Keep the pattern; rewrite the base URL, add `AbortController` timeouts, `204` handling, structured errors, `skipAuth`, 429 backoff. | `expo-av` entirely (removed SDK 55) |
-| `Audio.setAudioModeAsync({playsInSilentModeIOS, staysActiveInBackground, shouldDuckAndroid})` — well-reasoned, product-appropriate | The whole styling layer — 8 duplicated `StyleSheet.create` blocks, 130+ hardcoded hex, 16 alpha steps, zero tokens |
+| `Audio.setAudioModeAsync({playsInSilentMode, interruptionMode:'duckOthers', shouldPlayInBackground, allowsRecording})` — well-reasoned, product-appropriate. *(Keys corrected 2026-09-29: the salvage list named the expo-av keys, which do not exist in expo-audio.)* | The whole styling layer — 8 duplicated `StyleSheet.create` blocks, 130+ hardcoded hex, 16 alpha steps, zero tokens |
 | `RecordingPresets.HIGH_QUALITY` → `.m4a`/AAC/44.1k/stereo/128kbps. Backend-compatible (`ALLOWED_EXT`), ffmpeg-friendly, matches the free-tier bitrate | `App.tsx` navigation — no stacks, no linking, no param typing, no error boundary, no auth gate |
 | `com.echoflow.audio` bundle IDs, `scheme`, `UIBackgroundModes: audio` | `AuthContext` — `login()` unreachable, `isAuthenticated` derived not authoritative, no session-expiry signal, un-caught startup `refreshProfile` |
 | `CommentModal`'s `KeyboardAvoidingView` + drag-indicator composition (the design; the implementation should be `@gorhom/bottom-sheet`) | `consentAccepted = useState(true)` — a DPDP §11 defect |

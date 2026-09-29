@@ -20,6 +20,8 @@ import { surface } from '../src/design/tokens';
 import { ThemeProvider } from '../src/design/theme';
 import { ErrorBoundary } from '../src/components/ErrorBoundary';
 import { useAuthStore } from '../src/store/auth';
+import { applyPlaybackAudioMode } from '../src/lib/audioMode';
+import { releasePlayer } from '../src/store/player';
 
 /**
  * Root layout. Providers only — no navigation decisions, no data fetching.
@@ -66,6 +68,23 @@ export default function RootLayout() {
   useEffect(() => {
     void init();
   }, [init]);
+
+  /**
+   * ONE audio session and ONE player for the whole app, established here at the
+   * root — deliberately OUTSIDE the `<Stack>`, and outside anything that
+   * unmounts when the auth status flips.
+   *
+   * Two separate reasons, both from defects the old app shipped:
+   *  1. The old app owned its player inside a feed card, so it unmounted with
+   *     the view and every swipe killed playback (plan §10).
+   *  2. `applyPlaybackAudioMode` reconfigures the platform audio session. On
+   *     Android, re-issuing it re-acquires audio focus, which can drop the
+   *     current stream. Doing it once, at startup, is the only safe place.
+   */
+  useEffect(() => {
+    void applyPlaybackAudioMode();
+    return () => releasePlayer();
+  }, []);
 
   // Block first paint until the font resolves, but do not block forever: a font
   // CDN failure should degrade to the system font, not hang the app on a splash.

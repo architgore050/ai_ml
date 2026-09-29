@@ -459,20 +459,32 @@ python -c "from backend.app.tasks import scrape_and_import; scrape_and_import.de
 Sources that still exist: wikimedia, internet_archive, freesound (needs `FREESOUND_API_KEY`), kaggle (needs `SCRAPER_KAGGLE_LOCAL_PATH`). Respects `robots.txt`. Source connectors live in `ai_ml/scrapers/sources/`. **The A3 licensing gate is unaffected** — `views/feed.py` and `services/entitlements.py::is_license_restricted` read the DB columns `is_noncommercial`/`requires_share_alike`, not the missing helpers. Only the scraper's ability to *classify* a license is gone.
 
 ### Seeding media for local development
-The scraper being broken does not block local media work. `backend/scripts/seed_clips.py`
-seeds real audio through the genuine upload path (`POST /clips/` →
-`POST /clips/{id}/approve-moderation/` → `process_audio_to_hls`), one clip at a time:
+The scraper being broken does not block local media work — upload files instead.
+**See [docs/EXPLAIN/operations/01-audio-upload-guide.md](docs/EXPLAIN/operations/01-audio-upload-guide.md)**
+for the full guide. The essentials:
+
 ```bash
+# Recommended: backend/scripts/seed_clips.py drives the real HTTP API
+# (POST /clips/ -> POST /clips/{id}/approve-moderation/ -> process_audio_to_hls),
+# one clip at a time. Do NOT hand-write AudioClip rows: approve-moderation is the
+# only enqueue trigger, so a seeder that skips it produces a state the pipeline
+# never creates and makes "the feed works" unfalsifiable.
 python3 backend/scripts/seed_clips.py --dry-run   # validate the manifest, upload nothing
 python3 backend/scripts/seed_clips.py             # upload + approve + wait for ready
 python3 backend/scripts/seed_clips.py --resume    # skip already-uploaded tracks
-```
-Then trigger a feed refill so the new clips reach `GET /feed/`:
-```bash
+
+# Then refill the feed so the new clips reach GET /feed/:
 docker compose -f docker-compose.local.yml --env-file .env.local \
-  exec celery_feed_local python -c "from backend.app.tasks import refill_user_feed; print(refill_user_feed(<user_id>))"
+  exec web_local python manage.py shell -c \
+  "from backend.app.tasks import refill_user_feed; print(refill_user_feed(<user_id>))"
 ```
-`GET /feed/` is a **destructive `lpop`**, so each call drains up to 10 ids; re-run the refill after you have consumed the queue.
+
+Two traps the guide covers in full: `POST /clips/` enqueues **nothing**
+(`finalize_upload` deliberately does not, because the task opens with an
+`if not clip.moderation_approved: return` gate) — skip `approve-moderation` and
+the clip sits at `processing` for ever; and `GET /feed/` is a **destructive
+`lpop`**, so each call drains up to 10 ids and re-requesting a page you already
+got returns the *next* ten. Buffer client-side; re-run the refill instead.
 
 ## Frontend (sample only)
 ```bash

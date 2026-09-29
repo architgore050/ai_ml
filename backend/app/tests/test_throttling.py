@@ -548,3 +548,137 @@ class TestRefreshThrottleWiring:
         from django.conf import settings
 
         assert "register_username" in settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]
+
+
+# ---------------------------------------------------------------------------
+# AudioUploadViewSet per-action scopes — A4 follow-up (2026-09-29)
+# ---------------------------------------------------------------------------
+class TestAudioUploadViewSetScopes:
+    """`throttle_scope` was keyed on `url_path` while DRF sets `self.action`
+    to the handler's **method name**.
+
+    A4 added a per-action dispatch so a shared link's landing page would not
+    429 after 20 views, but the map used the routes the actions are *mounted*
+    at (`'public'`, `'approve-moderation'`, …) rather than the names of the
+    methods implementing them (`public_view`, `approve_moderation`, …). None
+    of the five ever matched, so every action silently fell through to the
+    `'upload'` default. The five A4 scopes were dead code.
+
+    The concrete harm was on a READ. `GET /clips/{id}/` — the status poll a
+    client runs while HLS encodes — resolved to `'upload'` (20/hour), so a
+    client polling during an encode 429s after 20 polls. The mobile Phase 5
+    upload status pipeline polls this exact endpoint.
+
+    A wrong scope fails *open onto the wrong bucket*, silently, which is why
+    this is pinned by method name rather than trusted to the routing table.
+    """
+
+    #: action name -> the scope it must resolve to.
+    EXPECTED = {
+        # writes that push files or are owner mutations over the same rows
+        "create": "upload",
+        "update": "upload",
+        "partial_update": "upload",
+        "destroy": "upload",
+        # reads must NOT be charged the upload budget
+        "retrieve": "clip_read",
+        "list": "clip_read",
+        # compute / abuse-sensitive actions
+        "approve_moderation": "clip_approve",
+        "public_view": "clip_public",
+        "play_shared": "clip_play",
+        "share_link": "share_link",
+        "report_clip": "clip_report",
+    }
+
+    @staticmethod
+    def _view_for(action):
+        from backend.app.views.content import AudioUploadViewSet
+
+        view = AudioUploadViewSet()
+        view.action = action
+        return view
+
+    @pytest.mark.parametrize("action,expected", sorted(EXPECTED.items()))
+    def test_action_resolves_to_expected_scope(self, action, expected):
+        assert self._view_for(action).throttle_scope == expected, (
+            f"{action!r} should resolve to {expected!r}; if this fails, the "
+            f"scope map is likely keyed on url_path instead of the method "
+            f"name that DRF puts in self.action."
+        )
+
+    def test_retrieve_is_not_charged_the_upload_budget(self):
+        """The regression that mattered: a status poll is a read, not an upload.
+
+        This is the one assertion written to fail against the pre-fix code,
+        where `retrieve` fell through to the 20/hour `upload` scope.
+        """
+        assert self._view_for("retrieve").throttle_scope != "upload"
+
+    @pytest.mark.parametrize("action", sorted(EXPECTED))
+    def test_every_scope_is_registered_in_settings(self, action):
+        """An unregistered scope makes ScopedRateThrottle.get_rate() return
+        None, and allow_request() then returns True — completely unthrottled.
+        A typo in the map is therefore silent; this is the guard (same shape as
+        the token_refresh / register_username rate-existence tests above).
+        """
+        from django.conf import settings
+
+        scope = self._view_for(action).throttle_scope
+        assert scope in settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"], (
+            f"{action!r} resolved to unregistered scope {scope!r}; requests "
+            f"would be allowed through with no rate limit at all."
+        )
+
+    def test_reads_and_writes_do_not_share_a_bucket(self):
+        """`upload` exists to cap storage abuse (up to 100 MB per file). A read
+        cannot abuse storage, so folding reads into it penalises polling and
+        polling is exactly what the encode path does.
+        """
+        read_scopes = {self._view_for(a).throttle_scope for a in ("retrieve", "list")}
+        write_scopes = {self._view_for(a).throttle_scope for a in ("create", "update", "destroy")}
+
+        assert "upload" not in read_scopes
+        assert read_scopes.isdisjoint(write_scopes)
+
+    def test_scoped_only_actions_run_under_scoped_throttle_alone(self):
+        """`get_throttles` had the same key mismatch as the scope map, so the
+        five dedicated actions were also running under the inherited class list
+        instead of ScopedRateThrottle alone.
+        """
+        from rest_framework.throttling import ScopedRateThrottle
+
+        for action in AudioUploadViewSet_scoped_actions():
+            view = self._view_for(action)
+            throttles = view.get_throttles()
+            assert len(throttles) == 1 and isinstance(throttles[0], ScopedRateThrottle), (
+                f"{action!r} should run under ScopedRateThrottle alone; got "
+                f"{[type(t).__name__ for t in throttles]}"
+            )
+
+    def test_reads_keep_the_inherited_user_throttle(self):
+        """retrieve/list deliberately stay on the inherited class list so the
+        1000/hour `user` bucket remains a backstop beneath `clip_read`. If the
+        scope were ever mis-typed, that backstop is what stops it from being
+        fully unthrottled.
+        """
+        from rest_framework.throttling import ScopedRateThrottle
+
+        for action in ("retrieve", "list"):
+            classes = [type(t) for t in self._view_for(action).get_throttles()]
+            assert ScopedRateThrottle in classes, (
+                f"{action!r} lost its ScopedRateThrottle; clip_read would be "
+                f"unenforced."
+            )
+
+
+def AudioUploadViewSet_scoped_actions():
+    """The actions that must run under ScopedRateThrottle alone.
+
+    Read off the viewset constant rather than hardcoded here, so a future
+    action added to that frozenset is covered automatically and a rename that
+    desyncs the two fails loudly instead of quietly widening the class list.
+    """
+    from backend.app.views.content import AudioUploadViewSet
+
+    return sorted(AudioUploadViewSet.SCOPED_ONLY_ACTIONS)

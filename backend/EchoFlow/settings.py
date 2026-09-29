@@ -761,6 +761,15 @@ REST_FRAMEWORK = {
         'share_link':          '60/hour',
         'clip_report':         '20/hour',
         'clip_approve':        '20/hour',
+        # FIX (2026-09-29): reads on a clip. Before this, `GET /clips/{id}/` and
+        # `GET /clips/` resolved to the 'upload' scope (20/hour) because the
+        # per-action map in views/content.py was keyed on url_path while DRF
+        # sets self.action to the method name, so no custom action ever matched
+        # and every read fell through to the upload cap. A client polling clip
+        # status during an HLS encode (mobile Phase 5 upload pipeline) 429s
+        # after 20 polls. Reads are cheap and not storage-abuse vectors, so
+        # they get their own bucket rather than sharing the upload cap.
+        'clip_read':           '120/min',
     },
 }
 # lets set lifetimes for tokens

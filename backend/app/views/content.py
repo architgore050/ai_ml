@@ -127,21 +127,62 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
         everything else. A shared link's landing page returning 429 after 20
         views is a broken share feature, and it fails in exactly the way that
         is hardest to notice: the link works for you, then stops working.
+
+        FIX (2026-09-29): the keys below were the actions' **url_path**
+        values, but DRF sets ``self.action`` to the **method name**
+        (``ViewSetMixin.initialize_request`` assigns ``self.action`` from the
+        handler it routed to; ``url_path`` only decides where the handler is
+        mounted). So none of these ever matched, and all five A4 scopes were
+        dead code — every action fell through to ``upload``. The symptom was a
+        read-only ``GET /clips/{id}/`` being charged the 20/hour upload budget,
+        which 429s a client polling clip status during an HLS encode.
+
+        Keys are therefore method names, matching what DRF actually sets.
+        See docs/EXPLAIN/decisions/2026-09-29-clip-throttle-scopes.md.
+
+        ``retrieve``/``list`` are reads, not uploads: they get their own
+        ``clip_read`` scope rather than being folded into ``upload``, because
+        the upload cap exists to limit storage abuse and a read does none.
         """
         return {
-            'public': 'clip_public',
-            'play': 'clip_play',
-            'share-link': 'share_link',
-            'report': 'clip_report',
-            'approve-moderation': 'clip_approve',
+            # method name -> scope. NOT url_path: self.action is the former.
+            'approve_moderation': 'clip_approve',
+            'public_view': 'clip_public',
+            'play_shared': 'clip_play',
+            'share_link': 'share_link',
+            'report_clip': 'clip_report',
+            'retrieve': 'clip_read',
+            'list': 'clip_read',
+            # create / update / partial_update / destroy fall through to
+            # 'upload' by omission: they are owner-scoped writes over the
+            # same objects, so sharing the storage-abuse cap is correct.
         }.get(self.action, 'upload')
+
+    #: Actions that get a dedicated rate and therefore run under
+    #: ScopedRateThrottle *alone* (not additionally capped by the 1000/hour
+    #: `user` bucket). Keyed by method name for the same reason as
+    #: `throttle_scope` above — DRF's `self.action` is the method name.
+    #: `retrieve`/`list` are intentionally NOT here: they keep the inherited
+    #: class list so the 1000/hour UserRateThrottle stays as a backstop beneath
+    #: `clip_read` (a mis-typed scope would otherwise be unthrottled outright).
+    SCOPED_ONLY_ACTIONS = frozenset({
+        'public_view',
+        'play_shared',
+        'share_link',
+        'report_clip',
+        'approve_moderation',
+    })
 
     def get_throttles(self):
         # Actions with their own scope need ScopedRateThrottle; `create` and
         # the plain CRUD actions use the viewset's inherited classes.
+        #
+        # FIX (2026-09-29): these were url_path values, so like the scope map
+        # above they never matched `self.action` and the five A4 actions were
+        # silently running under the default class list + `upload` scope.
         from rest_framework.throttling import ScopedRateThrottle
 
-        if self.action in ('public', 'play', 'share-link', 'report', 'approve-moderation'):
+        if self.action in self.SCOPED_ONLY_ACTIONS:
             return [ScopedRateThrottle()]
         return super().get_throttles()
 

@@ -9,7 +9,7 @@ from rest_framework.response import Response
 from ..models import AudioClip, UserInteraction
 from ..serializers import (
     FeedClipSerializer, OwnProfileSerializer, PublicProfileSerializer,
-    ProfileUpdateSerializer,
+    ProfileUpdateSerializer, following_annotation,
 )
 from ._pagination import FeedCursorPagination
 
@@ -67,6 +67,9 @@ class ProfileViewSet(viewsets.ViewSet):
             AudioClip.objects
             .filter(creator=target, status='ready')
             .annotate(user_has_liked=Exists(user_like_subquery))
+            # B2: annotate alongside user_has_liked so the whole page of clips
+            # costs one follow query, not one per clip.
+            .annotate(**following_annotation(request.user))
             .order_by('-created_at')
         )
         paginator = FeedCursorPagination()

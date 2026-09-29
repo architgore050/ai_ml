@@ -14,7 +14,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from ..models import AudioClip, UserInteraction
-from ..serializers import FeedClipSerializer
+from ..serializers import FeedClipSerializer, following_annotation
 from ..services.interactions import invalidate_user_vectors_cache
 from ..tasks import refill_user_feed, calculate_time_decayed_vectors
 from ..services.task_publisher import publish
@@ -114,6 +114,9 @@ class FastFeedViewSet(viewsets.ViewSet):
                 # operator-gated via /clips/{id}/approve-moderation/.
                 .filter(is_noncommercial=False, requires_share_alike=False)
                 .annotate(user_has_liked=Exists(user_like_subquery))
+                # B2: one annotation for the whole page instead of one
+                # follow lookup per clip. See following_annotation().
+                .annotate(**following_annotation(request.user))
                 .order_by(preserved_order)
             )
             serializer = FeedClipSerializer(clips, many=True, context={'request': request})
@@ -137,6 +140,8 @@ class FastFeedViewSet(viewsets.ViewSet):
                         clip=OuterRef('pk'), user=request.user, interaction_type='like'
                     )
                 ))
+                # B2, same annotation as the primary path.
+                .annotate(**following_annotation(request.user))
                 .order_by('-engagement_velocity', '-created_at')[:20]
             )
             serializer = FeedClipSerializer(fallback, many=True, context={'request': request})
@@ -204,7 +209,12 @@ class SuggestionViewSet(viewsets.ReadOnlyModelViewSet):
         user_like_subquery = UserInteraction.objects.filter(
             clip=OuterRef('pk'), user=user, interaction_type='like'
         )
-        return queryset.annotate(user_has_liked=Exists(user_like_subquery))
+        return queryset.annotate(
+            user_has_liked=Exists(user_like_subquery),
+            # B2: the Explore page renders FeedClipSerializer too, so it needs
+            # the same per-page follow annotation.
+            **following_annotation(user),
+        )
 
 
 class TagsViewSet(viewsets.ViewSet):

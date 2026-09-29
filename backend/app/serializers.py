@@ -73,6 +73,62 @@ _BLOCKED_MAGIC_SIGNATURES = (
 )
 
 
+def request_user(context: dict):
+    """The authenticated user for a serializer context, or AnonymousUser.
+
+    DRF's `request.user` is `AnonymousUser` when unauthenticated rather than
+    `None`, so `is_authenticated` is the check — not truthiness.
+    """
+    request = context.get('request')
+    user = getattr(request, 'user', None)
+    if user is None or not user.is_authenticated:
+        return None
+    return user
+
+
+def following_annotation(viewer):
+    """`Exists` annotation for the B2 `user_is_following` fast path.
+
+    `FeedClipSerializer.get_is_following` checks `hasattr(obj,
+    'user_is_following')` first, exactly as `get_is_liked` does with
+    `user_has_liked`. Any queryset that serialises more than one clip should
+    `.annotate(**following_annotation(request.user))` to stay at one query
+    instead of one per clip.
+
+    Exported so views and the serializer module do not each grow their own
+    copy of the subquery, which is how the two drift apart.
+    """
+    from django.db.models import Exists, OuterRef
+
+    # Must test `is_authenticated`, not truthiness: DRF hands an unauthenticated
+    # request `AnonymousUser`, which is truthy but has no `following`
+    # manager. `request_user()` exists for the same reason.
+    if not getattr(viewer, 'is_authenticated', False):
+        return {}
+
+    # `User.following` is symmetrical=False with related_name='followers',
+    # so "viewer follows creator" is a filter on the viewer's own M2M
+    # manager. Outered on the AudioClip row so Postgres evaluates it once.
+    return {
+        'user_is_following': Exists(
+            viewer.following.filter(pk=OuterRef('creator_id'))
+        )
+    }
+
+
+def _viewer_follows(viewer, target) -> bool:
+    """Does `viewer` already follow `target`? B2, shared by the profile serializers.
+
+    A `False` for unauthenticated viewers and for self, matching
+    `FollowViewSet.toggle_follow`'s 400 on `target == request.user`.
+    """
+    if viewer is None or target is None:
+        return False
+    if viewer.pk == target.pk:
+        return False
+    return viewer.following.filter(pk=target.pk).exists()
+
+
 def _has_blocked_magic_signature(head: bytes) -> str | None:
     """Return the matched signature label if `head` matches a known
     non-audio file signature, else None.
@@ -311,6 +367,11 @@ class FeedClipSerializer(serializers.ModelSerializer):
     creator_name = serializers.CharField(source='creator.username', read_only=True)
     creator_id = serializers.IntegerField(source='creator.id', read_only=True)
     is_liked = serializers.SerializerMethodField()
+    # B2 (2026-09-29). See get_is_following for why this had to be added:
+    # without it the client's Follow button is a blind toggle that *unfollows*
+    # creators you already follow. Same hasattr-annotation fast path as
+    # get_is_liked so the common case costs no extra query.
+    is_following = serializers.SerializerMethodField()
     # `AudioClip.hls_playlist_url` stores a relative object-storage KEY
     # (e.g. "hls/<clip_id>/master.m3u8"), not a servable URL — the bucket is
     # private, so a real playable URL has to be signed fresh on every read.
@@ -325,7 +386,7 @@ class FeedClipSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'title', 'creator_name', 'category',
             'hls_playlist_url', 'likes', 'shares', 'skips',
-            'comment_count', 'is_liked', 'creator_id', 'cover_image',
+            'comment_count', 'is_liked', 'is_following', 'creator_id', 'cover_image',
             # A2 (2026-09-29). Both were already columns on AudioClip and
             # were simply never exposed, so the client had to derive them:
             # `tags` drives the chip row, and without `duration_ms` the
@@ -340,7 +401,7 @@ class FeedClipSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             'likes', 'shares', 'skips', 'comment_count', 'hls_playlist_url', 'is_liked', 'cover_image',
-            'tags', 'duration_ms',
+            'is_following', 'tags', 'duration_ms',
         ]
 
     def get_hls_playlist_url(self, obj):
@@ -362,6 +423,33 @@ class FeedClipSerializer(serializers.ModelSerializer):
         return UserInteraction.objects.filter(
             user=request.user, clip=obj, interaction_type='like', is_active=True
         ).exists()
+
+    def get_is_following(self, obj):
+        """Whether `request.user` already follows this clip's creator.
+
+        B2. The field did not exist on any serializer, and
+        `POST /follow/{id}/toggle-follow/` is a *toggle* — so a client that
+        cannot read the current state cannot render an honest button, and
+        tapping "Follow" on someone already followed silently unfollows them.
+        The backend already returns `{status: 'followed'|'unfollowed'}`; this
+        was one field away.
+
+        Follow is a property of the (viewer, creator) pair, not of the clip,
+        so the per-object query below is a fallback. Every queryset that
+        serialises a list of clips annotates `user_is_following` with an
+        `Exists` subquery so this hits the fast path with no extra round trip
+        — the same strategy `is_liked` uses via `user_has_liked`.
+
+        Note the self-follow case: the endpoint 400s on
+        `target == request.user`, so reporting False for your own clip is what
+        keeps the client's optimistic state consistent with the server.
+        """
+        if hasattr(obj, 'user_is_following'):
+            return obj.user_is_following
+        request = self.context.get('request')
+        if not request or not request.user.is_authenticated:
+            return False
+        return request.user.following.filter(pk=obj.creator_id).exists()
 
 class PublicClipSerializer(serializers.ModelSerializer):
     """Metadata for a shared clip, visible without authentication.
@@ -641,13 +729,14 @@ class PublicProfileSerializer(serializers.ModelSerializer):
     uploads_count = serializers.IntegerField(read_only=True)
 
     profile_picture_url = serializers.SerializerMethodField()
+    is_following = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = [
             'id', 'username', 'profile_picture', 'profile_picture_url',
             'followers_count', 'following_count', 'uploads_count',
-            'date_joined'
+            'is_following', 'date_joined'
         ]
 
 
@@ -655,6 +744,15 @@ class PublicProfileSerializer(serializers.ModelSerializer):
         if obj.profile_picture and obj.profile_picture.name:
             return get_signed_media_url(obj.profile_picture.name)
         return None
+
+    def get_is_following(self, obj):
+        """B2 — see `FeedClipSerializer.get_is_following`.
+
+        The Profile page has its own follow button hitting the same blind
+        toggle, so it needs the same honest state. Always False for your own
+        profile, matching the endpoint's 400 on self-follow.
+        """
+        return _viewer_follows(request_user(self.context), obj)
 
 class OwnProfileSerializer(serializers.ModelSerializer):
     """For the logged-in user's own profile — includes private data"""
@@ -664,13 +762,17 @@ class OwnProfileSerializer(serializers.ModelSerializer):
     liked_clips = serializers.SerializerMethodField()
 
     profile_picture_url = serializers.SerializerMethodField()
+    # B2. Always False for your own profile, but the field is declared so the
+    # client can read one shape off both profile endpoints and never has to
+    # branch on which one it got.
+    is_following = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = [
             'id', 'username', 'profile_picture', 'profile_picture_url',
             'followers_count', 'following_count', 'uploads_count',
-            'liked_clips', 'date_joined'
+            'liked_clips', 'is_following', 'date_joined'
         ]
 
 
@@ -678,6 +780,9 @@ class OwnProfileSerializer(serializers.ModelSerializer):
         if obj.profile_picture and obj.profile_picture.name:
             return get_signed_media_url(obj.profile_picture.name)
         return None
+
+    def get_is_following(self, obj):
+        return False
 
     def get_liked_clips(self, obj):
         # N7 fix: query AudioClip directly with the user_has_liked
@@ -694,13 +799,27 @@ class OwnProfileSerializer(serializers.ModelSerializer):
         liked_clips = (
             AudioClip.objects
             .filter(
-                interactions__user=obj,
-                interactions__interaction_type='like',
-                interactions__is_active=True,
+                # FIX (2026-09-29, found while doing B2): the reverse
+                # accessor is `userinteraction`, not `interactions`.
+                # `UserInteraction.clip` declares no `related_name`
+                # (models.py:256), so Django derives the name from the model
+                # and lowercases it. `interactions__*` therefore raises
+                # FieldError, which made `GET /profile/me/` return 500 for
+                # *every* authenticated user — the primary profile endpoint
+                # was entirely non-functional, and no test covered it.
+                # `order_by('-userinteraction__updated_at')` below was wrong
+                # for the same reason.
+                userinteraction__user=obj,
+                userinteraction__interaction_type='like',
+                userinteraction__is_active=True,
             )
             .annotate(user_has_liked=Exists(user_like_subquery))
+            # B2: same one-query-per-page treatment as views/feed.py and
+            # views/profile.py. `viewer`, not `obj` — the follow state that
+            # matters is the request's, not the profile owner's.
+            .annotate(**following_annotation(viewer))
             .distinct()
-            .order_by('-interactions__updated_at')[:50]
+            .order_by('-userinteraction__updated_at')[:50]
         )
         return FeedClipSerializer(
             liked_clips, many=True, context=self.context

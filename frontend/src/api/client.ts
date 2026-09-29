@@ -179,26 +179,37 @@ export async function apiRequest<T = any>(
 
 export const authAPI = {
   // SECURITY / DPDP §6: consent_accepted and terms_version are REQUIRED by
-  // RegisterSerializer (backend/app/serializers.py:435-436). Omitting them
+  // RegisterSerializer (backend/app/serializers.py:496-497). Omitting them
   // returns 400, so registration 400'd for every user until this was fixed
   // (ISSUE-16). termsVersion comes from GET /legal/compliance/ (A1) so that
   // appending a version to TERMS_VERSIONS does not break every client.
+  //
+  // SECURITY / DPDP §9: `dob` is REQUIRED (serializers.py:512) and `parentEmail`
+  // is required when the computed age is under 18. `dob` was previously
+  // optional, which was itself the bypass: a client that omitted it was
+  // registered as an adult and had its telemetry processed under the adult
+  // path. Future dates and dates over 120 years ago are rejected server-side.
   async register(
     username: string,
     email: string,
     password: string,
     termsVersion: string,
+    dob: string,
+    parentEmail?: string,
   ): Promise<User> {
+    const body: Record<string, unknown> = {
+      username,
+      email,
+      password,
+      consent_accepted: true,
+      terms_version: termsVersion,
+      dob,
+    };
+    if (parentEmail) body.parent_email = parentEmail;
     const user = await apiRequest<User>("/auth/register/", {
       method: "POST",
       skipAuth: true,
-      body: JSON.stringify({
-        username,
-        email,
-        password,
-        consent_accepted: true,
-        terms_version: termsVersion,
-      }),
+      body: JSON.stringify(body),
     });
     return user;
   },
@@ -392,5 +403,46 @@ export const profileAPI = {
 
   async getUserClips(userId: number): Promise<CursorPaginated<FeedClip>> {
     return apiRequest<CursorPaginated<FeedClip>>(`/profile/${userId}/clips/`);
+  },
+};
+
+export const mediaAPI = {
+  /**
+   * Mints the `ef_hls_token` playback credential for one clip.
+   *
+   * SECURITY: POST, not GET. Minting a credential must not be a safe method —
+   * a GET is CSRF-able (the cookie is SameSite=Lax), prefetchable by browsers
+   * and proxies, and cacheable by intermediaries, any of which would mint
+   * tokens nobody asked for.
+   *
+   * SECURITY: `credentials: "include"` is load-bearing. The cookie is HttpOnly
+   * and cross-site in production (set by `api.`, sent to `media.`), so without
+   * this the browser silently discards the `Set-Cookie` and every `/hls/*`
+   * request 403s. This is not the same code path as `apiRequest` above,
+   * which never needs the cookie jar.
+   *
+   * The token is per-clip and short-lived (MEDIA_TOKEN_TTL_SECONDS, default
+   * 600s). Switching clips requires a new one. Callers must treat a failure
+   * as terminal for that clip — the `hls/` prefix is not public-read and is
+   * validated at the edge on every request, so there is no unauthenticated
+   * fallback path.
+   */
+  async getPlaybackToken(clipId: string): Promise<{ status: string }> {
+    const response = await fetch(apiUrl(`/media/playback-token/${clipId}/`), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${getStoredTokens()?.access || ""}`,
+      },
+      credentials: "include",
+    });
+
+    if (!response.ok) {
+      // 409 = media still processing, 403 = unmoderated/unavailable,
+      // 404 = gone, 401 = session expired. The player maps these distinctly.
+      const error: any = new Error("Playback token issuance failed");
+      error.status = response.status;
+      throw error;
+    }
+    return response.json();
   },
 };

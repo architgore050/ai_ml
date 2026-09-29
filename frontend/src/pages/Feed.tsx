@@ -1,9 +1,9 @@
 import React, { useEffect, useState, useCallback } from "react";
-import { Headphones, AlertTriangle, RefreshCw, ChevronDown, ChevronUp, Sparkles, Radio, Disc3 } from "lucide-react";
+import { Headphones, AlertTriangle, RefreshCw, Sparkles } from "lucide-react";
 import { feedAPI } from "../api/client";
 import { usePlayer } from "../stores/player";
 import { FeedClip, FeedResponse } from "../types/echoflow";
-import { ReelCard } from "../components/feed/ReelCard";
+import { ReelList } from "../components/feed/ReelList";
 import { CommentSheet } from "../components/comments/CommentSheet";
 import { ShareModal } from "../components/sharing/ShareModal";
 
@@ -14,7 +14,6 @@ interface FeedPageProps {
 
 export const FeedPage: React.FC<FeedPageProps> = ({ onOpenCreatorProfile, onOpenOnboarding }) => {
   const [clips, setClips] = useState<FeedClip[]>([]);
-  const [activeIndex, setActiveIndex] = useState<number>(0);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isColdPreparing, setIsColdPreparing] = useState<boolean>(false);
   const [retryCountdown, setRetryCountdown] = useState<number>(0);
@@ -75,37 +74,6 @@ export const FeedPage: React.FC<FeedPageProps> = ({ onOpenCreatorProfile, onOpen
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Keep active index in sync with player's current clip
-  useEffect(() => {
-    if (currentClip && clips.length > 0) {
-      const idx = clips.findIndex((c) => c.id === currentClip.id);
-      if (idx !== -1 && idx !== activeIndex) {
-        setActiveIndex(idx);
-      }
-    }
-  }, [currentClip, clips, activeIndex]);
-
-  const goToNextReel = () => {
-    if (clips.length === 0) return;
-    const nextIdx = (activeIndex + 1) % clips.length;
-    setActiveIndex(nextIdx);
-    playClip(clips[nextIdx], clips);
-  };
-
-  const goToPrevReel = () => {
-    if (clips.length === 0) return;
-    const prevIdx = (activeIndex - 1 + clips.length) % clips.length;
-    setActiveIndex(prevIdx);
-    playClip(clips[prevIdx], clips);
-  };
-
-  const selectClipByIndex = (index: number) => {
-    if (index >= 0 && index < clips.length) {
-      setActiveIndex(index);
-      playClip(clips[index], clips);
-    }
-  };
-
   if (isColdPreparing) {
     return (
       <div className="min-h-[70vh] flex flex-col items-center justify-center p-6 text-center space-y-4">
@@ -152,8 +120,6 @@ export const FeedPage: React.FC<FeedPageProps> = ({ onOpenCreatorProfile, onOpen
     );
   }
 
-  const activeClip = clips[activeIndex] || clips[0];
-
   return (
     <div className="w-full max-w-7xl mx-auto px-4 md:px-8 py-4 pb-28">
       {/* Degraded mode banner */}
@@ -183,113 +149,23 @@ export const FeedPage: React.FC<FeedPageProps> = ({ onOpenCreatorProfile, onOpen
         </button>
       </div>
 
-      {/* Two-Column Bold Typography Layout on Large Screens */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-        {/* Left / Main Section: Active Reel Card */}
-        <div className="lg:col-span-7 xl:col-span-8 relative">
-          {activeClip ? (
-            <ReelCard
-              clip={activeClip}
-              isActive={true}
-              onOpenComments={(c) => setSelectedClipForComments(c)}
-              onOpenShare={(c) => setSelectedClipForShare(c)}
-              onCreatorClick={(id) => onOpenCreatorProfile(id)}
-            />
-          ) : (
-            <div className="h-96 rounded-3xl bg-[#111111] border border-white/10 flex flex-col items-center justify-center p-6 text-center space-y-2">
-              <p className="text-base font-black uppercase text-white">All Reels Caught Up</p>
-              <p className="text-xs text-white/40">Upload an audio reel or tune your vibes for more.</p>
-            </div>
-          )}
+      {/* Vertical scroll-snap reel feed with viewability autoplay.
+          Replaces the previous two-column "big card + Vector Feed Queue"
+          layout: the queue sidebar and its Cosine-Threshold/HNSW-Index footer
+          were a desktop-console affordance, and the product is a phone-first
+          vertical reel. ReelList also owns autoplay, which the old layout had
+          none of — nothing in src/ used an IntersectionObserver, so a clip only
+          played if the user tapped it. */}
+      <ReelList
+        clips={clips}
+        loading={isLoading}
+        err={errorMsg}
+        hasMore={false}
+        onOpenCreatorProfile={onOpenCreatorProfile}
+        onOpenComments={setSelectedClipForComments}
+        onOpenShare={setSelectedClipForShare}
+      />
 
-          {/* Quick Reel Nav Arrows */}
-          <div className="absolute -right-3 top-1/2 -translate-y-1/2 hidden md:flex flex-col gap-2 z-20">
-            <button
-              type="button"
-              onClick={goToPrevReel}
-              className="w-10 h-10 rounded-full bg-[#0A0A0A] hover:bg-[#111111] border border-white/20 text-white flex items-center justify-center shadow-xl hover:border-[#FF6321] transition-all"
-              title="Previous Reel"
-            >
-              <ChevronUp className="w-5 h-5" />
-            </button>
-            <button
-              type="button"
-              onClick={goToNextReel}
-              className="w-10 h-10 rounded-full bg-[#0A0A0A] hover:bg-[#111111] border border-white/20 text-white flex items-center justify-center shadow-xl hover:border-[#FF6321] transition-all"
-              title="Next Reel"
-            >
-              <ChevronDown className="w-5 h-5" />
-            </button>
-          </div>
-        </div>
-
-        {/* Right Section: Vector Feed Queue from Design Spec */}
-        <div className="lg:col-span-5 xl:col-span-4 bg-[#111111] border border-white/10 rounded-2xl md:rounded-3xl p-6 flex flex-col shadow-2xl">
-          <div className="flex items-center justify-between pb-4 mb-4 border-b border-white/10">
-            <h3 className="text-xs font-black uppercase tracking-widest text-white/40">
-              Vector Feed Queue
-            </h3>
-            <span className="text-[10px] font-mono text-[#FF6321] font-bold">
-              {clips.length} REELS PRE-FETCHED
-            </span>
-          </div>
-
-          <div className="space-y-3 overflow-y-auto max-h-[580px] pr-1">
-            {clips.map((clip, idx) => {
-              const isCurrent = idx === activeIndex;
-              const formatSec = Math.round(clip.duration_ms / 1000);
-              const numStr = (idx + 1).toString().padStart(2, "0");
-
-              return (
-                <div
-                  key={clip.id}
-                  onClick={() => selectClipByIndex(idx)}
-                  className={`p-3.5 rounded-xl border transition-all cursor-pointer flex items-center gap-3.5 group ${
-                    isCurrent
-                      ? "bg-white/10 border-white/20 shadow-[0_0_20px_rgba(255,99,33,0.1)] ring-1 ring-[#FF6321]"
-                      : idx === activeIndex + 1
-                      ? "bg-white/5 border-white/10 opacity-90 hover:opacity-100"
-                      : idx === activeIndex + 2
-                      ? "bg-white/5 border-white/5 opacity-60 hover:opacity-100"
-                      : "bg-white/2 border-white/5 opacity-40 hover:opacity-80"
-                  }`}
-                >
-                  {/* Number Badge */}
-                  <div
-                    className={`w-10 h-10 rounded-lg flex items-center justify-center font-black text-xs font-mono flex-shrink-0 transition-transform ${
-                      isCurrent
-                        ? "bg-[#FF6321] text-black scale-105"
-                        : "bg-white/10 text-white/50 group-hover:text-white"
-                    }`}
-                  >
-                    {numStr}
-                  </div>
-
-                  {/* Clip Info */}
-                  <div className="flex-1 min-w-0">
-                    <h4 className="font-black uppercase text-xs tracking-tight text-[#F5F5F5] truncate group-hover:text-[#FF6321] transition-colors">
-                      {clip.title}
-                    </h4>
-                    <p className="text-[10px] font-mono text-white/40 uppercase mt-0.5 truncate">
-                      {formatSec}s • @{clip.creator_name} • {clip.category}
-                    </p>
-                  </div>
-
-                  {/* Active Playing Indicator */}
-                  {isCurrent && (
-                    <div className="w-2 h-2 rounded-full bg-[#FF6321] animate-pulse" />
-                  )}
-                </div>
-              );
-            })}
-          </div>
-
-          <div className="mt-6 pt-4 border-t border-white/10 text-[10px] font-mono text-white/30 flex items-center justify-between">
-            <span>Cosine Threshold: &gt; 0.85</span>
-            <span className="text-green-400 font-bold">HNSW Index Active</span>
-          </div>
-        </div>
-      </div>
 
       {/* Comment Sheet Drawer */}
       <CommentSheet

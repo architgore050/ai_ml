@@ -10,6 +10,12 @@ export interface FeedClip {
   skips: number;
   comment_count: number;
   is_liked: boolean;
+  // Present in FeedClipSerializer (backend/app/serializers.py fields list) but
+  // previously missing here, so every read of them type-checked against an
+  // incomplete type. `duration_ms` is milliseconds, not seconds.
+  duration_ms: number;
+  tags: string[];
+  cover_image: string | null;
 }
 
 export interface User {

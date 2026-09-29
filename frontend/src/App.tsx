@@ -3,6 +3,7 @@ import { AuthProvider, useAuth } from "./stores/auth";
 import { PlayerProvider } from "./stores/player";
 import { Header } from "./components/common/Header";
 import { BottomNav } from "./components/navigation/BottomNav";
+import { NetworkBanner } from "./components/common/NetworkBanner";
 import { MiniPlayer } from "./components/feed/MiniPlayer";
 import { OnboardingModal } from "./components/feed/OnboardingModal";
 import { FeedPage } from "./pages/Feed";
@@ -59,6 +60,9 @@ const MainContent: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-[#0A0A0A] text-[#F5F5F5] flex flex-col selection:bg-[#FF6321] selection:text-black font-sans">
+      {/* Connectivity banner — FRONTEND-REQUIREMENTS.md §4.9 */}
+      <NetworkBanner />
+
       {/* Top App Header */}
       <Header
         activeTab={activeTab}

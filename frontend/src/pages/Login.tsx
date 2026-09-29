@@ -6,6 +6,25 @@ interface LoginPageProps {
   onLoginSuccess?: () => void;
 }
 
+/** Mirrors the server bound in RegisterSerializer.validate (serializers.py):
+ *  a future dob is rejected, as is one over 120 years old. Computed here only
+ *  to decide whether the guardian field is required — the server re-validates
+ *  and remains the authority. */
+const MAX_DOB = new Date();
+MAX_DOB.setFullYear(MAX_DOB.getFullYear() - 120);
+const MAX_DOB_ISO = MAX_DOB.toISOString().slice(0, 10);
+
+const dobToAge = (iso: string): number | null => {
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return null;
+  const now = new Date();
+  return (
+    now.getFullYear() -
+    parsed.getFullYear() -
+    ((now.getMonth(), now.getDate()) < (parsed.getMonth(), parsed.getDate()) ? 1 : 0)
+  );
+};
+
 export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
   const { login, register } = useAuth();
   const [mode, setMode] = useState<"login" | "register">("login");
@@ -13,6 +32,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [dob, setDob] = useState("");
+  const [parentEmail, setParentEmail] = useState("");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
@@ -28,7 +49,27 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
           setIsLoading(false);
           return;
         }
-        await register(email.trim(), username.trim(), password);
+        // DPDP §9: `dob` is required (serializers.py:512) and `parent_email` is
+        // required when the computed age is under 18. Omitting `dob` used to
+        // register the account as an adult, which was the bypass.
+        if (!dob) {
+          setErrorMsg("Date of birth is required.");
+          setIsLoading(false);
+          return;
+        }
+        const age = dobToAge(dob);
+        if (age !== null && age < 18 && !parentEmail.trim()) {
+          setErrorMsg("A parent or guardian email is required for users under 18.");
+          setIsLoading(false);
+          return;
+        }
+        await register({
+          email: email.trim(),
+          username: username.trim(),
+          password,
+          dob,
+          parentEmail: parentEmail.trim() || undefined,
+        });
       } else {
         await login(username.trim(), password);
       }
@@ -124,6 +165,41 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder="soundwave@echoflow.fm"
+                  required
+                  className="w-full bg-black border border-white/15 rounded-xl px-4 py-3 text-xs font-mono text-white placeholder-white/20 focus:outline-none focus:border-[#FF6321] transition-colors"
+                />
+              </div>
+            )}
+
+            {/* Date of birth (register only) */}
+            {mode === "register" && (
+              <div>
+                <label className="text-[10px] font-mono uppercase text-white/40 block mb-1.5 tracking-wider">
+                  Date of Birth
+                </label>
+                <input
+                  type="date"
+                  value={dob}
+                  max={MAX_DOB_ISO}
+                  onChange={(e) => setDob(e.target.value)}
+                  required
+                  className="w-full bg-black border border-white/15 rounded-xl px-4 py-3 text-xs font-mono text-white placeholder-white/20 focus:outline-none focus:border-[#FF6321] transition-colors"
+                />
+              </div>
+            )}
+
+            {/* Parent / guardian email — required by the server when the
+                computed age is under 18. */}
+            {mode === "register" && dobToAge(dob) !== null && dobToAge(dob)! < 18 && (
+              <div>
+                <label className="text-[10px] font-mono uppercase text-white/40 block mb-1.5 tracking-wider">
+                  Parent / Guardian Email
+                </label>
+                <input
+                  type="email"
+                  value={parentEmail}
+                  onChange={(e) => setParentEmail(e.target.value)}
+                  placeholder="guardian@echoflow.fm"
                   required
                   className="w-full bg-black border border-white/15 rounded-xl px-4 py-3 text-xs font-mono text-white placeholder-white/20 focus:outline-none focus:border-[#FF6321] transition-colors"
                 />

@@ -8,7 +8,13 @@ interface AuthContextType {
   isAuthenticated: boolean;
   isLoading: boolean;
   login: (username: string, password: string) => Promise<void>;
-  register: (email: string, username: string, password: string) => Promise<void>;
+  register: (params: {
+    email: string;
+    username: string;
+    password: string;
+    dob: string;
+    parentEmail?: string;
+  }) => Promise<void>;
   logout: () => Promise<void>;
   refreshProfile: () => Promise<void>;
 }
@@ -61,7 +67,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   // Spec FR-AUTH-1: register then immediately login to obtain tokens
-  const register = async (email: string, username: string, password: string) => {
+  const register = async ({
+    email,
+    username,
+    password,
+    dob,
+    parentEmail,
+  }: {
+    email: string;
+    username: string;
+    password: string;
+    dob: string;
+    parentEmail?: string;
+  }) => {
     // A1 / ISSUE-16: the accepted terms versions are a server contract, so
     // read them from /legal/compliance/ rather than hardcoding. Falls back to
     // the documented default if that fetch fails, because registration
@@ -78,7 +96,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // Leave the default. A metadata fetch must not block registration.
     }
 
-    await authAPI.register(username, email, password, termsVersion);
+    await authAPI.register(username, email, password, termsVersion, dob, parentEmail);
     await authAPI.login(username, password);
     sessionStorage.setItem("ef_new_user", "1");
     await refreshProfile();

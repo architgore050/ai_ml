@@ -310,7 +310,15 @@ def _process_audio_to_hls_impl(self, clip_id, timer):
             # True. Kept as a bare name so the actual value being checked is
             # visible at the call site rather than hidden behind a
             # conditional that reads as if the value might be missing.
-            from ..services import content_moderation as moderation_svc
+            # SECURITY: relative import is `.services`, not `..services`.
+            # This module is `backend.app.tasks`, so `..` resolves to
+            # `backend.services` (which does not exist) and raised
+            # ModuleNotFoundError at the moderation step — killing EVERY
+            # clip at the transcript check, so no clip ever reached HLS
+            # encoding. Files one level deeper (`backend/app/views/*.py`)
+            # correctly use `..services`; a module at `backend/app/` itself
+            # needs one dot.
+            from .services import content_moderation as moderation_svc
             transcript_approved, transcript_reason = moderation_svc.check_transcript_for_prohibited_content(transcript_text)
             tags_approved, tags_reason = moderation_svc.check_tags_for_prohibited_content(clip.tags)
             if not transcript_approved:

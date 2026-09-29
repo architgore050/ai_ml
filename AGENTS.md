@@ -326,6 +326,9 @@ docker builder prune                                # CAREFUL — wipes dangling
 | `REDIS_CACHE_URL` | Docker: `redis://redis_cache:6379/0`. Falls back to `REDIS_URL`. |
 | `HF_TOKEN` | HuggingFace token (model baking at build time). See [docs/EXPLAIN/operations/hf-token-rotation.md](docs/EXPLAIN/operations/hf-token-rotation.md) for the rotation runbook. |
 | `OPENAI_API_KEY` | Optional — reserved for OpenAI pipeline branch |
+| `SCRAPER_ENABLED` | **Master switch for the audio scraper. Default `False`.** Both entry points (`scrape_audio`, `scrape_and_import`) raise until it is set. The license classifier is the *only* writer of `AudioClip.is_noncommercial` / `requires_share_alike`, which are the only input to the feed rights gate and to `POST /media/playback-token/`. See `docs/EXPLAIN/decisions/2026-09-29-restore-audio-scraper.md` before enabling. |
+| `SCRAPER_ALLOW_NC` | Default `False`. `True` admits non-commercial audio to feeds. A product decision, not a technical one. |
+| `SCRAPER_ALLOW_SHARE_ALIKE` | Default `False`. SA items still import with `requires_share_alike=True` + `moderation_approved=False` and need an operator `approve-moderation` call. |
 | `FREESOUND_API_KEY` | Required only for freesound scraper |
 | `SEED_AUTH_TOKEN` | Auth token for `seed_db.py` |
 | `GUNICORN_WORKERS` | Default gunicorn workers (default: 4) |
@@ -440,23 +443,32 @@ POST /webhooks/revenuecat/    # Webhook endpoint (Phase 2 — HMAC verified when
 - **HLS output**: Stored under `media/hls/{clip_id}/` on local disk. Not S3-backed yet. `cleanup_orphan_hls` Celery task (daily 03:00 UTC) prunes directories older than 1 day that are not in the `AudioClip` table — bounded to 1000 keys/run.
 
 ## Scraping / Ingestion
-> **⚠ BROKEN as of 2026-09-29 — both entry points fail at import.** `5c9c2d6 "removed scraper"`
-> deleted the license helpers from `ai_ml/scrapers/base.py` (`normalize_license`,
-> `license_features`, `license_allows_commercial`, `is_noncommercial_license`,
-> `is_share_alike_license`, `resolve_podcast_rss` — 0 definitions remain anywhere in
-> the tree) but both callers below still import them from that module, so neither
-> will start. The commands are kept here for reference; see the "Session Learnings"
-> entry for 2026-09-29. Restoring the helpers or finishing the removal is a
-> **product decision that has not been made**.
+> **⚠ DISABLED BY DEFAULT as of 2026-09-29 — both entry points now import and
+> run, but refuse unless `SCRAPER_ENABLED=True`.** The scraper was restored
+> from `aacd759^` together with a **rights fix**: the restored classifier
+> failed open on the Freesound vocabulary (`Attribution NonCommercial` ->
+> `CC-BY` -> `is_noncommercial=False`), so NC audio would have been written to
+> the DB and served by the feed and by `/media/playback-token/`. That is
+> fixed and pinned by `backend/app/tests/test_scraper_licensing.py`, and
+> `license_allows_commercial` is now an explicit **allow-list** rather than
+> "anything not-NC is commercial". Full analysis, the restore source, and why
+> `youtube` is deliberately not wired:
+> `docs/EXPLAIN/decisions/2026-09-29-restore-audio-scraper.md`.
+>
+> The columns the classifier writes (`is_noncommercial`, `requires_share_alike`)
+> are **not** reachable through the API, so this module is the *only* rights
+> enforcement for third-party content — which is why the gate is off by
+> default rather than on.
 
 ```bash
-# Management command  (currently ImportError — see warning above)
-python manage.py scrape_audio --source=wikimedia --limit=3 --clip-length=30
+# Both refuse with an explanatory error until SCRAPER_ENABLED=True.
+# Management command
+SCRAPER_ENABLED=True python manage.py scrape_audio --source=freesound --limit=3
 
-# Celery task  (currently ImportError — see warning above)
-python -c "from backend.app.tasks import scrape_and_import; scrape_and_import.delay('internet_archive', limit=5)"
+# Celery task
+SCRAPER_ENABLED=True python -c "from backend.app.tasks import scrape_and_import; scrape_and_import.delay('freesound', limit=5)"
 ```
-Sources that still exist: wikimedia, internet_archive, freesound (needs `FREESOUND_API_KEY`), kaggle (needs `SCRAPER_KAGGLE_LOCAL_PATH`). Respects `robots.txt`. Source connectors live in `ai_ml/scrapers/sources/`. **The A3 licensing gate is unaffected** — `views/feed.py` and `services/entitlements.py::is_license_restricted` read the DB columns `is_noncommercial`/`requires_share_alike`, not the missing helpers. Only the scraper's ability to *classify* a license is gone.
+Sources wired: wikimedia, internet_archive, freesound (needs `FREESOUND_API_KEY`), kaggle (needs `SCRAPER_KAGGLE_LOCAL_PATH`). Respects `robots.txt` — **except** `youtube`/`youtube_shorts`, which are deliberately not wired because `downloader._download_youtube` bypasses `RobotsTxtChecker` and violates the YouTube ToS. Connectors live in `ai_ml/scrapers/sources/`. **Expect wikimedia / internet_archive / kaggle to import ZERO items**: they emit no `license` key, so items normalize to `UNKNOWN` and are skipped by the fail-closed allow-list. Only `freesound` classifies today. `SCRAPER_ALLOW_NC=False` also excludes NC from every feed query, and `SCRAPER_ALLOW_SHARE_ALIKE=False` leaves SA items at `moderation_approved=False` awaiting `/clips/{id}/approve-moderation/`.
 
 ### Seeding media for local development
 The scraper being broken does not block local media work — upload files instead.
@@ -621,7 +633,7 @@ REVENUECAT_SYNC_INTERVAL_MINUTES=360    # 6 hours
 
 ## Testing & Linting
 - Test framework: **pytest** + `pytest-django`, installed in the `api` image. Run via `docker compose exec web pytest …` — see [Running Tests](#running-tests) for the full command set.
-- Test files live under `backend/app/tests/` (34 files: `test_adversarial_pass3.py`, `test_auth_regulatory.py`, `test_content_moderation.py`, `test_counter_store.py`, `test_db_router.py`, `test_erasure.py`, `test_feed_license_filter.py`, `test_feed_pool.py`, `test_group_c.py`, `test_hls_token.py`, `test_https_termination.py`, `test_integration_concurrency.py`, `test_integration_pgvector.py`, `test_metrics_endpoint.py`, `test_metrics.py`, `test_mobile_contract.py`, `test_observability_tui.py`, `test_orphan_cleanup.py`, `test_redis_url_precedence.py`, `test_reports.py`, `test_revenuecat.py`, `test_security_and_validation.py`, `test_sentry.py`, `test_services_comments.py`, `test_services_follows.py`, `test_services_interactions.py`, `test_services_shares.py`, `test_services_uploads.py`, `test_settings.py`, `test_share_pipeline.py`, `test_smoke.py`, `test_system_health.py`, `test_task_publisher.py`, `test_throttling.py`). The 8 `test_scraper*` files were deleted 2026-09-29 as orphaned — see the count note below.
+- Test files live under `backend/app/tests/` (36 files: `test_adversarial_pass3.py`, `test_auth_regulatory.py`, `test_content_moderation.py`, `test_counter_store.py`, `test_db_router.py`, `test_erasure.py`, `test_feed_license_filter.py`, `test_feed_pool.py`, `test_group_c.py`, `test_hls_token.py`, `test_https_termination.py`, `test_integration_concurrency.py`, `test_integration_pgvector.py`, `test_metrics_endpoint.py`, `test_metrics.py`, `test_mobile_contract.py`, `test_observability_tui.py`, `test_orphan_cleanup.py`, `test_redis_url_precedence.py`, `test_reports.py`, `test_revenuecat.py`, `test_scraper_licensing.py`, `test_security_and_validation.py`, `test_sentry.py`, `test_services_comments.py`, `test_services_follows.py`, `test_services_interactions.py`, `test_services_shares.py`, `test_services_uploads.py`, `test_settings.py`, `test_share_pipeline.py`, `test_suggestions_category_filter.py`, `test_smoke.py`, `test_system_health.py`, `test_task_publisher.py`, `test_throttling.py`). The 8 `test_scraper*` files were deleted 2026-09-29 as orphaned — see the count note below.
 - All tests run against PostgreSQL in Docker. No SQLite fallback.
 - No linting/formatter config (no `.eslintrc` at root, no `pyproject.toml`, no `ruff.toml`).
 - CI: `.github/workflows/django.yml` runs migrations + the test suite via Docker. Blocks merges on failure.

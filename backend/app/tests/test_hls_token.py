@@ -1072,3 +1072,114 @@ class TestPlaybackTokenThrottleScope:
 
         # Without a scope every one of these would be 200.
         assert 429 in codes, f"endpoint was not throttled: {codes}"
+
+
+# ---------------------------------------------------------------------------
+# Placeholder-secret guard
+# ---------------------------------------------------------------------------
+class TestPlaceholderSecretRejected:
+    """A placeholder MEDIA_TOKEN_SECRET is a total compromise, so it must be
+    rejected exactly like a missing one.
+
+    Every env example in this repo ships
+    `MEDIA_TOKEN_SECRET=change-me-to-a-long-random-string`. The previous
+    guard raised only on the empty string, so `cp .env.vps.example .env`
+    followed by a deploy produced a publicly-known HMAC key that is committed
+    to this repository. Anyone able to read the repo could then mint a valid
+    `{"c": "hls/<any_clip>", ...}` token and stream any clip.
+    """
+
+    # The literal value shipped in .env.example, .env.vps.example and
+    # .env.laptop.example. Read from the files when possible so a change to
+    # an example fails this test rather than silently weakening the guard.
+    EXAMPLE_FILES = ('.env.example', '.env.vps.example', '.env.laptop.example')
+
+    def _example_values(self):
+        from pathlib import Path
+        import re
+        found = {}
+        for name in self.EXAMPLE_FILES:
+            p = Path(__file__).resolve().parents[3] / name
+            if not p.exists():
+                continue
+            m = re.search(
+                r'^MEDIA_TOKEN_SECRET=(.*)$',
+                p.read_text(),
+                re.MULTILINE,
+            )
+            if m:
+                found[name] = m.group(1).strip()
+        return found
+
+    def test_shipped_example_placeholder_is_rejected(self, settings):
+        from backend.app.services.hls_token import is_placeholder_secret
+
+        values = self._example_values()
+        assert values, (
+            "Could not read MEDIA_TOKEN_SECRET from any example env file — "
+            "this test would silently stop guarding the real value."
+        )
+        for name, value in values.items():
+            assert is_placeholder_secret(value), (
+                f"{name} ships MEDIA_TOKEN_SECRET={value!r}, which the guard "
+                "does NOT treat as a placeholder. Deploying a copy of this "
+                "file unchanged would leave a publicly-known HMAC key in "
+                "production. Either fix the guard or change the example to "
+                "an obviously-invalid value like <generate-me>."
+            )
+
+    @pytest.mark.parametrize('value', [
+        '',
+        '   ',
+        'change-me-to-a-long-random-string',
+        'change-me',
+        'CHANGEME',
+        'your-secret-here',
+        'replace-me',
+        'placeholder',
+        'not-for-prod',
+        'change_me_something',
+        '<same-as-vps>',
+        '<generate-me>',
+    ])
+    def test_placeholder_families_are_rejected(self, settings, value):
+        from backend.app.services.hls_token import _get_secret
+        settings.MEDIA_TOKEN_SECRET = value
+        with pytest.raises(RuntimeError, match='MEDIA_TOKEN_SECRET'):
+            _get_secret()
+
+    @pytest.mark.parametrize('value', [
+        'test-secret-key-for-unit-tests',
+        'unit-test-secret',
+        'x2P5IuWsPOaBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789',
+    ])
+    def test_real_looking_secrets_are_accepted(self, settings, value):
+        """Guards against a guard that is so aggressive it breaks every
+        environment, including the fixtures the rest of this file uses."""
+        from backend.app.services.hls_token import _get_secret
+        settings.MEDIA_TOKEN_SECRET = value
+        assert _get_secret() == value.encode('utf-8')
+
+    def test_token_generation_refuses_a_placeholder(self, settings):
+        """The exploit surface. Minting must fail, not silently produce a
+        token anyone can forge."""
+        from backend.app.services import hls_token
+        settings.MEDIA_TOKEN_SECRET = 'change-me-to-a-long-random-string'
+        with pytest.raises(RuntimeError, match='placeholder'):
+            hls_token.generate_playback_token(1, 'hls/abc/master.m3u8')
+
+    def test_error_message_tells_the_operator_what_to_do(self, settings):
+        from backend.app.services.hls_token import _get_secret
+        settings.MEDIA_TOKEN_SECRET = 'change-me-to-a-long-random-string'
+        with pytest.raises(RuntimeError) as exc:
+            _get_secret()
+        message = str(exc.value)
+        assert 'token_urlsafe' in message, (
+            "The error must show the command that generates a real key; an "
+            "operator hitting this at deploy time should not have to guess."
+        )
+        assert 'wrangler' in message, (
+            "The error must mention the edge secret, because Django and the "
+            "validating Worker must hold the same value or every /hls/* "
+            "request 403s with a confusing error."
+        )

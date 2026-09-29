@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   Heart,
   MessageSquare,
@@ -53,11 +53,29 @@ export const ReelCard: React.FC<ReelCardProps> = ({
 
   const [isLiked, setIsLiked] = useState<boolean>(clip.is_liked);
   const [likesCount, setLikesCount] = useState<number>(clip.likes);
-  const [isFollowing, setIsFollowing] = useState<boolean>(false);
+  const [isFollowing, setIsFollowing] = useState<boolean>(clip.is_following);
   const [isLikePending, setIsLikePending] = useState<boolean>(false);
+  const [isFollowPending, setIsFollowPending] = useState<boolean>(false);
+  const [followError, setFollowError] = useState<string | null>(null);
 
   const isCurrentPlaying = isActive && currentClip?.id === clip.id && isPlaying;
   const isSelf = user?.id === clip.creator_id;
+
+  // Cards are keyed by a stable clip.id, so useState(clip.x) is captured once
+  // and never re-read. Without this, a feed refresh that updates the server's
+  // follow state leaves the button showing the state from first paint. Keyed on
+  // the prop itself, so an optimistic local update is not immediately undone.
+  useEffect(() => {
+    setIsLiked(clip.is_liked);
+  }, [clip.is_liked]);
+
+  useEffect(() => {
+    setLikesCount(clip.likes);
+  }, [clip.likes]);
+
+  useEffect(() => {
+    setIsFollowing(clip.is_following);
+  }, [clip.is_following]);
 
   const handleLike = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -83,12 +101,25 @@ export const ReelCard: React.FC<ReelCardProps> = ({
   const handleFollowToggle = async (e: React.MouseEvent) => {
     e.stopPropagation();
     if (isSelf) return;
+    // Without this guard, a double-tap issues two toggles and lands back on
+    // the original state — so "Follow" tapped twice silently unfollows. That
+    // is the same class of surprise the hydration above exists to remove.
+    if (isFollowPending) return;
+
+    const previous = isFollowing;
+    setFollowError(null);
+    setIsFollowPending(true);
+    setIsFollowing(!previous); // optimistic
 
     try {
       const res = await followAPI.toggleFollow(clip.creator_id);
       setIsFollowing(res.status === "followed");
     } catch (err) {
+      setIsFollowing(previous); // roll back
+      setFollowError("Could not update follow. Try again.");
       console.warn("Follow toggle failed:", err);
+    } finally {
+      setIsFollowPending(false);
     }
   };
 
@@ -171,27 +202,41 @@ export const ReelCard: React.FC<ReelCardProps> = ({
         </div>
 
         {!isSelf && (
-          <button
-            type="button"
-            onClick={handleFollowToggle}
-            className={`px-3 py-1 rounded text-[10px] font-black uppercase tracking-wider transition-all flex items-center gap-1.5 ${
-              isFollowing
-                ? "bg-white/10 text-white/50 border border-white/10"
-                : "bg-white/10 hover:bg-[#FF6321] hover:text-black text-white border border-white/20"
-            }`}
-          >
-            {isFollowing ? (
-              <>
-                <UserCheck className="w-3 h-3 text-[#FF6321]" />
-                Following
-              </>
-            ) : (
-              <>
-                <UserPlus className="w-3 h-3" />
-                Follow
-              </>
-            )}
-          </button>
+          <div className="flex flex-col items-end gap-1">
+            <button
+              type="button"
+              onClick={handleFollowToggle}
+              disabled={isFollowPending}
+              aria-busy={isFollowPending}
+              className={`px-3 py-1 rounded text-[10px] font-black uppercase tracking-wider transition-all flex items-center gap-1.5 ${
+                isFollowing
+                  ? "bg-white/10 text-white/50 border border-white/10"
+                  : "bg-white/10 hover:bg-[#FF6321] hover:text-black text-white border border-white/20"
+              } ${isFollowPending ? "opacity-60" : ""}`}
+            >
+              {isFollowing ? (
+                <>
+                  <UserCheck className="w-3 h-3 text-[#FF6321]" />
+                  Following
+                </>
+              ) : (
+                <>
+                  <UserPlus className="w-3 h-3" />
+                  Follow
+                </>
+              )}
+            </button>
+            {/* Announced rather than silently swallowed. There is no global
+                toast in this app, and a follow that silently fails looks
+                identical to one that succeeded. */}
+            <span
+              role="status"
+              aria-live="polite"
+              className="text-[9px] font-bold uppercase tracking-wider text-red-400"
+            >
+              {followError ?? ""}
+            </span>
+          </div>
         )}
       </div>
 

@@ -10,6 +10,12 @@ export interface FeedClip {
   skips: number;
   comment_count: number;
   is_liked: boolean;
+  // Added in commit 21846fe. Before this existed, ReelCard initialised its
+  // follow state to a hardcoded `false`, so a creator you already followed
+  // rendered "Follow" and tapping it called the *toggle* endpoint — silently
+  // unfollowing them. The backend field shipped with no consumer; this is the
+  // consumer.
+  is_following: boolean;
   // Present in FeedClipSerializer (backend/app/serializers.py fields list) but
   // previously missing here, so every read of them type-checked against an
   // incomplete type. `duration_ms` is milliseconds, not seconds.

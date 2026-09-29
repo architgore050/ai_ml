@@ -865,7 +865,26 @@ Durable, repo-specific knowledge. Append a concise entry at the end of each sess
 **Open:**
 - **`scrape_audio` and the `scrape_and_import` task are dead at import time** — both import license helpers that no longer exist in `ai_ml/scrapers/base.py`. Not touched by mobile Phase 2; needs a decision (restore helpers or delete the scraper properly).
 - `test_task_publisher.py::TestFlushTelemetryInvalidation` (3) still fails deterministically, not root-caused.
-- Media worker image still needs a rebuild for the `tasks.py` import fix to be permanent; currently `docker cp`'d in.
+- Media worker image still needs a rebuild for the `task.py` import fix to be permanent; currently `docker cp`'d in.
+
+---
+
+### 2026-09-29 — frontend-rebuild-pass-1 (harness, avatar bound, is_following)
+**Learned:**
+- **Read the model before "fixing" a validation gap.** `profile_picture` is `models.ImageField` (`models.py:55`), so DRF already runs Pillow's real `ImageField` decode — the avatar upload was never missing content checks, only a size cap. I wrote a magic-byte allowlist to mirror the audio path, then deleted it: strictly weaker than an actual decode. `_BLOCKED_MAGIC_SIGNATURES` exists for *audio* because audio has many valid headers; an avatar has three. Always check whether the framework already covers the layer.
+- **`ImageField` sets no size limit, and `DATA_UPLOAD_MAX_MEMORY_SIZE` does not apply** — uploads spool to temp files. That was the entire real gap in B1.
+- **Test fixtures must be the thing the test is about.** A flat-colour 1400×1400 PNG is **9 KB, not 6 MB** (needs incompressible random pixels to reach a byte cap), and a synthetic `\x89PNG` header tests Pillow's rejection of garbage rather than the size/extension rule. Assert the fixture's own size/content.
+- **Which DRF layer fires is not inferable from the error text** — a bad extension with non-image content reports `invalid_image`, not `invalid_extension`. Assert the outcome, or the test measures the wrong layer and passes for the wrong reason.
+- **Check `is_authenticated`, not truthiness, on `request.user`.** DRF hands unauthenticated requests a truthy `AnonymousUser`; `if viewer is None` raised `AttributeError: 'AnonymousUser' object has no attribute 'following'`.
+- **N+1 tests measure the whole serializer, not your field.** "0 queries over 10 clips" returned 20 — from pre-existing `creator_name` (FK walk, no `select_related`) and `is_liked` (my queryset skipped that annotation). Isolate your contribution: annotate the neighbours, then add a second test omitting only one of them. **Both N+1s are still live (P2, logged in `docs/frontend_rebuild_plan.md`).**
+- **A corrupt AOF makes every cache-backed test fail as a DNS error and silently masks real results.** `echoflow_redis_cache_local` crash-looped on `Bad file format reading the append only file`; `socket.gethostbyname` fails while the container restarts, so failures read as flaky-connection rather than infrastructure. `docker ps` → `Restarting` is the tell. Non-destructive fix: `docker run --rm -i -v <volume>:/data redis:7-alpine redis-check-aof --fix /data/appendonlydir/appendonly.aof.1.incr.aof` (answer `y`), then `docker compose rm -sf` + `up -d` the service.
+- **`GET /profile/me/` was a 500 for every user and no test covered it.** `UserInteraction.clip` declares no `related_name` (`models.py:256`), so the reverse accessor is `userinteraction`, and `get_liked_clips`' `interactions__*` filter raised `FieldError`. Found only because B2 added a field to a serializer that could not render. **Untested endpoints are broken endpoints — assert 200 on each, not just on the fields under test.**
+
+**Changed:** commits `4ed5cf5` (vitest/RTL harness, `strict`, ErrorBoundary), `9eebc1a` (avatar size+extension bound, B1), `21846fe` (`is_following`, B2 + the `userinteraction` fix). Plan: `docs/frontend_rebuild_plan.md`. Suite 586 → **614 passed, 3 failed, 7 skipped** (the 3 are the pre-existing `TestFlushTelemetryInvalidation` set).
+
+**Open:**
+- Commits 4–11 of the plan: fabricated-`receiver_id` share writes (live data corruption), `watch_time_ms` = media position (ranking exploit), dead auto-advance, and the `ef_session_expired` gap. **The share bug is the most urgent item in the repo.**
+- Two live N+1s on every feed page: `creator_name` needs `select_related('creator')`, `is_liked` needs the `user_has_liked` annotation. Neither is in the plan's commit list.
 
 ---
 
@@ -880,5 +899,39 @@ Accumulated from user corrections. Append on your own when corrected.
 | DOs/DON'Ts → AGENTS.md, updated automatically on correction | Duplicating env-var tables across sections |
 | Link to docs instead of inlining | Asking permission to correct AGENTS.md after a user correction |
 | Record session learnings with `YYYY-MM-DD` slug format | Leaving entries unresolved indefinitely |
+| **Ask before committing when a finding contradicts the plan, or when a fix is broader than the plan's scope** | **Implementing a plan's premise without re-verifying it against the source** |
+| **Read the model/framework layer before adding a validation or guard** | **Adding a check that duplicates something DRF/Django already does** |
+| **Verify a pre-existing failure is pre-existing** (stash, re-run, compare the failure *set*) | **Reporting a green suite that ran on a partially broken stack** |
+| **Ask the user to decide when scope, risk, or a plan's premise is wrong** | **Silently widening or quietly narrowing an approved change** |
+| **Check `docker ps` for `Restarting` containers before trusting test results** | **Reading a DNS/connection error as test flakiness** |
+| **Assert fixture size/content, and isolate your own contribution in a query or error count** | **Asserting a total that other code also contributes to** |
 
-_(No user-corrected entries yet — add rows above as corrections come in.)_
+### Working agreement (owner correction, 2026-09-29)
+
+I make mistakes at a rate that this repo does not tolerate. In the first three
+commits of the frontend rebuild I: asserted a validation gap that the framework
+already covered (B1), wrote a query-count assertion that measured two
+pre-existing N+1s instead of my own field (B2), and reported a passing suite
+while a Redis container was crash-looping underneath it. All three were caught
+late and cost a debugging cycle each.
+
+Going forward:
+
+- **Verify the premise before implementing it.** When a plan asserts that
+  something is missing, read the model, the framework layer, or the
+  neighbouring code first. If reality differs, stop and say so rather than
+  building on the plan's description.
+- **Ask for a decision instead of guessing** whenever scope expands beyond the
+  approved plan, a fix is larger than planned, or two readings are plausible.
+  A question costs a reply; a wrong 3-commit sequence costs a revert and a
+  re-audit. Default to asking when the cost of being wrong exceeds the cost of
+  asking.
+- **Never report a result without confirming the harness was healthy.** Check
+  container status, and confirm a suspicious failure set is unchanged against a
+  stashed baseline before calling anything green.
+- **State uncertainty in the report, not just the conclusion.** "614 passed"
+  without "and by the way a cache container was down" is a misleading report
+  even when the number happens to be right.
+
+Being asked to double-check is not second-guessing; it is the correct
+response to a measured error rate.

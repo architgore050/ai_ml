@@ -707,7 +707,32 @@ class OwnProfileSerializer(serializers.ModelSerializer):
         ).data
 
 class ProfileUpdateSerializer(serializers.ModelSerializer):
-    """For PATCH — only editable fields exposed"""
+    """For PATCH — only editable fields exposed.
+
+    SECURITY (B1): the avatar upload was completely unbounded. Any
+    authenticated user could POST an arbitrarily large file to object storage.
+    The audio path has had an explicit `MAX_SIZE` since Group C item 23
+    (`AudioUploadSerializer.MAX_SIZE`); the avatar path had none, and
+    `Frontend/src/pages/Profile.tsx` labels the field "Max 5MB" while
+    enforcing nothing on either side.
+
+    Two checks only, and it is worth being precise about why there is no
+    third. This field is `models.ImageField` (`models.py:55`), which DRF maps
+    to `serializers.ImageField`; that already calls Pillow's full
+    `Image.open()` + `verify()`, so *content* is validated by an actual decode
+    attempt, which is strictly stronger than a magic-byte sniff — a renamed
+    `evil.exe` cannot pass it. `serializers.py:_BLOCKED_MAGIC_SIGNATURES` is
+    needed for audio because audio has many valid headers and block-listing is
+    the only tractable rule; an avatar has three, but Pillow already covers
+    them, so a hand-rolled header check here would be redundant surface.
+
+    Django's `ImageField` sets no size limit, and an upload is spooled to a
+    temp file rather than held in memory, so `DATA_UPLOAD_MAX_MEMORY_SIZE`
+    does not apply. The explicit cap below is therefore the whole fix.
+    """
+    MAX_SIZE = 5 * 1024 * 1024  # 5 MB
+    ALLOWED_EXT = {'.jpg', '.jpeg', '.png', '.webp'}
+
     class Meta:
         model = User
         fields = ['username', 'profile_picture']
@@ -716,6 +741,21 @@ class ProfileUpdateSerializer(serializers.ModelSerializer):
         user = self.context['request'].user
         if User.objects.exclude(pk=user.pk).filter(username=value).exists():
             raise serializers.ValidationError("Username already taken.")
+        return value
+
+    def validate_profile_picture(self, value):
+        if value is None:
+            return value
+        if value.size > self.MAX_SIZE:
+            raise serializers.ValidationError(
+                f"Image exceeds {self.MAX_SIZE // 1024 // 1024}MB limit."
+            )
+        ext = os.path.splitext(value.name)[1].lower()
+        if ext not in self.ALLOWED_EXT:
+            raise serializers.ValidationError(
+                f"Unsupported image type: {ext}. "
+                f"Allowed: {', '.join(sorted(self.ALLOWED_EXT))}"
+            )
         return value
 
 

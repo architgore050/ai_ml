@@ -651,7 +651,9 @@ LIKE/ERR  #ffb4ab (white icon + count on top, salmon glow)
 ON-SURF   #e2e2e5   ON-SURF-VAR #d5c3b9   OUTLINE #9d8e84   OUTLINE-VAR #51443d
 GLASS     rgba(18,20,22,0.6) + blur(20px)      TINT  ${c}08/0A/18/22/33/44/55
 RADIUS    card 48 · sheet 22 · dialog 20 · chip full
-LAYOUT    14px gutter · 56px header · 100px nav clearance · 470px content cap
+LAYOUT    16px gutter (globals.css:89 --gutter-md; this line previously said 14px,
+          which no source file contains) · 56px header · 100px nav clearance ·
+          470px content cap
 GLYPHS    22px icons · 9px nav · 10px counts · 11px labels · 13px body · 20px title · 28px page
 TRACKING  +0.02em title → +0.08em uppercase micro-labels
 GLOW      0 0 {6,8,12,16,20,24,32}px var(--accent-glow)   ← Platform.select, see D6
@@ -776,8 +778,8 @@ Each phase is independently shippable; one atomic commit each.
 | Phase | Delivers | Gate |
 |---|---|---|
 | **0** | ✅ **Backend PRs A1–A4** (this branch) | done |
-| **1** | Scaffold: SDK 55, expo-router, tokens, UI primitives, API client + zod, auth (register with consent + age gate, login, logout, session restore), error boundary, assets | A3 |
-| **2** | Onboarding + feed shell + player core — one clip plays end-to-end with the token header | A1, A2, Phase 1 |
+| **1** | Scaffold: SDK **57**, expo-router, tokens, UI primitives, API client + zod, auth (register with consent + age gate, login, logout, session restore), error boundary, assets | ✅ done 2026-09-29 (`3aea96d` Phase 0, `51f4383` Phase 1) |
+| **2** | Onboarding + feed shell + player core — one clip plays end-to-end with the token header | A1, A2, Phase 1 ✅ |
 | **3** | Feed interactions: like, comment sheet, share, follow, telemetry, haptics, degraded/202 handling | Phase 2 |
 | **4** | Explore, Profile (own + public), Inbox | Phase 3 |
 | **5** | Upload: record, progress, approve-moderation, status pipeline, my-clips | Phase 3 |

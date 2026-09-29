@@ -348,9 +348,17 @@ services:
         - hf_token
     container_name: echoflow_celery_media_local
     restart: unless-stopped
+    # --concurrency=1, not 2 (2026-09-29): with --pool=prefork each child
+    # process loads its OWN copy of the ML models on first task
+    # (faster_whisper 'base' int8 ~75MB + all-MiniLM-L6-v2 ~90MB + KeyBERT's
+    # default MiniLM ~90MB), then holds an ffmpeg subprocess and a decoded
+    # librosa array for the whole track. Two children × that working set
+    # exceeds the 2G limit below on a 12GB host that is also running a
+    # desktop, which is the OOM AGENTS.md records for this service.
+    # One child halves the peak and still saturates a queue this size.
     command: >
       sh -c "set -e && python wait_for_db.py &&
-              celery -A backend.EchoFlow worker -Q heavy_media --pool=prefork --concurrency=2 --loglevel=info"
+              celery -A backend.EchoFlow worker -Q heavy_media --pool=prefork --concurrency=1 --loglevel=info"
     env_file:
       - .env.local
     depends_on:

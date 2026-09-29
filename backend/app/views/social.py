@@ -12,6 +12,8 @@ the @action send_share which uses the shares_svc service. Narrowing the
 mixin set makes POST /share/ return 405 Method Not Allowed instead of
 500. List/retrieve/destroy continue to work as before.
 """
+import logging
+
 from django.contrib.auth import get_user_model
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, mixins, permissions, status, viewsets
@@ -22,6 +24,9 @@ from ..models import AudioClip, ShareEvent
 from ..serializers import ShareEventSerializer
 from ..services import follows as follows_svc
 from ..services import shares as shares_svc
+from ..services.entitlements import is_license_restricted
+
+logger = logging.getLogger(__name__)
 
 User = get_user_model()
 
@@ -75,11 +80,59 @@ class ShareViewSet(
 
     @action(detail=True, methods=['post'], url_path='send-share')
     def send_share(self, request, pk=None):
-        clip = get_object_or_404(AudioClip, pk=pk)
+        """Send a clip to another user, creating an inbox item.
+
+        SECURITY: the clip lookup is scoped. It was
+        `get_object_or_404(AudioClip, pk=pk)`, which accepted *any* clip id in
+        the table — unmoderated, unencoded, NonCommercial or ShareAlike.
+
+        That is not a cosmetic validation gap. `resolve_clip_access` grants
+        ``ACCESS_SHARED_WITH_ME`` on the existence of a ShareEvent and returns
+        BEFORE the licence check (entitlements.py:108-110, by explicit design
+        so a clean clip can be shared). So sharing an NC clip to a throwaway
+        account handed that account playback of audio the feed is built to
+        withhold, in two requests:
+
+            POST /share/{nc_clip_id}/send-share/  {"receiver_id": <other>}
+            POST /media/playback-token/{nc_clip_id}/       -> 200 + token
+
+        `send-share` had no tests at all, so nothing pinned this.
+
+        The filter below is the same one the feed uses (feed.py:135-137,
+        183-186) rather than an independently-chosen set, so "what the feed
+        will show" and "what can be shared" cannot drift apart. Reusing
+        `is_license_restricted` for the NC/SA half keeps the rule in the one
+        module whose docstring says it is the single source of truth.
+        """
         receiver_id = request.data.get('receiver_id')
         if not receiver_id:
             return Response({'error': 'Receiver ID required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Mirrors find_user's own guard. Sharing with yourself produced a real
+        # ShareEvent and a real counter increment for no benefit.
+        if str(receiver_id) == str(request.user.pk):
+            return Response(
+                {'error': "You can't share with yourself"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         receiver = get_object_or_404(User, id=receiver_id)
+
+        clip = get_object_or_404(
+            AudioClip.objects.filter(
+                status='ready',
+                moderation_approved=True,
+            ),
+            pk=pk,
+        )
+        if is_license_restricted(clip):
+            logger.warning(
+                "send_share refused: licence-restricted clip=%s nc=%s sa=%s",
+                clip.id, clip.is_noncommercial, clip.requires_share_alike,
+            )
+            return Response(
+                {'error': 'This clip may not be shared'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         shares_svc.send_share(sender=request.user, clip=clip, receiver=receiver)
         return Response({'status': 'shared successfully'}, status=status.HTTP_201_CREATED)

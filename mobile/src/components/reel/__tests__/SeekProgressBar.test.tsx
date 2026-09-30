@@ -48,18 +48,21 @@ import { createAudioPlayer } from 'expo-audio';
 import { getAnimatedStyle } from 'react-native-reanimated';
 
 import {
-  A11Y_STEP_SECONDS,
+  DIRECTION_SLOP,
   FILL_EASING,
   FILL_EASING_STOPS,
   SAMPLE_INTERVAL_MS,
   SeekProgressBar,
   TRACK_HEIGHT,
   TRACK_RADIUS,
-  formatClock,
   fractionFromLocation,
   progressFraction,
+  resolveAxis,
   seekTargetFor,
 } from '../SeekProgressBar';
+import { ClipTransport } from '../ClipTransport';
+import { formatTime } from '../../../lib/formatTime';
+import { SKIP_SECONDS } from '../../../lib/skipSeconds';
 import { accessibility, accent, surface } from '../../../design/tokens';
 import { categoryColor } from '../../../design/categories';
 import { MIN_TOUCH_TARGET } from '../../ui/primitives';
@@ -148,19 +151,31 @@ const TOUCH_ID = 1;
  *
  * So `previousX` is the position before this event, which is what makes the
  * accumulated `dx` real. Omit it for a tap, where no movement has happened.
+ *
+ * The `y` pair was added with directional claiming. A vertical drag is now the
+ * behaviour under test, and `PanResponder` derives `dy` from
+ * `previousPageY`/`currentPageY` by exactly the same arithmetic as `dx` — so a
+ * harness with no vertical axis could only ever manufacture `dy === 0`, and
+ * every "this gesture is vertical" assertion would have been satisfied by a
+ * payload that cannot express the case.
  */
-const touch = (locationX: number, previousX: number = locationX) => {
+const touch = (
+  locationX: number,
+  previousX: number = locationX,
+  y: number = 24,
+  previousY: number = y,
+) => {
   touchSeq += 1;
   const point = {
     touchActive: true,
     startPageX: previousX,
-    startPageY: 24,
+    startPageY: previousY,
     startTimeStamp: 1,
     currentPageX: locationX,
-    currentPageY: 24,
+    currentPageY: y,
     currentTimeStamp: touchSeq,
     previousPageX: previousX,
-    previousPageY: 24,
+    previousPageY: previousY,
     previousTimeStamp: touchSeq - 1,
   };
   const touchBank: Array<typeof point | undefined> = [];
@@ -176,9 +191,9 @@ const touch = (locationX: number, previousX: number = locationX) => {
       changedTouches: [{ ...point, identifier: TOUCH_ID }],
       identifier: TOUCH_ID,
       locationX,
-      locationY: 24,
+      locationY: y,
       pageX: locationX,
-      pageY: 24,
+      pageY: y,
       target: TOUCH_ID,
       timestamp: touchSeq,
       touches: [{ ...point, identifier: TOUCH_ID }],
@@ -194,25 +209,225 @@ const layout = (width: number) => ({
 type Rendered = Awaited<ReturnType<typeof render>>;
 type TestElement = ReturnType<Rendered['getByTestId']>;
 
-/** Fire the `onLayout` that gives the bar its width. */
-const layOut = async (bar: TestElement, width = BAR_WIDTH) => {
-  await fireEvent(bar, 'layout', layout(width));
+/**
+ * Dispatch an event straight to the handler the element carries.
+ *
+ * ## Why this is not just `fireEvent`
+ * `fireEvent` runs every event through RNTL's authorization gate
+ * (`dist/fire-event.js:34-47`, `isEventEnabled`), which is a PROXY for the
+ * responder negotiation:
+ *
+ *     const touchStart = nearestTouchResponder?.props.onStartShouldSetResponder?.();
+ *     const touchMove  = nearestTouchResponder?.props.onMoveShouldSetResponder?.();
+ *     if (touchStart || touchMove) return true;
+ *     return touchStart === undefined && touchMove === undefined;
+ *
+ * It is not event-specific, so it gates `layout` and `accessibilityAction` too.
+ * Both `should*` callbacks are invoked with NO ARGS, so `resolveAxis(g.dx, g.dy)`
+ * reads `0, 0` = `'none'`, and under the directional rule the bar answers `false`
+ * to both — at which point the gate returns `false` and swallows everything.
+ * Measured, not assumed: flipping `onStartShouldSetPanResponder` to
+ * `() => false` and changing nothing else turns 13 of the 39 tests in this file
+ * red with zero calls reaching `onPanResponderGrant`.
+ *
+ * That gate is a harness artifact, not production behaviour: on a device the
+ * real negotiation always passes a live `gestureState` (PanResponder's wrapper
+ * closes over it and supplies it regardless), and RN re-consults
+ * `onMoveShouldSetResponder` on every move with the accumulated `dx`/`dy`. So
+ * the gate must be stepped over, not fed a rigged answer.
+ *
+ * ## What is still real here
+ * Nothing is stubbed. Payloads are the same `touchHistory` the previous harness
+ * built, they go through the same `PanResponder` wrapper the `View` is given,
+ * and that wrapper is what computes `dx`/`dy` from `touchHistory`
+ * (`PanResponder.js:490-506` → `_updateGestureStateOnMove`). So the drag-vs-tap
+ * and horizontal-vs-vertical decisions are still made from genuine accumulated
+ * geometry; only RNTL's permission check is bypassed.
+ *
+ * Prop lookup mirrors `getEventHandlerFromProps(..., { loose: true })`: try
+ * `on` + Capitalized, then the bare name.
+ */
+const fire = (el: TestElement, name: string, payload?: unknown) => {
+  const props = el.props as Record<string, ((p?: unknown) => unknown) | undefined>;
+  const prop =
+    props[`on${name.charAt(0).toUpperCase()}${name.slice(1)}`] ?? props[name];
+  if (typeof prop !== 'function') {
+    throw new Error(`SeekProgressBar exposes no handler for "${name}"`);
+  }
+  // CALLED WITHOUT `act`, and that is deliberate rather than lazy.
+  //
+  // Every handler reached through here — the four `*ShouldSetResponder*` props,
+  // the five `onResponder*` props, and the three `onTouch*` props — is a plain
+  // synchronous function over refs, zustand state and Reanimated shared values.
+  // None of them sets React state, so there is nothing for `act` to flush.
+  //
+  // Wrapping them anyway is actively harmful, and the damage is not local. RNTL's
+  // `act` is `withGlobalActEnvironment(reactAct)(async () => await callback())`
+  // (`dist/act.js:96-98`) — it ALWAYS takes the async path, so every call opens
+  // an act scope that is closed only on a later microtask. A nine-event gesture
+  // chains them faster than they close, React reports "overlapping act() calls",
+  // and the leaked scope then suppresses the effects of the NEXT `render` — so
+  // a later `getByTestId` finds an empty tree and the failure lands on an
+  // innocent-looking query instead of on the gesture. Measured: 8 such warnings,
+  // and every test after the first flick went red.
+  //
+  // `settle` / `frame` / `setStore` below DO use `act`, and must: those are the
+  // points where Reanimated's frame loop and the store subscription actually
+  // re-render, so that is where flushing belongs.
+  prop(payload);
 };
 
 /**
- * A complete gesture: grant at `xs[0]`, one move per remaining x (each
- * reporting the previous x so `dx` accumulates), then a release at `end`.
- * `xs` empty = a tap.
+ * TOUCH-DOWN on the responder negotiation, capture phase.
+ *
+ * Not optional decoration: `PanResponder._initializeGestureState` is called
+ * from exactly one place on the way in — `onStartShouldSetResponderCapture`
+ * when `touches.length === 1` (`PanResponder.js:432-434`) — and it is what
+ * zeroes `dx`/`dy` before a sequence accumulates. Skip it and the previous
+ * sequence's displacement leaks into the next one.
  */
-const drag = async (bar: TestElement, xs: number[], end: number) => {
-  const first = xs[0] ?? 0;
-  await fireEvent(bar, 'responderGrant', touch(first));
-  let prev = first;
-  for (const x of xs) {
-    await fireEvent(bar, 'responderMove', touch(x, prev));
-    prev = x;
+const beginSequence = (el: TestElement, at: number, y: number = 24): void => {
+  // `onStartShouldSetResponderCapture` — NOT `onResponderStartShould...`. The
+  // capture handlers drop the `Responder` infix that the bubble ones carry
+  // (`PanResponder.js:429` vs `:459`), while the CONFIG names the other way
+  // round (`onStartShouldSetPanResponderCapture` vs `onPanResponderGrant`).
+  // Both spellings are the install's, and the mismatch is worth writing down.
+  fire(el, 'startShouldSetResponderCapture', touch(at, at, y, y));
+};
+
+/**
+ * ONE move of the negotiation, and the bar's answer.
+ *
+ * Both phases, in the order the platform runs them, because the bubble answer
+ * is UNREACHABLE without the capture phase:
+ *
+ *  - `onMoveShouldSetResponderCapture` (`PanResponder.js:442-457`) calls
+ *    `_updateGestureStateOnMove(gestureState, touchHistory)` FIRST, and only
+ *    then consults the config.
+ *  - `onMoveShouldSetResponder` (`:424-428`) does NOT update the state at all —
+ *    it passes the same closed-over object. A second `gestureState` argument
+ *    handed in from outside is silently DISCARDED, and the bar then reads
+ *    `resolveAxis(0, 0)` = `'none'` and declines to claim. That failure is
+ *    silent and looks exactly like "the bar never claims", so this helper is the
+ *    only correct way to ask.
+ */
+const askMove = (
+  el: TestElement,
+  locationX: number,
+  previousX: number,
+  y: number = 24,
+  previousY: number = 24,
+): boolean => {
+  const payload = touch(locationX, previousX, y, previousY);
+  // `onMoveShouldSetResponderCapture` — see `beginSequence` on the naming.
+  fire(el, 'moveShouldSetResponderCapture', payload);
+  const probe = (el.props as { onMoveShouldSetResponder?: (e: unknown) => boolean })
+    .onMoveShouldSetResponder;
+  if (typeof probe !== 'function') throw new Error('no onMoveShouldSetResponder');
+  // No `act` — see `fire`. This is a read of the same ref, not a state change.
+  return probe(payload) === true;
+};
+
+/**
+ * A ONE-SHOT question: "given a touch that has moved `dx`/`dy`, does the bar
+ * want it?" Self-contained — it initialises the sequence first, so the answer
+ * depends only on the displacement asked about.
+ */
+const wouldClaimMove = (el: TestElement, dx: number, dy: number): boolean => {
+  beginSequence(el, 0, 0);
+  return askMove(el, dx, 0, dy, 0);
+};
+
+/** Fire the `onLayout` that gives the bar its width. */
+const layOut = (bar: TestElement, width = BAR_WIDTH): void => {
+  fire(bar, 'layout', layout(width));
+};
+
+/** Where in a touch sequence the bar took the responder, if it did. */
+type Claim = { claimed: boolean; claimedAt: 'start' | 'move' | null };
+
+/**
+ * THE ARBITRATION, run the way the platform runs it, and a report on who won.
+ *
+ * This is the only helper that can tell the two implementations apart, and the
+ * reason is worth being explicit about. "A vertical drag does not seek" passes
+ * under BOTH the old and the new arbitration — under the old one the bar claimed
+ * on touch-down, but `onPanResponderMove` still saw a vertical axis and
+ * abandoned, so the seek did not happen either. Asserting only "no seek" would
+ * therefore have been a test that passes for the wrong reason, and it would have
+ * looked like proof of the fix.
+ *
+ * What actually differs between the two is whether a GRANT EVER HAPPENED. That
+ * is not a detail: on iOS, `RCTScrollView` disables its own pan recognizer as
+ * soon as a descendant is the JS responder
+ * (`_shouldDisableScrollInteraction` → `handleCustomPan:`), and nothing in JS
+ * can undo it. So "did the bar become the responder" IS "does the feed still
+ * scroll", and that is what this reports.
+ *
+ * The platform's contract, as modelled here: `onStartShouldSetResponder` is
+ * consulted ONCE, on touch-down, before any movement exists. If it declines,
+ * `onMoveShouldSetResponder` is consulted on every move until one of them
+ * agrees, and the grant lands there. The first answer wins and is never revisited.
+ */
+const negotiate = (bar: TestElement, deltas: Array<{ dx: number; dy: number }>): Claim => {
+  if (bar.props.onStartShouldSetResponder?.() === true) {
+    return { claimed: true, claimedAt: 'start' };
   }
-  await fireEvent(bar, 'responderRelease', touch(end, prev));
+  beginSequence(bar, 0, 0);
+  let x = 0;
+  let y = 0;
+  for (const d of deltas) {
+    const nextX = x + d.dx;
+    const nextY = y + d.dy;
+    if (askMove(bar, nextX, x, nextY, y)) return { claimed: true, claimedAt: 'move' };
+    x = nextX;
+    y = nextY;
+  }
+  return { claimed: false, claimedAt: null };
+};
+
+/**
+ * The move displacements a flick produces, in the order the pager sees them. The
+ * first is already tens of dp — a real flick never starts sub-slop — and the
+ * steps grow because a flick accelerates.
+ */
+const flickDeltas = (dy = -120) => [
+  { dx: 0, dy: dy * 0.4 },
+  { dx: 0, dy: dy * 0.4 },
+  { dx: 0, dy: dy * 0.2 },
+];
+
+/**
+ * A STATIONARY tap: arm on touch-down, commit on touch-up, no responder event
+ * anywhere.
+ *
+ * This is the shape a real tap now takes, and it is a DIFFERENT set of handlers
+ * than the old harness used. A tap used to be `responderGrant` +
+ * `responderRelease`, which was only possible because the bar claimed the touch
+ * on touch-down. It no longer does, so there is no grant to give — the tap
+ * commits on the direct touch channel instead.
+ */
+const tap = (bar: TestElement, at: number): void => {
+  fire(bar, 'touchStart', touch(at));
+  fire(bar, 'touchEnd', touch(at));
+};
+
+/**
+ * A VERTICAL flick that begins on the bar, and therefore the feed's problem
+ * rather than the bar's.
+ *
+ * Modelled as the platform does it: arm the tap, negotiate the moves, then
+ * CANCEL — a vertical flick inside a UIScrollView is cancelled by the recognizer
+ * that took it (`RCTTouchHandler.m:320-323` turns `touchesCancelled` into
+ * `touchCancel`), never ended. The x is held still on purpose, so `dy` is
+ * unambiguously the only axis in play.
+ */
+const flickUp = (bar: TestElement, at = 150, dy = -120): Claim => {
+  fire(bar, 'touchStart', touch(at));
+  const claim = negotiate(bar, flickDeltas(dy));
+  fire(bar, 'touchCancel', touch(at, at, dy, dy));
+  return claim;
+
 };
 
 /** Advance past the in-flight fill animation. */
@@ -282,11 +497,21 @@ describe('SeekProgressBar', () => {
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
 
-      // Read the prop directly rather than through `fireEvent`: RNTL's
-      // `isEventEnabled` consults `onStartShouldSetResponder()` itself, so a
-      // `fireEvent` here would be swallowed by the HARNESS and the assertion
-      // would pass for the wrong reason.
+      // Read the props directly rather than through `fireEvent`: RNTL's
+      // `isEventEnabled` consults `onStartShouldSetResponder()` /
+      // `onMoveShouldSetResponder()` itself (see `fire`), so a `fireEvent` here
+      // would be swallowed by the HARNESS and the assertion would pass for the
+      // wrong reason.
+      //
+      // STRENGTHENED: `onStartShouldSetResponder()` alone no longer proves
+      // anything — under directional claiming it is `false` on every bar,
+      // interactive or not, because claiming at touch-down is the bug being
+      // fixed. The claim question now lives on `onMoveShouldSetResponder`, so
+      // THAT is what has to answer false. The old assertion is kept alongside
+      // it because the gate still reads it, and a future change that starts
+      // claiming on start must be caught here too.
       expect(bar.props.onStartShouldSetResponder()).toBe(false);
+      expect(wouldClaimMove(bar, 40, 0)).toBe(false);
       expect(bar.props.pointerEvents).toBe('none');
       expect(bar.props.accessibilityState).toEqual({ disabled: true });
     });
@@ -298,8 +523,8 @@ describe('SeekProgressBar', () => {
       seedStore({ currentTime: 0, duration: 0 });
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
-      await layOut(bar);
-      await drag(bar, [], 150);
+      layOut(bar);
+      await tap(bar, 150);
 
       expect(fakePlayer.seekTo).not.toHaveBeenCalled();
     });
@@ -342,7 +567,12 @@ describe('SeekProgressBar', () => {
       await settle();
 
       expect(widthPercent(getByTestId('seek-progress-fill'))).toBe(0);
+      // STRENGTHENED — see the note in `refuses the gesture at the responder
+      // boundary`: `onStartShouldSetResponder()` is `false` unconditionally
+      // under directional claiming, so the interactivity question has moved to
+      // `onMoveShouldSetResponder`.
       expect(getByTestId('seek-progress-bar').props.onStartShouldSetResponder()).toBe(false);
+      expect(wouldClaimMove(getByTestId('seek-progress-bar'), 40, 0)).toBe(false);
     });
 
     it('uses the exact stored fraction in between', async () => {
@@ -385,8 +615,8 @@ describe('SeekProgressBar', () => {
         <SeekProgressBar clipId={CLIP_ID} onSeekResult={onSeekResult} />,
       );
       const bar = getByTestId('seek-progress-bar');
-      await layOut(bar);
-      await drag(bar, [], 150);
+      layOut(bar);
+      await tap(bar, 150);
 
       expect(fakePlayer.seekTo).toHaveBeenCalledTimes(1);
       expect(fakePlayer.seekTo).toHaveBeenCalledWith(30);
@@ -403,8 +633,8 @@ describe('SeekProgressBar', () => {
       ] as const) {
         seedStore({ currentTime: 0, duration: DURATION });
         const { getByTestId, unmount } = await render(<SeekProgressBar clipId={CLIP_ID} />);
-        await layOut(getByTestId('seek-progress-bar'));
-        await drag(getByTestId('seek-progress-bar'), [], x);
+        layOut(getByTestId('seek-progress-bar'));
+        await tap(getByTestId('seek-progress-bar'), x);
         expect(fakePlayer.seekTo).toHaveBeenLastCalledWith(seconds);
         fakePlayer.seekTo.mockClear();
         await unmount();
@@ -419,13 +649,13 @@ describe('SeekProgressBar', () => {
       seedStore({ currentTime: 0, duration: DURATION });
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
-      await layOut(bar);
+      layOut(bar);
 
-      await drag(bar, [], -80);
+      await tap(bar, -80);
       expect(fakePlayer.seekTo).toHaveBeenLastCalledWith(0);
       fakePlayer.seekTo.mockClear();
 
-      await drag(bar, [], 9999);
+      await tap(bar, 9999);
       expect(fakePlayer.seekTo).toHaveBeenLastCalledWith(DURATION);
     });
 
@@ -437,7 +667,7 @@ describe('SeekProgressBar', () => {
       const { getByTestId } = await render(
         <SeekProgressBar clipId={CLIP_ID} onSeekResult={onSeekResult} />,
       );
-      await drag(getByTestId('seek-progress-bar'), [], 150);
+      await tap(getByTestId('seek-progress-bar'), 150);
 
       expect(fakePlayer.seekTo).not.toHaveBeenCalled();
       expect(onSeekResult).toHaveBeenCalledWith(null);
@@ -462,19 +692,19 @@ describe('SeekProgressBar', () => {
       seedStore({ currentTime: 0, duration: DURATION, playing: true });
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
-      await layOut(bar);
+      layOut(bar);
 
       // 40 move events, then a release. Native must be told ONCE: 40 seeks would
       // queue 40 discontinuity events in the player for one finger movement.
       const xs = Array.from({ length: 40 }, (_, i) => 4 + i * 6);
-      await fireEvent(bar, 'responderGrant', touch(xs[0] as number));
+      await fire(bar, 'responderGrant', touch(xs[0] as number));
       let prev = xs[0] as number;
       for (const x of xs) {
-        await fireEvent(bar, 'responderMove', touch(x, prev));
+        await fire(bar, 'responderMove', touch(x, prev));
         prev = x;
       }
       expect(fakePlayer.seekTo).not.toHaveBeenCalled();
-      await fireEvent(bar, 'responderRelease', touch(prev, prev));
+      await fire(bar, 'responderRelease', touch(prev, prev));
 
       expect(fakePlayer.seekTo).toHaveBeenCalledTimes(1);
     });
@@ -483,17 +713,17 @@ describe('SeekProgressBar', () => {
       seedStore({ currentTime: 0, duration: DURATION, playing: true });
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
-      await layOut(bar);
+      layOut(bar);
       const fill = getByTestId('seek-progress-fill');
 
-      await fireEvent(bar, 'responderGrant', touch(10));
-      await fireEvent(bar, 'responderMove', touch(150, 10));
+      await fire(bar, 'responderGrant', touch(10));
+      await fire(bar, 'responderMove', touch(150, 10));
       await frame();
       // The fill tracks the finger EXACTLY — no easing on a drag.
       expect(widthPercent(fill)).toBeCloseTo(50, 3);
       expect(fakePlayer.seekTo).not.toHaveBeenCalled();
 
-      await fireEvent(bar, 'responderRelease', touch(150, 150));
+      await fire(bar, 'responderRelease', touch(150, 150));
       await frame();
       // Lands ON the committed position rather than easing back to it.
       expect(widthPercent(fill)).toBeCloseTo(50, 3);
@@ -501,16 +731,33 @@ describe('SeekProgressBar', () => {
     });
 
     it('treats a sub-slop nudge as a tap, not a drag', async () => {
+      // NAME UNCHANGED, SCOPE NARROWED, and the reason is worth stating.
+      //
+      // This used to be the only sub-slop test, and it drove
+      // `responderGrant` → `responderMove` → `responderRelease`, a shape that was
+      // possible solely because the bar claimed the touch on touch-down. Under
+      // directional claiming a real 2 dp nudge never reaches those handlers at
+      // all — it is sub-slop on both axes, so `resolveAxis` says `'none'`, the
+      // bar does not claim, and the tap commits on the direct touch channel.
+      // That case now lives in `a sub-slop wobble is still a tap` under the
+      // arbitration block.
+      //
+      // What is left here, and is still worth pinning, is the GRANTED path's
+      // handling of a sub-slop displacement: the preview must stay put rather
+      // than chase the finger by 2 px, and the commit must still land at the
+      // RELEASE position. That is a separate property from the arbitration, and
+      // it is not covered by the other test.
       seedStore({ currentTime: 0, duration: DURATION });
+
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
-      await layOut(bar);
+      layOut(bar);
 
       // 2 px of movement, under MIN_DRAG_SLOP. The commit is still made, and it
       // is made at the release position.
-      await fireEvent(bar, 'responderGrant', touch(148));
-      await fireEvent(bar, 'responderMove', touch(150, 148));
-      await fireEvent(bar, 'responderRelease', touch(150, 150));
+      await fire(bar, 'responderGrant', touch(148));
+      await fire(bar, 'responderMove', touch(150, 148));
+      await fire(bar, 'responderRelease', touch(150, 150));
 
       expect(fakePlayer.seekTo).toHaveBeenCalledTimes(1);
       expect(fakePlayer.seekTo).toHaveBeenCalledWith(30);
@@ -520,13 +767,327 @@ describe('SeekProgressBar', () => {
       seedStore({ currentTime: 0, duration: DURATION, playing: true });
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
-      await layOut(bar);
+      layOut(bar);
 
-      await fireEvent(bar, 'responderGrant', touch(10));
-      await fireEvent(bar, 'responderMove', touch(150, 10));
-      await fireEvent(bar, 'responderTerminate', touch(150, 150));
+      await fire(bar, 'responderGrant', touch(10));
+      await fire(bar, 'responderMove', touch(150, 10));
+      await fire(bar, 'responderTerminate', touch(150, 150));
 
       expect(fakePlayer.seekTo).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Directional claiming: a vertical drag is the FEED's, not the bar's
+  // -------------------------------------------------------------------------
+
+  describe('arbitrating a drag against the feed pager', () => {
+    it('never claims the responder on touch-down, so the pager always gets the touch', async () => {
+      seedStore({ currentTime: 0, duration: DURATION });
+      const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
+      const bar = getByTestId('seek-progress-bar');
+
+      // THE load-bearing assertion. Read from the prop because the prop IS the
+      // contract: `onStartShouldSetResponder` is consulted exactly once, on
+      // touch-down, before any movement exists, so a `true` here is
+      // unconditional and no later event can undo it. On iOS that is fatal for
+      // a vertical feed — `RCTScrollView._shouldDisableScrollInteraction`
+      // disables the pager's own pan recognizer as soon as a DESCENDANT is the
+      // JS responder, and there is no JS API to give the responder back.
+      expect(bar.props.onStartShouldSetResponder()).toBe(false);
+
+      // ...and the bar is genuinely interactive, so this is the directional rule
+      // and not the `duration > 0` gate wearing the same answer.
+      expect(wouldClaimMove(bar, 40, 0)).toBe(true);
+    });
+
+    it('a vertical drag starting on the bar never becomes the responder', async () => {
+      seedStore({ currentTime: 0, duration: DURATION });
+      const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
+      const bar = getByTestId('seek-progress-bar');
+
+      // THE assertion that actually discriminates. Under the old arbitration
+      // this returns `{ claimed: true, claimedAt: 'start' }` — the bar took the
+      // touch on touch-down, which is the bug, and which on iOS is what turns
+      // off the feed's own pan recognizer for that gesture.
+      expect(negotiate(bar, flickDeltas())).toEqual({ claimed: false, claimedAt: null });
+
+      // Same answer with x held still, with a much larger first jump, and with
+      // the flick the other way. The direction of the flick cannot matter to a
+      // vertical feed, and a slow start must not change the answer either.
+      expect(negotiate(bar, flickDeltas(120))).toEqual({ claimed: false, claimedAt: null });
+      expect(negotiate(bar, [{ dx: 0, dy: -400 }])).toEqual({
+        claimed: false,
+        claimedAt: null,
+      });
+    });
+
+    it('a diagonal drag is the FEED\'s, not the bar\'s', async () => {
+      // 45 degrees is a genuine ambiguity, and it is resolved conservatively.
+      // In a vertically paging feed a diagonal flick is far more often someone
+      // changing reel than someone scrubbing, and the two failures are not
+      // symmetric: a wrong scrub is a one-off annoyance, a wrong page gesture is
+      // a control that looks broken.
+      seedStore({ currentTime: 0, duration: DURATION });
+      const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
+
+      expect(negotiate(getByTestId('seek-progress-bar'), [{ dx: 0, dy: -60 }])).toEqual({
+        claimed: false,
+        claimedAt: null,
+      });
+      // Past `DIRECTION_SLOP` and clearly sideways: now it is a scrub.
+      expect(negotiate(getByTestId('seek-progress-bar'), [{ dx: 60, dy: 0 }])).toEqual({
+        claimed: true,
+        claimedAt: 'move',
+      });
+    });
+
+    it('a vertical drag does not seek, and does not report a refusal either', async () => {
+      seedStore({ currentTime: 0, duration: DURATION, playing: true });
+      const onSeekResult = jest.fn();
+      const { getByTestId } = await render(
+        <SeekProgressBar clipId={CLIP_ID} onSeekResult={onSeekResult} />,
+      );
+      const bar = getByTestId('seek-progress-bar');
+      layOut(bar);
+
+      // End-to-end guarantee on top of the arbitration assertion above. It is
+      // NOT the discriminating test — it passes under the old arbitration too,
+      // because the old `onPanResponderMove` also saw a vertical axis and
+      // abandoned — so it is kept for the guarantee, and the negotiation
+      // assertion is kept for the proof.
+      expect(negotiate(bar, flickDeltas())).toEqual({ claimed: false, claimedAt: null });
+      flickUp(bar);
+
+      // No seek...
+      expect(fakePlayer.seekTo).not.toHaveBeenCalled();
+      // ...and no "refused" either. The user never asked for a seek, so
+      // `onSeekResult(null)` here would be a lie the parent could log or
+      // surface; and this is the common case, not an edge — most scrolls in a
+      // full-bleed feed cross this row.
+      expect(onSeekResult).not.toHaveBeenCalled();
+    });
+
+    it('a vertical drag that ENDS on the bar still does not seek', async () => {
+      // The nastier shape, and the one a pure `onTouchEnd` tap channel gets
+      // wrong: the finger is released over the bar even though it went
+      // vertically. `onTouchCancel` is the platform's own signal, so a real
+      // flick never reaches `onTouchEnd` — but the arm must be revoked on the
+      // MOVE too, so the row cannot be armed by a gesture that has already
+      // been ruled vertical.
+      seedStore({ currentTime: 0, duration: DURATION });
+      const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
+      const bar = getByTestId('seek-progress-bar');
+      layOut(bar);
+
+      await fire(bar, 'touchStart', touch(150));
+      beginSequence(bar, 150, 0);
+      // Sub-slop on both axes: still undecided, so the tap is NOT revoked.
+      expect(askMove(bar, 150, 150, -6, 0)).toBe(false);
+      // 40 dp vertically: the feed's scroll, and the arm is revoked.
+      expect(askMove(bar, 150, 150, -40, -6)).toBe(false);
+      await fire(bar, 'touchEnd', touch(150));
+
+      expect(fakePlayer.seekTo).not.toHaveBeenCalled();
+    });
+
+    it('a horizontal drag claims, previews, and seeks exactly once on release', async () => {
+      seedStore({ currentTime: 0, duration: DURATION, playing: true });
+      const onSeekResult = jest.fn();
+      const { getByTestId } = await render(
+        <SeekProgressBar clipId={CLIP_ID} onSeekResult={onSeekResult} />,
+      );
+      const bar = getByTestId('seek-progress-bar');
+      const fill = getByTestId('seek-progress-fill');
+      layOut(bar);
+
+      await fire(bar, 'touchStart', touch(10));
+      // The claim, and the mirror of the vertical case: the bar is NOT the
+      // responder at touch-down and IS the responder after the first horizontal
+      // move. `claimedAt: 'move'` is the whole point — under the old
+      // arbitration this returned `'start'`, which is the bug.
+      expect(negotiate(bar, [{ dx: 12, dy: 1 }])).toEqual({
+        claimed: true,
+        claimedAt: 'move',
+      });
+      await fire(bar, 'responderGrant', touch(10));
+      await fire(bar, 'responderMove', touch(150, 10));
+      await frame();
+
+      // Previews under the finger, and has NOT committed — a seek per move
+      // would queue a discontinuity per event for one finger movement.
+      expect(widthPercent(fill)).toBeCloseTo(50, 3);
+      expect(fakePlayer.seekTo).not.toHaveBeenCalled();
+      expect(onSeekResult).not.toHaveBeenCalled();
+
+      await fire(bar, 'responderRelease', touch(150, 150));
+
+      // ONCE. 150/300 of 60 s = 30 s.
+      expect(fakePlayer.seekTo).toHaveBeenCalledTimes(1);
+      expect(fakePlayer.seekTo).toHaveBeenCalledWith(30);
+      expect(onSeekResult).toHaveBeenCalledTimes(1);
+      expect(onSeekResult).toHaveBeenCalledWith({ requested: 30, target: 30 });
+    });
+
+    it('a horizontal drag cannot also be committed by the tap channel', async () => {
+      // The two channels are independent mechanisms, so they could double-commit
+      // if the claim did not revoke the arm. Whichever of `touchEnd` and
+      // `responderRelease` the platform delivers FIRST, the answer is one seek.
+      seedStore({ currentTime: 0, duration: DURATION });
+      const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
+      const bar = getByTestId('seek-progress-bar');
+      layOut(bar);
+
+      await fire(bar, 'touchStart', touch(10));
+      expect(negotiate(bar, [{ dx: 30, dy: 0 }])).toEqual({ claimed: true, claimedAt: 'move' });
+      await fire(bar, 'responderGrant', touch(10));
+      // touchEnd FIRST, then the responder release.
+      await fire(bar, 'touchEnd', touch(150));
+      await fire(bar, 'responderRelease', touch(150, 150));
+
+      expect(fakePlayer.seekTo).toHaveBeenCalledTimes(1);
+      expect(fakePlayer.seekTo).toHaveBeenCalledWith(30);
+    });
+
+    it('a stationary tap still seeks, on the direct touch channel', async () => {
+      seedStore({ currentTime: 0, duration: DURATION });
+      const onSeekResult = jest.fn();
+      const { getByTestId } = await render(
+        <SeekProgressBar clipId={CLIP_ID} onSeekResult={onSeekResult} />,
+      );
+      const bar = getByTestId('seek-progress-bar');
+      layOut(bar);
+
+      // No responder event anywhere: the bar is not the responder for a tap, so
+      // this is the only channel left. Removing it is what "claiming later"
+      // would silently do to tap-to-seek.
+      await tap(bar, 150);
+
+      expect(fakePlayer.seekTo).toHaveBeenCalledTimes(1);
+      expect(fakePlayer.seekTo).toHaveBeenCalledWith(30);
+      expect(onSeekResult).toHaveBeenCalledWith({ requested: 30, target: 30 });
+    });
+
+    it('a sub-slop wobble is still a tap', async () => {
+      // Inside the slop on both axes the intent is genuinely undecided, and
+      // `resolveAxis` says `'none'`. The bar must neither claim nor revoke the
+      // tap: a 3 dp wobble is how most people actually tap, and it is the case
+      // a "claim on any move" rule would break.
+      seedStore({ currentTime: 0, duration: DURATION });
+      const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
+      const bar = getByTestId('seek-progress-bar');
+      layOut(bar);
+
+      await fire(bar, 'touchStart', touch(148));
+      expect(wouldClaimMove(bar, 3, -3)).toBe(false);
+      await fire(bar, 'touchEnd', touch(150));
+
+      expect(fakePlayer.seekTo).toHaveBeenCalledTimes(1);
+      expect(fakePlayer.seekTo).toHaveBeenCalledWith(30);
+    });
+
+    it('refuses to seek a tap before the bar has been laid out', async () => {
+      // The tap channel is a second entry point, so the `duration > 0` refusal
+      // and the no-geometry refusal have to hold on it too — otherwise a tap
+      // becomes a way around the Android "seek queues onto the NEXT clip" trap.
+      seedStore({ currentTime: 0, duration: DURATION });
+      const onSeekResult = jest.fn();
+      const { getByTestId } = await render(
+        <SeekProgressBar clipId={CLIP_ID} onSeekResult={onSeekResult} />,
+      );
+
+      await tap(getByTestId('seek-progress-bar'), 150);
+
+      expect(fakePlayer.seekTo).not.toHaveBeenCalled();
+      expect(onSeekResult).toHaveBeenCalledWith(null);
+    });
+
+    it('a second finger disarms the tap rather than seeking on pinch', async () => {
+      seedStore({ currentTime: 0, duration: DURATION });
+      const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
+      const bar = getByTestId('seek-progress-bar');
+      layOut(bar);
+
+      // PanResponder's own start capture keys on `touches.length` for the same
+      // reason: with two touches the centroid is not a finger position, so a
+      // position derived from it is not a place to seek to.
+      const twoFingers = { ...touch(150), nativeEvent: { ...touch(150).nativeEvent, touches: [
+        { ...touch(150).nativeEvent.touches[0], identifier: 1 },
+        { ...touch(150).nativeEvent.touches[0], identifier: 2, pageX: 200 },
+      ] } };
+      await fire(bar, 'touchStart', twoFingers);
+      await fire(bar, 'touchEnd', touch(150));
+
+      expect(fakePlayer.seekTo).not.toHaveBeenCalled();
+    });
+
+    it('a cancel disarms the tap, so a cancelled sequence seeks nothing', async () => {
+      seedStore({ currentTime: 0, duration: DURATION });
+      const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
+      const bar = getByTestId('seek-progress-bar');
+      layOut(bar);
+
+      await fire(bar, 'touchStart', touch(150));
+      await fire(bar, 'touchCancel', touch(150));
+      // A stray touchEnd after the cancel must not resurrect the arm.
+      await fire(bar, 'touchEnd', touch(150));
+
+      expect(fakePlayer.seekTo).not.toHaveBeenCalled();
+    });
+
+    it('resolveAxis separates the three intents, and treats a diagonal as vertical', () => {
+      // Below the slop on both axes: undecided, claim nothing.
+      expect(resolveAxis(0, 0)).toBe('none');
+      expect(resolveAxis(DIRECTION_SLOP, DIRECTION_SLOP)).toBe('none');
+      // One dp over on one axis is a decision.
+      expect(resolveAxis(DIRECTION_SLOP + 1, 0)).toBe('horizontal');
+      expect(resolveAxis(0, DIRECTION_SLOP + 1)).toBe('vertical');
+      expect(resolveAxis(0, -(DIRECTION_SLOP + 1))).toBe('vertical');
+      // 45-degree cone, and the tie resolves to the FEED, not to the bar.
+      expect(resolveAxis(40, -39)).toBe('horizontal');
+      expect(resolveAxis(-39, 40)).toBe('vertical');
+      expect(resolveAxis(30, 30)).toBe('vertical');
+      // Total: nothing undecided resolves to a claim, and nothing is a claim
+      // unless it is real.
+      for (const [dx, dy] of [
+        [Number.NaN, 0],
+        [0, Number.NaN],
+        [Number.POSITIVE_INFINITY, 0],
+        [0, Number.NEGATIVE_INFINITY],
+        [Number.NaN, Number.NaN],
+      ] as const) {
+        expect(resolveAxis(dx, dy)).toBe('none');
+      }
+    });
+
+    it('the claim slop and the preview slop are genuinely independent', async () => {
+      // Two different questions, deliberately two different numbers. 8 dp asks
+      // "is this a scrub or a page flick?" and gates the claim; 3 dp asks "has
+      // the finger visibly moved sideways?" and gates the preview. So there is a
+      // band — between 3 and 8 dp — where the bar has CLAIMED but must not yet
+      // have previewed. If the two ever collapse to one number this band
+      // disappears, and the failure mode is a bar that jumps under the thumb
+      // before the user has committed to a scrub.
+      seedStore({ currentTime: 0, duration: DURATION, playing: true });
+      const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
+      const bar = getByTestId('seek-progress-bar');
+      const fill = getByTestId('seek-progress-fill');
+      layOut(bar);
+
+      await fire(bar, 'touchStart', touch(10));
+      // 5 dp: past the preview slop (3), short of the claim slop (8).
+      expect(negotiate(bar, [{ dx: 5, dy: 0 }])).toEqual({ claimed: false, claimedAt: null });
+      await fire(bar, 'touchEnd', touch(15));
+      fakePlayer.seekTo.mockClear();
+
+      // 9 dp: over the claim slop, and now the drag previews.
+      await fire(bar, 'touchStart', touch(10));
+      expect(negotiate(bar, [{ dx: 9, dy: 0 }])).toEqual({ claimed: true, claimedAt: 'move' });
+      await fire(bar, 'responderGrant', touch(10));
+      await fire(bar, 'responderMove', touch(19, 10));
+      await frame();
+      // 19/300 of a 300 pt bar = 6.3%, i.e. the finger, not the grant position.
+      expect(widthPercent(fill)).toBeCloseTo(6.33, 1);
     });
   });
 
@@ -544,11 +1105,21 @@ describe('SeekProgressBar', () => {
         <SeekProgressBar clipId={CLIP_ID} onSeekResult={onSeekResult} />,
       );
       const bar = getByTestId('seek-progress-bar');
-      await layOut(bar);
-      expect(bar.props.onStartShouldSetResponder()).toBe(true);
+      layOut(bar);
+      // CHANGED (was `expect(bar.props.onStartShouldSetResponder()).toBe(true)`).
+      // That assertion encoded the OLD arbitration: the bar claimed the touch
+      // on touch-down, so "interactive" was observable there. Under directional
+      // claiming the bar never claims at touch-down — that is the fix — so the
+      // assertion is not merely outdated, it now asserts the BUG.
+      //
+      // Its purpose is preserved verbatim above it: prove nothing EXCEPT the
+      // `clampSeekTime` null is holding the seek back. Under the new rule that
+      // means proving the bar WOULD claim a committed horizontal scrub, which is
+      // the gesture this test drives (`tap(bar, 150)`).
+      expect(wouldClaimMove(bar, 20, 0)).toBe(true);
 
       const spy = jest.spyOn(playerModule, 'clampSeekTime').mockReturnValue(null);
-      await drag(bar, [], 150);
+      await tap(bar, 150);
 
       // The load-bearing assertion: NOT `seekTo(0)`.
       expect(fakePlayer.seekTo).not.toHaveBeenCalled();
@@ -560,10 +1131,10 @@ describe('SeekProgressBar', () => {
       seedStore({ currentTime: 0, duration: DURATION });
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
-      await layOut(bar);
+      layOut(bar);
 
       const spy = jest.spyOn(playerModule, 'clampSeekTime');
-      await drag(bar, [], 150);
+      await tap(bar, 150);
 
       // The component must not re-derive the bounds itself.
       expect(spy).toHaveBeenCalledWith(30, DURATION);
@@ -588,17 +1159,17 @@ describe('SeekProgressBar', () => {
       seedStore({ currentTime: 0, duration: DURATION, playing: true });
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
-      await layOut(bar);
+      layOut(bar);
 
-      await fireEvent(bar, 'responderGrant', touch(10));
-      await fireEvent(bar, 'responderMove', touch(120, 10));
+      await fire(bar, 'responderGrant', touch(10));
+      await fire(bar, 'responderMove', touch(120, 10));
 
       // ONLY the store changes — the props are untouched, so no effect keyed on
       // props can save us here. The live check inside the responder handlers is
       // the only thing that can, which is what makes this test non-vacuous.
       await setStore({ playingClipId: OTHER_CLIP_ID });
 
-      await fireEvent(bar, 'responderRelease', touch(150, 120));
+      await fire(bar, 'responderRelease', touch(150, 120));
       expect(fakePlayer.seekTo).not.toHaveBeenCalled();
     });
 
@@ -606,14 +1177,14 @@ describe('SeekProgressBar', () => {
       seedStore({ currentTime: 0, duration: DURATION, playing: true });
       const { getByTestId, rerender } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
-      await layOut(bar);
+      layOut(bar);
 
-      await fireEvent(bar, 'responderGrant', touch(10));
-      await fireEvent(bar, 'responderMove', touch(120, 10));
+      await fire(bar, 'responderGrant', touch(10));
+      await fire(bar, 'responderMove', touch(120, 10));
 
       await rerender(<SeekProgressBar clipId={OTHER_CLIP_ID} />);
 
-      await fireEvent(bar, 'responderRelease', touch(150, 120));
+      await fire(bar, 'responderRelease', touch(150, 120));
       expect(fakePlayer.seekTo).not.toHaveBeenCalled();
     });
 
@@ -622,15 +1193,15 @@ describe('SeekProgressBar', () => {
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
       const fill = getByTestId('seek-progress-fill');
-      await layOut(bar);
+      layOut(bar);
 
-      await fireEvent(bar, 'responderGrant', touch(10));
-      await fireEvent(bar, 'responderMove', touch(150, 10));
+      await fire(bar, 'responderGrant', touch(10));
+      await fire(bar, 'responderMove', touch(150, 10));
       await frame();
       expect(widthPercent(fill)).toBeCloseTo(50, 3);
 
       await setStore({ playingClipId: OTHER_CLIP_ID, currentTime: 0 });
-      await fireEvent(bar, 'responderMove', touch(200, 150));
+      await fire(bar, 'responderMove', touch(200, 150));
       await frame();
       // The drag is dead, so the move cannot drag the thumb any further.
       expect(widthPercent(fill)).toBeCloseTo(0, 3);
@@ -640,16 +1211,16 @@ describe('SeekProgressBar', () => {
       seedStore({ currentTime: 0, duration: DURATION, playing: true });
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
-      await layOut(bar);
+      layOut(bar);
 
-      await fireEvent(bar, 'responderGrant', touch(10));
-      await fireEvent(bar, 'responderMove', touch(120, 10));
+      await fire(bar, 'responderGrant', touch(10));
+      await fire(bar, 'responderMove', touch(120, 10));
 
       // `didJustFinish` is a ONE-tick pulse on both platforms, so the durable
       // signal is the store's latch of it into `ended`.
       await setStore({ playback: 'ended' });
 
-      await fireEvent(bar, 'responderRelease', touch(150, 120));
+      await fire(bar, 'responderRelease', touch(150, 120));
       expect(fakePlayer.seekTo).not.toHaveBeenCalled();
     });
 
@@ -657,13 +1228,13 @@ describe('SeekProgressBar', () => {
       seedStore({ currentTime: 0, duration: DURATION, playing: true });
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
-      await layOut(bar);
+      layOut(bar);
 
-      await fireEvent(bar, 'responderGrant', touch(10));
-      await fireEvent(bar, 'responderMove', touch(120, 10));
+      await fire(bar, 'responderGrant', touch(10));
+      await fire(bar, 'responderMove', touch(120, 10));
       await setStore({ playback: 'error' });
 
-      await fireEvent(bar, 'responderRelease', touch(150, 120));
+      await fire(bar, 'responderRelease', touch(150, 120));
       expect(fakePlayer.seekTo).not.toHaveBeenCalled();
     });
 
@@ -673,15 +1244,15 @@ describe('SeekProgressBar', () => {
       seedStore({ currentTime: 0, duration: DURATION, playing: true });
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
-      await layOut(bar);
+      layOut(bar);
 
-      await fireEvent(bar, 'responderGrant', touch(10));
-      await fireEvent(bar, 'responderMove', touch(120, 10));
+      await fire(bar, 'responderGrant', touch(10));
+      await fire(bar, 'responderMove', touch(120, 10));
       await setStore({ playback: 'ended' });
-      await fireEvent(bar, 'responderRelease', touch(150, 120));
+      await fire(bar, 'responderRelease', touch(150, 120));
       expect(fakePlayer.seekTo).not.toHaveBeenCalled();
 
-      await drag(bar, [], 150);
+      await tap(bar, 150);
       expect(fakePlayer.seekTo).toHaveBeenCalledTimes(1);
       expect(fakePlayer.seekTo).toHaveBeenCalledWith(30);
     });
@@ -760,19 +1331,19 @@ describe('SeekProgressBar', () => {
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
 
-      await fireEvent(bar, 'accessibilityAction', {
+      await fire(bar, 'accessibilityAction', {
         nativeEvent: { actionName: 'increment' },
       });
-      expect(fakePlayer.seekTo).toHaveBeenLastCalledWith(20 + A11Y_STEP_SECONDS);
+      expect(fakePlayer.seekTo).toHaveBeenLastCalledWith(20 + SKIP_SECONDS);
 
-      await fireEvent(bar, 'accessibilityAction', {
+      await fire(bar, 'accessibilityAction', {
         nativeEvent: { actionName: 'decrement' },
       });
-      expect(fakePlayer.seekTo).toHaveBeenLastCalledWith(20 - A11Y_STEP_SECONDS);
+      expect(fakePlayer.seekTo).toHaveBeenLastCalledWith(20 - SKIP_SECONDS);
 
       // An action that is not ours must not seek.
       fakePlayer.seekTo.mockClear();
-      await fireEvent(bar, 'accessibilityAction', {
+      await fire(bar, 'accessibilityAction', {
         nativeEvent: { actionName: 'activate' },
       });
       expect(fakePlayer.seekTo).not.toHaveBeenCalled();
@@ -784,19 +1355,93 @@ describe('SeekProgressBar', () => {
       seedStore({ currentTime: 0, duration: 0 });
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
 
-      await fireEvent(getByTestId('seek-progress-bar'), 'accessibilityAction', {
+      await fire(getByTestId('seek-progress-bar'), 'accessibilityAction', {
         nativeEvent: { actionName: 'increment' },
       });
       expect(fakePlayer.seekTo).not.toHaveBeenCalled();
     });
 
     it('formats a spoken position rather than a raw number', () => {
-      expect(formatClock(0)).toBe('0:00');
-      expect(formatClock(9)).toBe('0:09');
-      expect(formatClock(61)).toBe('1:01');
-      expect(formatClock(600)).toBe('10:00');
-      expect(formatClock(Number.NaN)).toBe('0:00');
-      expect(formatClock(-5)).toBe('0:00');
+      // The formatter is `lib/formatTime.ts` and nothing else. This file used to
+      // import `formatClock`, a second copy of the same rule declared in
+      // `SeekProgressBar.tsx` itself — logic that `jest.config.js` excludes from
+      // `collectCoverageFrom` (`src/components/**`), so it was only ever reachable
+      // through a render. It is called `formatTime` here now, and the assertions
+      // are the SAME values the deleted copy produced, which is the point: the
+      // rule did not move, the duplicate did.
+      expect(formatTime(0)).toBe('0:00');
+      expect(formatTime(9)).toBe('0:09');
+      expect(formatTime(61)).toBe('1:01');
+      expect(formatTime(600)).toBe('10:00');
+      expect(formatTime(Number.NaN)).toBe('0:00');
+      expect(formatTime(-5)).toBe('0:00');
+    });
+
+    it('names the a11y step with the SAME constant the skip buttons seek by', async () => {
+      // The two were once separate literals — `SKIP_SECONDS` in
+      // `ClipTransport.tsx`, `A11Y_STEP_SECONDS` here — kept equal by hand, and
+      // nothing in either suite could see them drift. Both are now one binding in
+      // `lib/skipSeconds.ts`, and this renders BOTH controls so the claim is
+      // checked on the rendered labels rather than on the import.
+      seedStore({ currentTime: 20, duration: DURATION });
+      const { getByTestId } = await render(
+        <>
+          <SeekProgressBar clipId={CLIP_ID} />
+          <ClipTransport clipId={CLIP_ID} />
+        </>,
+      );
+
+      const spoken = (getByTestId('seek-progress-bar').props.accessibilityActions as Array<{
+        name: string;
+        label: string;
+      }>).find((a) => a.name === 'increment');
+      expect(spoken?.label).toBe(`Forward ${SKIP_SECONDS} seconds`);
+      expect(getByTestId('clip-transport-advance').props.accessibilityLabel).toBe(
+        `Advance ${SKIP_SECONDS} seconds`,
+      );
+
+      // ...and the ACTION agrees with the label, so the announced number is the
+      // number the control actually performs rather than a second description of it.
+      await fire(getByTestId('seek-progress-bar'), 'accessibilityAction', {
+        nativeEvent: { actionName: 'increment' },
+      });
+      expect(fakePlayer.seekTo).toHaveBeenLastCalledWith(20 + SKIP_SECONDS);
+    });
+
+    it('speaks the position with the SAME function the transport displays', async () => {
+      // The cross-consumer claim, in one test and on one tree: the visible
+      // timecode, the transport's spoken label, and this bar's spoken value are
+      // three renderings of two numbers, and they must all come from
+      // `formatTime`. While this file carried its own `formatClock`, nothing
+      // asserted that — the two were pinned only against the same string
+      // literals in two suites that could not see each other.
+      seedStore({ currentTime: 12, duration: DURATION });
+      const { getByTestId } = await render(
+        <>
+          <SeekProgressBar clipId={CLIP_ID} title="Rain on a tin roof" />
+          <ClipTransport clipId={CLIP_ID} title="Rain on a tin roof" />
+        </>,
+      );
+
+      const position = formatTime(12);
+      const total = formatTime(DURATION);
+
+      // Visible, on the transport: `"0:12 / 1:00"` — the `/` is layout, not a
+      // different spelling of the position.
+      expect(getByTestId('clip-transport-timecode').props.children).toBe(
+        `${position} / ${total}`,
+      );
+      // Spoken, on the transport, and spoken, on this bar: the same `"x of y"`.
+      expect(getByTestId('clip-transport-timecode').props.accessibilityLabel).toBe(
+        `${position} of ${total}`,
+      );
+      expect(
+        (getByTestId('seek-progress-bar').props.accessibilityValue as { text: string }).text,
+      ).toBe(`${position} of ${total}`);
+
+      // Non-vacuity of the equality: the two spellings really are distinct
+      // strings, so "the spoken one equals the visible one" is not a tautology.
+      expect(`${position} / ${total}`).not.toBe(`${position} of ${total}`);
     });
   });
 
@@ -906,16 +1551,16 @@ describe('SeekProgressBar', () => {
       const { getByTestId } = await render(<SeekProgressBar clipId={CLIP_ID} />);
       const bar = getByTestId('seek-progress-bar');
       const fill = getByTestId('seek-progress-fill');
-      await layOut(bar);
+      layOut(bar);
 
       // The store is at 50%. Drag BACKWARDS, to 20%.
       await setStore({ currentTime: 30 });
       await settle();
       expect(widthPercent(fill)).toBeCloseTo(50, 1);
 
-      await fireEvent(bar, 'responderGrant', touch(200));
-      await fireEvent(bar, 'responderMove', touch(60, 200));
-      await fireEvent(bar, 'responderRelease', touch(60, 60));
+      await fire(bar, 'responderGrant', touch(200));
+      await fire(bar, 'responderMove', touch(60, 200));
+      await fire(bar, 'responderRelease', touch(60, 60));
       await frame();
 
       // Committed to 20% of 60 s = 12 s. If the drag had only previewed and let

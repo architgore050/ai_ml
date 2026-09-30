@@ -21,6 +21,8 @@ import { gradients, duration as motionDuration, surface, accent } from '../../de
 import { glow } from '../../design/shadows';
 import { categoryColor } from '../../design/categories';
 import { MIN_TOUCH_TARGET } from '../ui/primitives';
+import { formatTime } from '../../lib/formatTime';
+import { SKIP_SECONDS } from '../../lib/skipSeconds';
 import {
   clampSeekTime,
   seekToSeconds,
@@ -120,18 +122,57 @@ export const FILL_EASING = Easing.linear;
 export const FILL_EASING_STOPS: readonly number[] = [0.25, 0.5, 0.75];
 
 /**
- * Accessibility step for VoiceOver/TalkBack increment/decrement.
- * 10 s because that is the app's own skip granularity (`skipBy`, "the ±10 s
- * skip button" in `store/player.ts`).
- */
-export const A11Y_STEP_SECONDS = 10;
-
-/**
  * Movement past which a gesture is treated as a drag rather than a tap.
  * Below it the release position is the seek position anyway, so this only
  * decides whether a drag was in progress, not where it lands.
  */
 const MIN_DRAG_SLOP = 3;
+
+/**
+ * Directional slop, in dp: how far the finger must travel before its DIRECTION
+ * is treated as intent rather than as jitter.
+ *
+ * Two different questions, deliberately two different numbers:
+ *  - `MIN_DRAG_SLOP` (3) asks "has the finger visibly moved sideways?", and
+ *    gates the drag preview. Small, because a preview that lags the finger
+ *    feels broken.
+ *  - `DIRECTION_SLOP` (8) asks "is this a horizontal scrub or a page flick?",
+ *    and gates the two claims that can steal the feed's scroll. Larger,
+ *    because the cost of guessing wrong is asymmetric: claiming a vertical
+ *    drag as a scrub is a dead feed, while waiting 8 dp to start previewing a
+ *    horizontal scrub is a 16 ms delay nobody can perceive.
+ *
+ * 8 dp is the same figure RNGH's own directional API is conventionally driven
+ * at (`activeOffsetX([-8, 8])`), so this threshold and that one are directly
+ * comparable rather than two invented numbers.
+ */
+export const DIRECTION_SLOP = 8;
+
+/** Which way a touch has committed to going. See `resolveAxis`. */
+export type Axis = 'none' | 'horizontal' | 'vertical';
+
+/**
+ * Resolve a touch's intent from its accumulated displacement.
+ *
+ * `none` (inside the slop on both axes) is deliberately the answer for
+ * undecided movement and for a non-finite input: it is the only value that
+ * claims nothing and blocks nothing, so every failure mode of this function
+ * lands on the safe side — the feed keeps its scroll and the bar does not seek.
+ *
+ * `ax > ay` is a 45-degree cone, kept because it is the rule the component has
+ * always used for the horizontal lock (`onMoveShouldSetPanResponder`) and
+ * because a tighter ratio would be a second, independently-tuned number with
+ * nothing to justify it. The tie (`ax === ay`, i.e. a perfect diagonal) resolves
+ * to `vertical`, which is the conservative answer: a diagonal in a vertically
+ * paging feed is far more often a page flick than a scrub.
+ */
+export function resolveAxis(dx: number, dy: number, slop: number = DIRECTION_SLOP): Axis {
+  if (!Number.isFinite(dx) || !Number.isFinite(dy) || !Number.isFinite(slop)) return 'none';
+  const ax = Math.abs(dx);
+  const ay = Math.abs(dy);
+  if (ax <= slop && ay <= slop) return 'none';
+  return ax > ay ? 'horizontal' : 'vertical';
+}
 
 function clamp01(value: number): number {
   return Math.min(Math.max(value, 0), 1);
@@ -197,15 +238,6 @@ export function seekTargetFor(
   return clampSeekTime(fraction * duration, duration);
 }
 
-/** `m:ss`, or `m:ss.t` under a minute. Screen readers read this verbatim. */
-export function formatClock(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
-  const whole = Math.floor(seconds);
-  const m = Math.floor(whole / 60);
-  const s = whole % 60;
-  return `${m}:${String(s).padStart(2, '0')}`;
-}
-
 /* ------------------------------------------------------------------ */
 /* Component                                                            */
 /* ------------------------------------------------------------------ */
@@ -257,8 +289,18 @@ export function SeekProgressBar({
 
   const color = categoryColor(category);
 
-  const widthRef = useRef(0);
-  const gestureRef = useRef<Gesture | null>(null);
+const widthRef = useRef(0);
+const gestureRef = useRef<Gesture | null>(null);
+
+/**
+ * Whether a touch that began on this bar is still a CANDIDATE tap.
+ *
+ * `true` from `onTouchStart` until one of three things happens: a horizontal
+ * scrub claims the responder, the finger resolves as vertical, or the sequence
+ * is cancelled. See `onTouchStart` / `onTouchEnd` for why the tap lives on the
+ * direct touch channel rather than on the responder.
+ */
+const tapPendingRef = useRef(false);
 
   /**
    * Latest `clipId`, kept current during RENDER rather than in an effect.
@@ -340,6 +382,23 @@ export function SeekProgressBar({
   }, []);
 
   /**
+   * Give the gesture up WITHOUT reporting a seek.
+   *
+   * Distinct from `finishGesture(null)`, and the distinction is load-bearing:
+   * that one means "attempted, and the bar had no geometry", which is a real
+   * refusal the parent is entitled to hear about. This one means "this was
+   * never a seek attempt" — the feed took the touch, or the finger turned out
+   * to be going vertically. Reporting `onSeekResult(null)` for those would
+   * emit a "seek refused" for every flick that crossed the bar, which is the
+   * majority of scrolls in a full-bleed feed.
+   */
+  const abandonGesture = useCallback(() => {
+    gestureRef.current = null;
+    isDragging.value = false;
+    restoreFromStore();
+  }, [isDragging, restoreFromStore]);
+
+  /**
    * End the gesture. `fraction === null` means the release position was not
    * resolvable (no geometry yet) — an ATTEMPTED seek that could not be made,
    * as distinct from an ABANDONED gesture.
@@ -388,6 +447,51 @@ export function SeekProgressBar({
   );
 
   /**
+   * Open a gesture at `locationX`, capturing the clip identity.
+   *
+   * The ONE place a `Gesture` is built, shared by both entry points (a granted
+   * horizontal scrub, and a stationary tap) so the two cannot drift on which
+   * clip they captured or on how the fill previews.
+   */
+  const beginGesture = useCallback(
+    (locationX: number) => {
+      const s = usePlayerStore.getState();
+      const fraction = fractionFromLocation(locationX, widthRef.current);
+      gestureRef.current = {
+        clipId: clipIdRef.current,
+        playingClipId: s.playingClipId,
+        duration: s.duration,
+        // No geometry yet (no `onLayout`) is still a valid start: a tap that
+        // commits nothing is better than a bar that swallows the gesture.
+        fraction: fraction ?? 0,
+      };
+      isDragging.value = true;
+      if (fraction !== null) drag.value = fraction;
+    },
+    [drag, isDragging],
+  );
+
+  /**
+   * Close a gesture at `locationX`, committing exactly one seek.
+   *
+   * Also the one place a commit happens, so a tap and the end of a drag cannot
+   * disagree about where they landed: the position is always re-derived from the
+   * event that ENDED the sequence, never from the last previewed value.
+   */
+  const commitGesture = useCallback(
+    (locationX: number) => {
+      const gesture = gestureRef.current;
+      const fraction = fractionFromLocation(locationX, widthRef.current);
+      if (gesture !== null && fraction !== null) {
+        gesture.fraction = fraction;
+        drag.value = fraction;
+      }
+      finishGesture(fraction);
+    },
+    [drag, finishGesture],
+  );
+
+  /**
    * Cancel a drag in flight — the clip ended, or it was swapped out.
    *
    * `didJustFinish` is a single-event pulse on both native platforms
@@ -407,58 +511,150 @@ export function SeekProgressBar({
   }, [playback, isDragging, restoreFromStore]);
 
   /**
-   * PanResponder, not `react-native-gesture-handler`. The deciding reason is
-   * the clip-identity guard, not ergonomics:
+   * PanResponder, not `react-native-gesture-handler` — a decision revisited for
+   * this redesign, and the deciding reason is the TEST HARNESS, not the API.
    *
-   * `blockerFor` must read the LIVE store at grant, move and release. A
-   * worklet runs on the UI thread, where `usePlayerStore.getState()` does not
-   * exist — every read would have to be a snapshot mirrored into shared values
-   * and pushed across on each tick, which is strictly more machinery and a new
-   * way for the guard to be a tick stale against the very race it exists to
-   * catch. PanResponder handlers run on the JS thread where the store is a
-   * plain synchronous read, and the seek rules become ordinary code.
+   * RNGH expresses this arbitration better and declaratively: a
+   * `Gesture.Pan().activeOffsetX([-8, 8]).failOffsetY([-8, 8])` is genuinely NOT
+   * ACTIVE until 8 dp of horizontal movement, so a vertical flick never
+   * activates it at all and there is nothing to take back. It is not used here
+   * because nothing in this repo can drive one, and this was checked rather than
+   * assumed:
+   *  - `@testing-library/react-native@14.0.1` exports no `fireGestureHandler`.
+   *    Its public surface is `act, cleanup, fireEvent, render, waitFor,
+   *    waitForElementToBeRemoved, within, configure, resetToDefaults,
+   *    isHiddenFromAccessibility, isInaccessible, getDefaultNormalizer,
+   *    renderHook, screen, userEvent` (`dist/pure.d.ts`), and no file in
+   *    `dist/` mentions the symbol.
+   *  - RNGH's OWN driver is importable — `react-native-gesture-handler/jest-utils`
+   *    resolves to `lib/commonjs/jestUtils/index` — but it is a separate
+   *    dependency, not something `fireEvent` hands you, so every test would have
+   *    to be written in its vocabulary instead of RNTL's, and
+   *    `Gesture.Pan()`'s `activeOffsetX` would be unit-tested while the
+   *    composition with the feed's pager stayed untested.
+   *  - `jest.setup.js` does not load `react-native-gesture-handler/jestSetup`, so
+   *    `RNGestureHandlerModule` resolves to a TurboModule that does not exist
+   *    under jest. (Whether hand-dispatched `handlerStateChange` events would
+   *    reach a `GestureDetector` was NOT tested here — it is left as the open
+   *    question it is, rather than asserted.)
+   * So the seek would be tested in a different harness from the rest of the file,
+   * and the arbitration is the one thing here that MUST be tested against this
+   * repo's own. PanResponder it is; the rule below is PanResponder's own
+   * vocabulary for the same intent.
    *
-   * Also in its favour: the drag preview still runs on the UI thread (it is a
-   * Reanimated shared value either way, so smoothness is unaffected), and it
-   * has no hard dependency on a root `GestureHandlerRootView` — so the bar can
-   * be rendered in a test or a preview without one. For reference, this app
-   * DOES have one (`app/_layout.tsx`), so RNGH remains a live option if the
-   * guard is ever rewritten in shared values.
+   * ## THE RULE: the bar claims a touch only once it is clearly HORIZONTAL
    *
-   * `onShouldBlockNativeResponder: false` is deliberate: the enclosing feed is
-   * a `pagingEnabled` FlatList, and a vertical flick that happens to begin on
-   * this row should scroll the feed rather than be swallowed. When native takes
-   * the touch, `onPanResponderTerminate` fires and the drag is abandoned
-   * without seeking. `onPanResponderTerminationRequest: false` is the other
-   * half — a JS-level *parent* cannot take the drag away mid-gesture.
+   * `onStartShouldSetPanResponder` is `false`, always, and that is the entire
+   * fix. The previous value (`() => interactive`) claimed the touch on
+   * touch-down, before any movement existed, which is precisely the reported
+   * symptom: a vertical flick starting anywhere in this 44 dp row — the natural
+   * thumb position in a full-screen feed, about 8% of screen height — was
+   * swallowed.
+   *
+   * WHY THAT WAS NOT FIXABLE FROM WHERE THE BAR STOOD. Once JS is the
+   * responder, iOS takes the paging ScrollView's own pan recognizer out of the
+   * picture, and that is driven by the responder itself, not by anything the
+   * bar can revoke:
+   *  - `RCTScrollView.m::_shouldDisableScrollInteraction` returns YES when the
+   *    `RCTUIManager JSResponder` is a DESCENDANT of the scroll view, and
+   *    `handleCustomPan:` then does `panGestureRecognizer.enabled = NO; ... = YES`
+   *    to restart it disabled. The bar is a descendant, so any claim at all
+   *    kills the pager.
+   *  - `scrollView:touchesShouldCancelInContentView:` is written the same way —
+   *    it skips `[super touchesShouldCancelInContentView:view]` exactly when
+   *    `shouldDisableScrollInteraction`, so the pager explicitly refuses to
+   *    cancel a touch inside this bar's subtree while JS holds it.
+   *  - `onShouldBlockNativeResponder` cannot rescue it, and PanResponder's own
+   *    doc comment in the installed `PanResponder.js:102` says why: "Is
+   *    currently only supported on android." It is not consulted on iOS at all.
+   *    (On Android it is meaningful — `JSResponderHandler.setJSResponder` only
+   *    calls `requestDisallowInterceptTouchEvent(true)` on the ancestor when this
+   *    returns true — which is why the old `() => false` looked like it worked.)
+   * There is no JS API to hand the responder back mid-gesture, so a claim at
+   * touch-down is unrecoverable on the platform this app ships on. The only
+   * place the decision can be made correctly is BEFORE the claim: on movement.
+   *
+   * ## WHY THE TAP STILL WORKS
+   *
+   * A stationary tap produces no move event, so it can never reach
+   * `onMoveShouldSetPanResponder`, and with no claim there is no
+   * `onPanResponderRelease` to commit from. The tap therefore rides the DIRECT
+   * touch channel — `onTouchStart` / `onTouchEnd` / `onTouchCancel` — which is
+   * a different mechanism from the responder negotiation entirely
+   * (`BaseViewConfig.ios.js:406-410` groups them separately, under "Touch
+   * events"). It is delivered to the node the sequence STARTED on, whether or
+   * not that node is the responder, which is what makes it usable precisely
+   * because the bar is no longer the responder for a tap. Three properties make
+   * it safe rather than a second, competing seek path:
+   *  1. It arms on touch-down and commits on touch-end ONLY if still armed, and
+   *     the arming is revoked by the same two things that revoke a scrub: a
+   *     horizontal claim (`onPanResponderGrant`) and a vertical resolve
+   *     (`onMoveShouldSetPanResponder`). So a page flick that happens to END on
+   *     the bar seeks nothing, and a horizontal scrub cannot be double-committed
+   *     whichever of the two events the platform delivers first.
+   *  2. It is the platform's own cancellation signal that disarms it. A vertical
+   *     flick inside a UIScrollView ends in `touchesCancelled` →
+   *     `touchCancel` (`RCTTouchHandler.m:320-323`), not `touchEnd`, so the arm
+   *     is dropped by the same mechanism that hands the touch to the pager.
+   *  3. It commits through `beginGesture` / `commitGesture` — the SAME two
+   *     functions a granted scrub uses — so the clip-identity guard, the
+   *     `clampSeekTime` refusal and the single-commit guarantee are literally
+   *     the same code, not a parallel copy that can drift.
+   *
+   * ## THE ARBITRATION, in PanResponder's own vocabulary
+   *  - `onStartShouldSetPanResponder` → `false`. Never claim at touch-down.
+   *  - `onMoveShouldSetPanResponder` → claim iff `resolveAxis(dx, dy)` is
+   *    `'horizontal'`; a `'vertical'` resolve additionally abandons, which is
+   *    the earliest possible moment to drop a pending tap.
+   *  - `onShouldBlockNativeResponder` → `interactive`. Reached only from
+   *    `onResponderGrant`, i.e. only after a horizontal claim. Note the
+   *    gestureState is ALREADY ZEROED there (`PanResponder.js:462-463` resets
+   *    `dx`/`dy` before invoking both the grant and this callback), so reading
+   *    the axis at this point is meaningless — an earlier version of this
+   *    comment treated a conditional answer here as the fix, and it evaluated
+   *    `resolveAxis(0, 0)` = `'none'` and so returned a constant `false`,
+   *    identical to the value it claimed to replace.
+   *  - `onPanResponderTerminationRequest` → `true`. Cooperative; RN's own
+   *    default is `true` when the prop is absent. Written out because this is
+   *    exactly the line a future reader would "fix" back to `false` to make the
+   *    grab unconditional, which is the platform fight this design removes.
+   *
+   * KNOWN LIMIT, stated rather than hidden: once a horizontal scrub has claimed,
+   *  the finger cannot then turn vertical and hand the touch back — the same iOS
+   *  rule as above, and the same limit `react-native-gesture-handler` has. So a
+   *  user who scrubs 20 dp sideways and then flicks vertically does not page the
+   *  feed. That is a far narrower hole than the one this replaces (which broke
+   *  EVERY flick that touched the row), it cannot be closed from JS at all, and
+   *  `onPanResponderMove`'s vertical abandon at least guarantees it neither
+   *  previews nor seeks.
    */
   const panResponder = useMemo(
     () =>
       PanResponder.create({
-        onStartShouldSetPanResponder: () => interactive,
-        // Consulted only when start declined the touch (it does not, while
-        // interactive), so this documents the horizontal lock rather than
-        // enforcing it. Enforced at runtime in `onPanResponderMove` instead,
-        // where the accumulated gesture state is available.
-        onMoveShouldSetPanResponder: (_e, g) =>
-          interactive && Math.abs(g.dx) > Math.abs(g.dy),
-        onPanResponderTerminationRequest: () => false,
-        onShouldBlockNativeResponder: () => false,
+        // Never at touch-down. See THE RULE.
+        onStartShouldSetPanResponder: () => false,
+
+        onMoveShouldSetPanResponder: (_e, g) => {
+          if (!interactive) return false;
+          const axis = resolveAxis(g.dx, g.dy);
+          if (axis === 'vertical') {
+            // The intent is the feed's scroll, not a scrub. Revoke the pending
+            // tap here, on the first move that says so, so a flick that happens
+            // to END on the bar cannot commit a seek afterwards. `none` keeps
+            // the tap armed: sub-slop wobble is still a tap, not a scroll.
+            tapPendingRef.current = false;
+          }
+          return axis === 'horizontal';
+        },
+
+        onPanResponderTerminationRequest: () => true,
+        onShouldBlockNativeResponder: () => interactive,
 
         onPanResponderGrant: (e: GestureResponderEvent) => {
           if (!interactive) return;
-          const s = usePlayerStore.getState();
-          const fraction = fractionFromLocation(e.nativeEvent.locationX, widthRef.current);
-          gestureRef.current = {
-            clipId: clipIdRef.current,
-            playingClipId: s.playingClipId,
-            duration: s.duration,
-            // No geometry yet (no `onLayout`) is still a valid grant: a tap that
-            // commits nothing is better than a bar that swallows the gesture.
-            fraction: fraction ?? 0,
-          };
-          isDragging.value = true;
-          if (fraction !== null) drag.value = fraction;
+          // A claim supersedes the tap channel, whichever order they arrive in.
+          tapPendingRef.current = false;
+          beginGesture(e.nativeEvent.locationX);
         },
 
         onPanResponderMove: (
@@ -471,9 +667,15 @@ export function SeekProgressBar({
           // between on the parent. Checking here is what stops a drag that
           // started on one clip from previewing over another.
           if (!stillCurrent(gesture)) {
-            gestureRef.current = null;
-            isDragging.value = false;
-            restoreFromStore();
+            abandonGesture();
+            return;
+          }
+          // The intent turned vertical mid-scrub. Drop the preview now rather
+          // than waiting for the release, so the bar cannot look grabbed while
+          // the reel pages underneath it. Silent, and the release below then
+          // finds no gesture and does nothing.
+          if (resolveAxis(g.dx, g.dy) === 'vertical') {
+            abandonGesture();
             return;
           }
           // Past the slop, and horizontally: a drag. The fill follows the
@@ -491,25 +693,61 @@ export function SeekProgressBar({
         },
 
         onPanResponderRelease: (e: GestureResponderEvent) => {
-          const gesture = gestureRef.current;
-          // A tap is a release with no drag: the fraction to commit is simply
-          // where the finger is. Same code path, so a tap and the end of a drag
-          // cannot disagree.
-          const fraction = fractionFromLocation(e.nativeEvent.locationX, widthRef.current);
-          if (gesture !== null && fraction !== null) {
-            gesture.fraction = fraction;
-            drag.value = fraction;
-          }
-          finishGesture(fraction);
+          // A tap that got this far is a release with no drag: the fraction to
+          // commit is simply where the finger is. Same code path, so a tap and
+          // the end of a drag cannot disagree.
+          commitGesture(e.nativeEvent.locationX);
         },
 
         onPanResponderTerminate: () => {
-          // Native took the touch (the feed scrolling). Never seek from here.
-          finishGesture(null);
+          // Native took the touch (the feed scrolling). Never seek, and never
+          // report: the user did not ask for a seek and did not get refused
+          // one. `abandonGesture` rather than `finishGesture(null)`.
+          abandonGesture();
         },
       }),
-    [drag, finishGesture, interactive, isDragging, restoreFromStore, stillCurrent],
+    [abandonGesture, beginGesture, commitGesture, interactive, stillCurrent],
   );
+
+  /**
+   * The TAP channel. See WHY THE TAP STILL WORKS above — the short version is
+   * that with no claim at touch-down there is no `onPanResponderRelease` for a
+   * stationary tap, and these are the only handlers that still fire.
+   *
+   * ARM ONLY on touch-down. The gesture itself is not begun here, deliberately:
+   * beginning it would drive `drag.value` from the touch-down position, so a
+   * vertical flick would paint a preview for the one frame before its first
+   * move event revoked it. A tap has no visible preview to lose — `finishGesture`
+   * lands the fill on the committed position — so arming costs nothing and
+   * flashing costs a frame of "the bar grabbed my scroll".
+   */
+  const onTouchStart = useCallback(
+    (e: GestureResponderEvent) => {
+      if (!interactive) return;
+      // A second finger makes the centroid meaningless (PanResponder's own
+      // `onStartShouldSetResponderCapture` keys on the same `touches.length`),
+      // and a pinch that happened to end over the bar must not seek.
+      tapPendingRef.current = (e.nativeEvent.touches?.length ?? 1) === 1;
+    },
+    [interactive],
+  );
+
+  const onTouchEnd = useCallback(
+    (e: GestureResponderEvent) => {
+      if (!tapPendingRef.current) return;
+      tapPendingRef.current = false;
+      // Same two functions a granted scrub runs, so there is one commit path.
+      beginGesture(e.nativeEvent.locationX);
+      commitGesture(e.nativeEvent.locationX);
+    },
+    [beginGesture, commitGesture],
+  );
+
+  /** The platform handed the touch to the pager. Drop the tap, and any preview. */
+  const onTouchCancel = useCallback(() => {
+    tapPendingRef.current = false;
+    abandonGesture();
+  }, [abandonGesture]);
 
   const onLayout = useCallback((e: LayoutChangeEvent) => {
     const w = e.nativeEvent.layout.width;
@@ -525,8 +763,13 @@ export function SeekProgressBar({
    */
   const onAccessibilityAction = useCallback((event: AccessibilityActionEvent) => {
     const name = event.nativeEvent.actionName;
-    if (name === 'increment') skipBy(A11Y_STEP_SECONDS);
-    else if (name === 'decrement') skipBy(-A11Y_STEP_SECONDS);
+    // The step is `SKIP_SECONDS` — the same constant the Rewind / Advance buttons
+    // use, from `lib/skipSeconds.ts`. It used to be a second literal
+    // (`A11Y_STEP_SECONDS`) written here and kept in agreement by hand, which is
+    // exactly the arrangement where the spoken step and the tapped step drift
+    // apart silently. See that file for why the two are one gesture.
+    if (name === 'increment') skipBy(SKIP_SECONDS);
+    else if (name === 'decrement') skipBy(-SKIP_SECONDS);
   }, []);
 
   /**
@@ -585,14 +828,26 @@ export function SeekProgressBar({
         min: 0,
         max: Math.round(safeDuration),
         now: Math.round(a11yNow),
-        text: `${formatClock(a11yNow)} of ${formatClock(safeDuration)}`,
+        // `formatTime` — the SAME function `ClipTransport` renders its visible
+        // timecode with. It was a second local copy of the rule
+        // (`formatClock`) until this was collapsed, which meant the spoken
+        // position and the visible one could be two different numbers for the
+        // same instant.
+        text: `${formatTime(a11yNow)} of ${formatTime(safeDuration)}`,
       }}
       accessibilityState={{ disabled: !interactive }}
       accessibilityActions={[
-        { name: 'increment', label: `Forward ${A11Y_STEP_SECONDS} seconds` },
-        { name: 'decrement', label: `Back ${A11Y_STEP_SECONDS} seconds` },
+        { name: 'increment', label: `Forward ${SKIP_SECONDS} seconds` },
+        { name: 'decrement', label: `Back ${SKIP_SECONDS} seconds` },
       ]}
       onAccessibilityAction={onAccessibilityAction}
+      // The tap channel, spread separately from the pan handlers and for that
+      // reason: these three are NOT the responder negotiation, they fire on the
+      // node the sequence started on whether or not it is the responder. See
+      // WHY THE TAP STILL WORKS.
+      onTouchStart={onTouchStart}
+      onTouchEnd={onTouchEnd}
+      onTouchCancel={onTouchCancel}
       {...panResponder.panHandlers}
     >
       {/* pointerEvents: none — the parent is the only hit target, and a child

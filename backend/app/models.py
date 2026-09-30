@@ -57,7 +57,20 @@ class User(AbstractUser):
     # RevenueCat Pro entitlement state.
     # DECISION: App User ID is a UUID (defaults to uuid4 on creation) rather
     # than derived from username/email, so it survives identity changes.
-    revenuecat_app_user_id = models.UUIDField(default=uuid.uuid4, null=True, blank=True)
+    #
+    # NOT NULL (migration 0009). It was nullable, and that was the whole defect:
+    # `get_customer_portal_url()` had a `else str(user.uuid)` branch on the null
+    # path, but `User` extends `AbstractUser` and has no `uuid` attribute — so
+    # the branch raised `AttributeError` and returned HTTP 500. The `uuid4()`
+    # default masked it on every newly created user, leaving only pre-0002 rows
+    # able to reach it. 0008 backfills those; 0009 makes the database refuse to
+    # create the state again.
+    #
+    # A nullable identifier is not a defensible contract for a billing identity.
+    # `services.revenuecat._app_user_id()` still tolerates null as
+    # defence-in-depth for objects that are not this model, but nothing in the
+    # database can be null any more.
+    revenuecat_app_user_id = models.UUIDField(default=uuid.uuid4)
     has_pro_entitlement = models.BooleanField(default=False)
     pro_expires_at = models.DateTimeField(null=True, blank=True)
     pro_grace_until = models.DateTimeField(null=True, blank=True)
@@ -114,7 +127,7 @@ class AudioClip(models.Model):
     original_file = models.FileField(upload_to='uploads/%Y/%m/%d/', null=True)
     cover_image = models.ImageField(upload_to='covers/%Y/%m/%d/', blank=True, null=True)
     hls_playlist_url = models.CharField(max_length=500, blank=True, null=True)
-    # Provenance and licensing metadata for scraper imports
+    # Provenance and licensing metadata retained for legacy imported rows.
     source_name = models.CharField(max_length=100, blank=True, null=True)
     source_url = models.CharField(max_length=500, blank=True, null=True)
     license = models.CharField(max_length=100, blank=True, null=True)
@@ -122,10 +135,9 @@ class AudioClip(models.Model):
     imported_via_scraper = models.BooleanField(default=False)
     original_source_id = models.CharField(max_length=255, blank=True, null=True)
     # DECISION: Two boolean fields instead of a license-policy table so feed
-    # queries can filter NC + SA with index-friendly predicates. Populated by
-    # uploader.save_clip() via ai_ml.scrapers.base.license_features().
-    # SECURITY: is_noncommercial=True clips are excluded from feed/suggestions
-    # queries until SCRAPER_ALLOW_NC=True (operator opt-in).
+    # queries can filter NC + SA with index-friendly predicates. User uploads
+    # derive these flags from their declared license type at creation time.
+    # SECURITY: restricted clips are excluded from feed/suggestions queries.
     is_noncommercial = models.BooleanField(default=False)
     requires_share_alike = models.BooleanField(default=False)
     license_family = models.CharField(max_length=32, blank=True, default='')
@@ -150,6 +162,18 @@ class AudioClip(models.Model):
     acoustic_vector = VectorField(dimensions=128, null=True, blank=True)
 
     moderation_approved = models.BooleanField(default=False)
+    # Moderation evidence is persisted so a rejection is explainable and the
+    # automated decision is not trapped in a Celery log/local variable.
+    transcript_text = models.TextField(blank=True, default='')
+    moderation_reason = models.TextField(blank=True, default='')
+    moderated_at = models.DateTimeField(null=True, blank=True)
+    moderated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='moderated_clips',
+    )
     copyright_acknowledgement = models.BooleanField(default=False)
     copyright_owner_name = models.CharField(max_length=255, blank=True, null=True)
 
@@ -462,4 +486,3 @@ class Report(models.Model):
                 name='unique_report_per_user_per_clip',
             ),
         ]
-

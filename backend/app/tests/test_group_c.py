@@ -229,7 +229,9 @@ class TestApproveModerationScope:
         client.force_authenticate(user=owner)
         response = client.post(f"/clips/{clip.id}/approve-moderation/", {}, format="json")
         assert response.status_code == 200
-        assert response.json()["status"] == "approved"
+        # Approval now queues the HLS/Whisper moderation worker. The clip is
+        # not feed-servable until that worker records its final decision.
+        assert response.json()["status"] == "processing"
         clip.refresh_from_db()
         assert clip.moderation_approved is True
 

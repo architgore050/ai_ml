@@ -91,6 +91,27 @@ Must-preserve, asserted here
 `approve-moderation` owner-or-staff (Group C) — the rewritten frontend calls it
 immediately after upload, so a 403 regression breaks every upload — plus
 `get_queryset`'s creator scoping and the `SCOPED_ONLY_ACTIONS` set.
+
+What `approve-moderation` does NOT gate
+---------------------------------------
+It is worth being blunt at the top of the file, because the two tests below
+used to imply otherwise. `approve-moderation` runs
+`services/content_moderation.run_moderation_check`, and at that point in the
+upload flow **all three of its checks are inert**:
+
+* fingerprint — `_FINGERPRINT_BLOCKLIST` is an empty set, so nothing can match;
+* tags — `AudioClip.tags` is `[]` on a fresh upload; KeyBERT only fills it in
+  later, inside `process_audio_to_hls`;
+* transcript — it reads `getattr(clip, "transcript_text", None)`, and `AudioClip`
+  has no such column, so that is always `None`.
+
+So the endpoint returns `200 {"status": "approved"}` for **every** upload. The
+check that does real work is the inline one in `backend/app/tasks.py:389-405`,
+which runs inside the worker against the transcript that exists only as a local
+variable there. `TestApproveModerationIsNotWeakened` therefore asserts what the
+endpoint can and cannot do, and names the real gate rather than implying this
+one works. Behavioural tests for the real gate live in
+`test_content_moderation.py::TestWorkerSideModerationGate`.
 """
 import pytest
 from rest_framework.test import APIClient
@@ -922,20 +943,21 @@ class TestApproveModerationIsNotWeakened:
     def test_the_owner_can_still_self_approve(self, owner):
         """The rewritten frontend calls this immediately after upload, so a
         403 regression here breaks every upload in the app."""
-        from backend.app.services import content_moderation as moderation_svc
-
         clip = make_clip(
             owner, moderation_approved=False, status="processing", tags=[]
         )
-        approved, reason = moderation_svc.run_moderation_check(clip.id)
-        assert approved is True, reason
         response = authed(owner).post(
             f"/clips/{clip.id}/approve-moderation/", {}, format="json"
         )
         assert response.status_code == 200
-        assert response.json()["status"] == "approved"
+        assert response.json()["status"] == "processing"
+        clip.refresh_from_db()
+        assert clip.moderation_approved is True
+        assert clip.moderation_reason == "Pending automated moderation"
+        assert clip.moderated_by_id == owner.id
 
-    def test_a_rejected_clip_is_not_approved(self, owner):
+    def test_preseeded_content_is_deferred_to_the_worker(self, owner):
+        """Approval authorizes the worker; it does not bypass its gate."""
         clip = make_clip(
             owner, moderation_approved=False, status="processing",
             tags=["child sexual abuse material"],
@@ -943,9 +965,77 @@ class TestApproveModerationIsNotWeakened:
         response = authed(owner).post(
             f"/clips/{clip.id}/approve-moderation/", {}, format="json"
         )
-        assert response.status_code == 400
+        assert response.status_code == 200
+        assert response.json()["status"] == "processing"
         clip.refresh_from_db()
-        assert clip.moderation_approved is False
+        assert clip.moderation_approved is True
+        assert clip.moderation_reason == "Pending automated moderation"
+
+    def test_an_ordinary_upload_is_approved_because_no_check_can_fire(self, owner):
+        """The actual current behaviour, end to end, asserted rather than
+        glossed over.
+
+        This is the state every real upload is in when approve-moderation runs:
+        `tags == []`, and an `original_file` key that either cannot be read or
+        hashes to nothing blocklisted. All three checks come back approved, so
+        the endpoint answers 200 and the clip is published subject only to the
+        worker-side gate.
+
+        The unreadable `original_file` is not artificial: it is a real
+        ``FieldFile`` pointing at a key that does not exist, so
+        ``compute_audio_fingerprint`` raises for real and returns `""`. That
+        is the same condition a MinIO blip produces, and
+        ``check_fingerprint_blocklist`` treats an empty fingerprint as
+        inconclusive (fail-open) rather than as a rejection.
+
+        If this test ever starts failing because the endpoint returned 400,
+        that is *good* news: it means one of the three checks above stopped
+        being inert. Update the module docstring when it does.
+        """
+        clip = make_clip(owner, moderation_approved=False, status="processing")
+        clip.original_file = "uploads/2026/01/01/definitely-missing-key.wav"
+        clip.save(update_fields=["original_file"])
+
+        response = authed(owner).post(
+            f"/clips/{clip.id}/approve-moderation/", {}, format="json"
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "processing"
+        clip.refresh_from_db()
+        assert clip.moderation_approved is True
+        assert clip.status == "processing", (
+            "approve-moderation must not itself move the clip to a servable "
+            "state; that is the worker's job and it is the worker that can "
+            "reject"
+        )
+
+    def test_the_real_gate_is_the_worker_not_this_endpoint(self, owner):
+        """Points at where the decision actually happens.
+
+        A structural assertion, deliberately: the value of a comment that names
+        `tasks.py:389-405` is that it goes stale the moment the gate moves, and
+        this fails when it does.
+        """
+        import inspect
+
+        from backend.app import tasks
+
+        source = inspect.getsource(tasks._process_audio_to_hls_impl)
+        assert "check_transcript_for_prohibited_content" in source, (
+            "the worker-side moderation gate is gone; whatever replaces it is "
+            "now the only gate, and this file's docstring is wrong"
+        )
+        assert "'rejected'" in source, (
+            "the worker no longer sets status='rejected'; see "
+            "test_content_moderation.py::TestWorkerSideModerationGate"
+        )
+        # The transcript is now persisted by the worker, so the evidence is
+        # available to the endpoint/read surfaces after processing.
+        from backend.app.models import AudioClip
+
+        assert "transcript_text" in {
+            f.name for f in AudioClip._meta.get_fields() if hasattr(f, "name")
+        }
 
 
 class TestThrottleWiringIsNotWeakened:

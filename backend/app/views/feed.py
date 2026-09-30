@@ -5,7 +5,6 @@ touches the recommendation engine / Redis feed cache, so they share
 a single module. ~270 lines.
 """
 import logging
-import numpy as np
 from django.core.cache import cache
 from django.db.models import Exists, OuterRef, Case, When, Count, Func, F, JSONField
 from pgvector.django import CosineDistance
@@ -152,9 +151,7 @@ class FastFeedViewSet(viewsets.ViewSet):
                 # it: `moderation_approved=True` above and the NC/SA filter
                 # below are unchanged.
                 #
-                # SECURITY: Exclude NC + SA items from user feeds. NC items
-                # are filtered at runtime via SCRAPER_ALLOW_NC; SA items are
-                # operator-gated via /clips/{id}/approve-moderation/.
+                # SECURITY: Exclude NC + SA items from user feeds.
                 .filter(status='ready')
                 .filter(is_noncommercial=False, requires_share_alike=False)
                 .annotate(user_has_liked=Exists(user_like_subquery))
@@ -601,39 +598,13 @@ class TagsViewSet(viewsets.ViewSet):
         # and this one-shot onboarding path is where that costs the most.
         selected_tags = list(dict.fromkeys(cleaned))
 
-        # N bug fix: tags is a JSONField(default=list) (see models.py:69),
-        # NOT a Postgres ArrayField. The old code used Django's ArrayField
-        # 'overlap' lookup on a JSONField, which Django silently
-        # reinterpreted as a JSON path: `JSON_EXTRACT(tags, '$.overlap')`.
-        # That returned 0 rows for every call (no JSON document has a key
-        # literally named 'overlap'), so the entire tag-based cold-start
-        # UX was silently non-functional.
-        #
-        # Postgres JSONB has no native "any-of" operator. The right
-        # primitive is `@>` (contains): tags @> '["tag"]'::jsonb is true
-        # when the array contains "tag". We OR one Q per selected tag.
-        # selected_tags is guaranteed non-empty by the validation above, so
-        # there is no empty-selection case to short-circuit.
-        from django.db.models import Q
-        tag_filter = Q()
-        for tag in selected_tags:
-            tag_filter |= Q(tags__contains=[tag])
-        baseline_clips = AudioClip.objects.filter(
-            tag_filter,
-            semantic_vector__isnull=False,
-            acoustic_vector__isnull=False,
-            moderation_approved=True,
-        ).order_by('-likes')[:100]
-
-        if not baseline_clips:
-            return Response({"error": "Not enough data to build baseline."}, status=400)
-
-        sem_vectors = [np.array(clip.semantic_vector) for clip in baseline_clips]
-        ac_vectors = [np.array(clip.acoustic_vector) for clip in baseline_clips]
-
-        user.long_term_semantic = (np.mean(sem_vectors, axis=0)).tolist()
-        user.long_term_acoustic = (np.mean(ac_vectors, axis=0)).tolist()
-        user.save()
+        # The JSONField matcher (`tags__contains`) and vector averaging live
+        # in the reusable AI/ML cold-start pipeline.
+        from ai_ml.pipelines.cold_start import initialize_user_vectors
+        try:
+            initialize_user_vectors(user, selected_tags)
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=400)
 
         publish(refill_user_feed, user.id, count=30)
 

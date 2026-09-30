@@ -195,7 +195,7 @@ def _has_blocked_magic_signature(head: bytes) -> str | None:
 #: still served commercially. Nothing on the upload path can catch that: there
 #: is no audio fingerprint that determines a licence, the server has no access
 #: to the source, and the only classifier in this repository
-#: (``ai_ml.scrapers.base.license_features``) reads a *licence string*, not
+#: The removed ingestion classifier read a *licence string*, not
 #: audio. So the honest statement of what this table buys is:
 #:
 #:   It makes an HONEST declaration binding. It does not make a DISHONEST one
@@ -211,29 +211,14 @@ def _has_blocked_magic_signature(head: bytes) -> str | None:
 #:
 #: ``license_type`` -> ``(is_noncommercial, requires_share_alike)``.
 #:
-#: THE AUTHORITY is ``ai_ml.scrapers.base.license_features``, which
-#: ``ai_ml/scrapers/uploader.py`` calls to populate these exact two columns on
-#: the scraper path, and which ``AudioClip``'s own field comment names. For the
-#: seven values in ``AudioUploadSerializer.LICENSE_CHOICES`` it reduces to this
-#: table, transcribed rather than computed: ``license_features`` is a regex over
-#: a normalised licence *family* string (the scraper's vocabulary — "Freesound
-#: Attribution NonCommercial", "CC-BY-NC-ND", ...), which is not the same
-#: domain as the seven fixed choices a user can pick here.
+#: The table below is the authority for the seven values in
+#: ``AudioUploadSerializer.LICENSE_CHOICES``. It is explicit rather than
+#: computed so the rights policy is reviewable and deterministic.
 #:
 #: WHY TRANSCRIBED INSTEAD OF IMPORTED
 #: -----------------------------------
-#: ``serializers.py`` is imported by every request this platform serves:
-#: authentication, the feed, playback token issuance, the public share page.
-#: ``ai_ml/scrapers/`` is an OPTIONAL ingestion subsystem, disabled by default
-#: (``SCRAPER_ENABLED=False``), and this repository has deleted it outright
-#: twice — ``5c9c2d6`` and then ``aacd759``, the latter also adding it to
-#: ``.gitignore`` and ``.dockerignore``. A top-level ``from ai_ml.scrapers.base
-#: import license_features`` here would therefore turn a missing optional
-#: package into an ``ImportError`` on every single request, taking down the
-#: rights gate along with the site. The trade is a second copy of a table that
-#: can drift, and ``test_upload_license_derivation::
-#: test_parity_with_the_scraper_classifier`` re-derives both and fails on any
-#: divergence — so the drift is caught by a test rather than trusted.
+#: ``serializers.py`` is imported by every request this platform serves, so the
+#: policy deliberately has no optional ingestion-package dependency.
 LICENSE_RESTRICTION_FEATURES = {
     # Owned work. No third-party obligation, so nothing to enforce.
     "Owned": (False, False),
@@ -273,12 +258,12 @@ def license_restriction_features(license_type):
     """Return ``(is_noncommercial, requires_share_alike)`` for a licence.
 
     Unknown or unrecognised values fall through to ``(False, False)``, which is
-    the same fail-open-on-unknown answer the scraper classifier gives. That is a
-    deliberate, bounded choice and not a general default: the input here is
+    the same fail-open-on-unknown answer used by legacy imported rows. That is
+    a deliberate, bounded choice and not a general default: the input here is
     already constrained to ``LICENSE_CHOICES`` by a ``ChoiceField``, so an
     unrecognised value can only arrive from a row written outside this
-    serializer (the scraper, a fixture, a management command) — and those
-    writers own their own flags.
+    serializer (for example a fixture or management command), whose persisted
+    rights flags remain authoritative.
     """
     if not license_type:
         return (False, False)
@@ -545,8 +530,8 @@ class AudioUploadSerializer(serializers.ModelSerializer):
         clip = super().create(validated_data)
 
         # (A2) `Unknown` derives to (False, False) — the same answer
-        # `license_features('UNKNOWN')` gives the scraper — and that is a
-        # deliberate product decision, not an oversight. Reasoning is on the
+        # the legacy classifier — and that is a deliberate product decision,
+        # not an oversight. Reasoning is on the
         # `LICENSE_RESTRICTION_FEATURES["Unknown"]` row: the value is what
         # every upload gets by default, so quarantining it here would
         # quarantine 100% of uploads. What keeps it from being free is the
@@ -1206,6 +1191,18 @@ class ProfileUpdateSerializer(serializers.ModelSerializer):
 
 
 class SubscriptionStatusSerializer(serializers.Serializer):
+    # SELF-SCOPED. `app_user_id` is the authenticated user's own RevenueCat
+    # App User ID and nothing else — it is the identity a client passes to the
+    # RevenueCat SDK, so it must be readable here and ONLY here.
+    #
+    # It is deliberately absent from every other serializer in this file
+    # (OwnProfileSerializer, PublicProfileSerializer, the feed/comment/clip
+    # serializers). `User.revenuecat_app_user_id` is not in any `Meta.fields`,
+    # so the only way it can reach a response body is through an explicit
+    # declaration like this one. `test_revenuecat.py::TestAppUserIdIsSelfScoped`
+    # pins that: it asserts a second user's id never appears in this payload and
+    # that the public/feed surfaces do not carry the field at all.
+    app_user_id = serializers.UUIDField()
     is_pro = serializers.BooleanField()
     expires_at = serializers.DateTimeField(allow_null=True)
     grace_until = serializers.DateTimeField(allow_null=True)

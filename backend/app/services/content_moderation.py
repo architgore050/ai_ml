@@ -2,6 +2,7 @@ import hashlib
 import logging
 import re
 from typing import Optional, Tuple
+from django.utils import timezone as dt_timezone
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +130,7 @@ def check_fingerprint_blocklist(fingerprint: str) -> Tuple[bool, Optional[str]]:
 
     return True, None
 
-def run_moderation_check(clip_id) -> Tuple[bool, Optional[str]]:
+def run_moderation_check(clip_id, moderated_by=None) -> Tuple[bool, Optional[str]]:
     """
     Runs full moderation check.
     Consolidates the DB save to prevent multiple writes.
@@ -172,9 +173,19 @@ def run_moderation_check(clip_id) -> Tuple[bool, Optional[str]]:
         transcript_text = getattr(clip, "transcript_text", None)
         approved, reason = check_transcript_for_prohibited_content(transcript_text)
 
-    # Single DB update transaction
+    # Persist both the decision and the evidence. The worker calls the same
+    # service after transcription, so this is no longer a pre-transcription
+    # check that can only see an empty transcript.
     clip.moderation_approved = approved
-    clip.save(update_fields=["moderation_approved"])
+    clip.moderation_reason = reason or ''
+    clip.moderated_at = dt_timezone.now()
+    if moderated_by is not None:
+        clip.moderated_by = moderated_by
+    update_fields = [
+        "moderation_approved", "moderation_reason", "moderated_at",
+    ]
+    if moderated_by is not None:
+        update_fields.append("moderated_by")
+    clip.save(update_fields=update_fields)
 
     return approved, reason
-

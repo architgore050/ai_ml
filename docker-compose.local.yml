@@ -234,7 +234,7 @@ services:
       - REDIS_CACHE_PASSWORD=${REDIS_CACHE_PASSWORD}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
       - DJANGO_DEBUG=${DJANGO_DEBUG:-False}
-      - DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1,web
+      - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS}
       - GUNICORN_WORKERS=2
       - GUNICORN_THREADS=2
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
@@ -243,7 +243,7 @@ services:
       - AWS_S3_ENDPOINT_URL=http://minio-local:9000
       - AWS_S3_REGION_NAME=auto
       - AWS_S3_QUERYSTRING_EXPIRE=3600
-      - PUBLIC_MEDIA_ENDPOINT_URL=http://localhost:19000
+      - PUBLIC_MEDIA_ENDPOINT_URL=${PUBLIC_MEDIA_ENDPOINT_URL}
       # Browser-facing HLS origin: the nginx :9443 listener (published as
       # 19443), which routes /hls/* to the HLS token Worker. Setting it also
       # flips HLS_URL_STYLE to "edge", which is what makes the emitted URLs
@@ -251,7 +251,7 @@ services:
       # as a path segment, and the Worker rejects any path not starting
       # /hls/. Left unset, HLS URLs keep the bucket-prefixed MinIO form and
       # would 404 at the Worker.
-      - PUBLIC_HLS_ENDPOINT_URL=https://localhost:19443
+      - PUBLIC_HLS_ENDPOINT_URL=${PUBLIC_HLS_ENDPOINT_URL}
       # Must match the Worker's MEDIA_TOKEN_SECRET. The run script
       # (scripts/run-hls-worker-local.sh) generates the Worker's .dev.vars from
       # this same value so the two cannot drift.
@@ -425,7 +425,7 @@ services:
       - AWS_S3_ENDPOINT_URL=http://minio-local:9000
       - AWS_S3_REGION_NAME=auto
       - AWS_S3_QUERYSTRING_EXPIRE=3600
-      - PUBLIC_MEDIA_ENDPOINT_URL=http://localhost:19000
+      - PUBLIC_MEDIA_ENDPOINT_URL=${PUBLIC_MEDIA_ENDPOINT_URL}
     deploy:
       resources:
         limits:

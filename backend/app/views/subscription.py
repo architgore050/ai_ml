@@ -15,6 +15,7 @@ from rest_framework.views import APIView
 from rest_framework.viewsets import ViewSet
 
 from ..serializers import SubscriptionStatusSerializer
+from ..services.revenuecat import _app_user_id
 
 
 def _get_limits(user) -> dict:
@@ -58,6 +59,10 @@ class SubscriptionStatusView(APIView):
         user = request.user
         serializer = SubscriptionStatusSerializer(
             {
+                # The caller's own App User ID. Sourced from the authenticated
+                # request, never from a query parameter, so this endpoint cannot
+                # be used to read anyone else's billing identity.
+                "app_user_id": _app_user_id(user),
                 "is_pro": user.is_pro(),
                 "expires_at": user.pro_expires_at,
                 "grace_until": user.pro_grace_until,

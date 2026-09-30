@@ -8,8 +8,8 @@ the comment above a key is not reading the value that actually takes effect.
 
 Scope note — this file deliberately asserts only things that are true of the
 repo as it stands. Where a key is intentionally absent from every template
-(DATABASE_URL, the disabled scraper connectors' API keys) the reason is
-recorded in ``_NOT_IN_ANY_TEMPLATE`` so that a *new* undeclared os.getenv in
+(DATABASE_URL and operator-only secrets) the reason is recorded in
+``_NOT_IN_ANY_TEMPLATE`` so that a *new* undeclared os.getenv in
 settings.py turns this suite red instead of vanishing silently.
 
 Why no PyYAML: the `api` image ships no YAML parser (verified — `yaml`,
@@ -324,9 +324,6 @@ DIVERGENCE_IS_INTENTIONAL: dict[str, str] = {
 #: missing from another is a contradiction in the fleet contract: the
 #: operator of the second environment has no way to discover it exists.
 FLEET_WIDE_REQUIRED: dict[str, tuple[str, ...]] = {
-    'SCRAPER_ENABLED': ('.env.example', '.env.vps.example'),
-    'SCRAPER_ALLOW_NC': ('.env.example', '.env.vps.example'),
-    'SCRAPER_ALLOW_SHARE_ALIKE': ('.env.example', '.env.vps.example'),
     'SHARE_TOKEN_TTL_SECONDS': ('.env.example', '.env.vps.example'),
     'PUBLIC_APP_BASE_URL': ('.env.example', '.env.vps.example'),
     'READ_DATABASE_URL': ('.env.example', '.env.vps.example'),
@@ -336,7 +333,6 @@ FLEET_WIDE_REQUIRED: dict[str, tuple[str, ...]] = {
     'REVENUECAT_ENTITLEMENT_ID': ('.env.example', '.env.vps.example'),
     'REVENUECAT_SYNC_INTERVAL_MINUTES': ('.env.example', '.env.vps.example'),
     'SEED_AUTH_TOKEN': ('.env.example', '.env.vps.example'),
-    'FREESOUND_API_KEY': ('.env.example', '.env.vps.example'),
 }
 
 
@@ -678,22 +674,6 @@ _NOT_IN_ANY_TEMPLATE: dict[str, str] = {
     'PRIVACY_VERSION': 'Undocumented knob. settings.py:1065 defaults it to '
                        '"v1.0" and nothing publishes it; whether it should be '
                        'operator-set is an open question for the owner.',
-    'SCRAPER_STATE_DIR': 'Internal state directory for the (currently '
-                         'disabled, currently unimportable) scraper. No '
-                         'operator has ever set it.',
-    'SCRAPER_LOG_DIR': 'Same as SCRAPER_STATE_DIR.',
-    'SCRAPER_DOWNLOAD_MAX_ATTEMPTS': 'Retry-count tuning for the disabled '
-                                     'scraper. Safe code default (3).',
-    'SCRAPER_DOWNLOAD_BACKOFF': 'Backoff tuning for the disabled scraper. Safe '
-                                'code default (2.0s).',
-    'SCRAPER_OPENVERSE_API_KEY': 'Connector is commented out in settings.py '
-                                 '~line 472 ("DISABLED: uncomment once '
-                                 'configured"), so the key cannot be used.',
-    'SCRAPER_PIXABAY_API_KEY': 'Connector commented out in settings.py, as above.',
-    'SCRAPER_PODCAST_INDEX_API_KEY': 'Connector commented out in settings.py.',
-    'SCRAPER_PODCAST_INDEX_API_SECRET': 'Connector commented out in settings.py.',
-    'SCRAPER_PODCAST_RSS_DEFAULT': 'Belongs to the disabled podcast_index '
-                                   'connector.',
     'FEED_POOL_GLOBAL_TOP_N': 'Feed-pool sizing. Code default 10000 is sized '
                               'for the catalog; tuning it is a capacity task, '
                               'not a deployment step.',
@@ -774,7 +754,7 @@ class TestSettingsTemplateSymmetry:
         for anchor in (
             'DJANGO_DEBUG', 'DJANGO_SECRET_KEY', 'DATABASE_URL',
             'MEDIA_TOKEN_SECRET', 'SHARE_TOKEN_TTL_SECONDS',
-            'PUBLIC_APP_BASE_URL', 'READ_DATABASE_URL', 'SCRAPER_ENABLED',
+            'PUBLIC_APP_BASE_URL', 'READ_DATABASE_URL',
         ):
             assert anchor in keys, (
                 f'settings.py key extraction missed {anchor!r} — the symmetry '

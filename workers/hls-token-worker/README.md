@@ -51,10 +51,47 @@ R2→Worker data transfer is free. Worker→browser egress is covered by R2's
 
 ## Files
 
-- `src/index.ts` — Worker fetch handler (validate cookie → proxy to R2)
-- `src/token.ts` — Token validation logic (HMAC-SHA256, must match Django's `hls_token.py`)
-- `src/config.ts` — Constants (cookie name, TTL, etc.)
+- `src/index.ts` — Worker fetch handler (validate token → proxy to storage)
+- `src/token.ts` — Token validation and extraction logic (HMAC-SHA256, must
+  match Django's `hls_token.py`), plus the constants (`TOKEN_VERSION`,
+  `COOKIE_NAME` at the top of the file — there is no separate `src/config.ts`)
+- `src/storage.ts` — R2 binding (production) and S3/MinIO-over-SigV4 (local)
+  backends behind one interface, plus the `Env` interface and backend selection
+- `src/token.test.ts` — tests for `token.ts`
+- `src/storage.test.ts` — tests for `storage.ts`
 - `wrangler.toml` — Worker configuration
+
+## Tests
+
+```bash
+cd workers/hls-token-worker
+npm ci        # first time only
+npm test      # vitest run — no network, no Docker, no wrangler
+npm run typecheck
+```
+
+Plain `vitest` on Node: the tests are pure unit tests and never touch R2,
+MinIO, or `wrangler dev`.
+
+### What is covered
+
+| Covered | File |
+|---|---|
+| `validatePlaybackToken` — every branch: HMAC mismatch, tampered payload, expiry, version, per-clip path scope (including the partial-prefix off-by-one), malformed and missing fields | `src/token.test.ts` |
+| Token extraction from `Cookie` / `X-EchoFlow-Media-Token`, and cookie-over-header precedence | `src/token.test.ts` |
+| `objectUrl` path building, `assertTokenSecret`, and which storage backend `getStorage` selects for a given env | `src/storage.test.ts` |
+
+### What is NOT covered
+
+| Not covered | File | Risk |
+|---|---|---|
+| The whole fetch handler — `/healthz`, OPTIONS preflight, the 404/405/method routing, CORS header emission and origin allowlist, `Cache-Control` selection, 304 passthrough, and the 403-vs-502 mapping | `src/index.ts` | **Highest.** This is where a validated token becomes bytes; a routing or CORS regression here is invisible to the suite |
+| `StorageBackend.get()` itself — Range forwarding, `HEAD` vs `GET` bodies, 404 / 304 / `!ok` handling, `StorageUnavailable` on a transport error | `src/storage.ts` | The signer's request shape against a real MinIO/R2. Note these two backends never see the same input under test (an R2 binding cannot be pointed at MinIO), so a cross-environment parity test does not exist |
+
+`src/token.test.ts` also pins several **known divergences** from
+`hls_token.py` (a string `exp` is accepted, a missing `exp` never expires, a
+`null` payload throws). Those assertions record current behaviour on purpose —
+they are documented in the file and are not a specification.
 
 ## References
 

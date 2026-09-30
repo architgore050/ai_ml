@@ -55,6 +55,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from django.core.cache.backends.locmem import LocMemCache
@@ -792,6 +793,331 @@ class TestPlaceholderSecretGuard:
         assert any(
             "DJANGO_SECRET_KEY" in r.getMessage() for r in caplog.records
         ), f"no warning recorded; records were {caplog.records!r}"
+
+
+class TestRevenueCatSecretIsGuarded:
+    """DEFECT 2b — `REVENUECAT_SECRET_KEY` had no placeholder check.
+
+    `DJANGO_SECRET_KEY` and both Redis passwords call `require_real_secret`;
+    `REVENUECAT_SECRET_KEY` was read with a bare `os.environ.get(...)`. The
+    gitignored `.env` shipped `your-revenuecat-secret-key`, so a deployment
+    could hold a repository-known bearer token for the whole entitlement API.
+
+    It never presented as a breach, which is why it survived: RevenueCat
+    answers a bad token with 401, `get_subscriber_info` maps that to `None`,
+    and `sync_entitlements` deliberately *preserves* the current Pro state on
+    an unknown lookup. The visible result was a paid subscription that
+    silently never syncs, on every account — a support problem rather than a
+    security alarm, so nothing ever prompted anyone to look at the key.
+
+    WHY THESE TESTS ARE SPLIT IN TWO
+    =================================
+
+    The refusal tests run in a **subprocess**, and that is not a stylistic
+    choice. `secrets.testing_enabled()` returns True when `"pytest" is in
+    sys.modules`, which cannot be unset from inside a test — `monkeypatch.
+    delenv(TESTING_ENV_VAR)` removes the env var but not the `sys.modules`
+    signal, and the latter is a deliberate second signal (see
+    `secrets.testing_enabled`). So under pytest the guard **always** takes the
+    bypass, and an in-process `pytest.raises(ImproperlyConfigured)` can never
+    pass. `TestSettingsImportEnforcesTheGuard` already works around exactly
+    this for `DJANGO_SECRET_KEY`; this class follows that precedent.
+
+    Two things were learned by getting it wrong first, and both are worth
+    keeping in writing:
+
+      * An in-process version of these tests passed `sync_entitlements` a
+        placeholder, the bypass swallowed it, and the service went on to make
+        a **real authenticated HTTPS request to api.revenuecat.com**, which
+        answered `401 Client Error: Unauthorized`. Every in-process test in
+        this class therefore mocks `get_subscriber_info` even when it expects
+        a raise — otherwise a guard regression turns a test suite into an
+        outbound request generator.
+      * `test_each_documented_bypass_...` looked meaningful and proved
+        nothing: it set `ECHOFLOW_TESTING=1`, `DJANGO_DEBUG=true` and
+        `ECHOFLOW_ALLOW_PLACEHOLDER_SECRETS=1` in turn and the sync proceeded
+        for every one — but it would have proceeded with all three **unset**,
+        because pytest itself is the bypass. A test that passes for a reason
+        unrelated to the thing it asserts is worse than no test. Hence the
+        subprocess harness with a control assertion.
+
+    The enforcement point is `services/revenuecat.py::_verified_secret_key`,
+    not `settings.py`, because that is the module that decides whether to make
+    the call. Same predicate, same bypasses; only the call site differs.
+    """
+
+    #: Documentation-shaped values that must all be refused. Read out of the
+    #: shipped env files rather than invented, so the list stays honest about
+    #: what has actually reached a deployment.
+    PLACEHOLDERS = (
+        "your-revenuecat-secret-key",
+        "change-me-to-a-long-random-string",
+        "sk_change_me",
+        "<paste-from-dashboard>",
+    )
+
+    REAL_KEY = "sk_Ab3xY9zQw7Lp2mNc5RfT8vKd1"
+
+    #: Control marker: calls the choke point directly. Deliberately *not* the
+    #: public path, because the control runs with a real key and the public
+    #: path would then issue a live authenticated request to RevenueCat. This
+    #: one only needs to prove the subprocess can import settings and reach the
+    #: function, which is what makes the refusals below meaningful.
+    MARKER_DIRECT = (
+        "from backend.app.services.revenuecat import _verified_secret_key; "
+        "_verified_secret_key(); print('GUARD-REACHED')"
+    )
+
+    #: Refusal / bypass marker: goes through the PUBLIC `sync_entitlements`,
+    #: so removing the guard from that function breaks these tests. (A version
+    #: that imported `_verified_secret_key` directly passed with the guard call
+    #: deleted — the tests outlived the thing they were written for.)
+    #:
+    #: `get_subscriber_info` is replaced with a no-op BEFORE the call. Without
+    #: it, a bypass case would issue a real authenticated HTTPS request to
+    #: api.revenuecat.com with the placeholder — which is exactly the failure
+    #: mode this class exists to prevent, and it happened once while these
+    #: tests were being written. The stub user is a plain namespace: nothing
+    #: before `get_subscriber_info` touches the database.
+    MARKER_SYNC = (
+        "import types;"
+        "import backend.app.services.revenuecat as rc;"
+        "rc.get_subscriber_info = lambda app_user_id: None;"
+        "rc.sync_entitlements(types.SimpleNamespace("
+        "revenuecat_app_user_id='00000000-0000-0000-0000-000000000000',"
+        "id=0, has_pro_entitlement=False, pro_expires_at=None,"
+        "pro_grace_until=None, pro_last_synced=None));"
+        "print('SYNC-REACHED')"
+    )
+
+    def _run(self, overrides, marker=None):
+        """Run `marker` in a clean interpreter that inherits this process's env.
+
+        Every documented bypass is then cleared, so the subprocess cannot
+        succeed for a reason the test did not arrange. `ECHOFLOW_TESTING` is
+        cleared explicitly for the same reason
+        `TestSettingsImportEnforcesTheGuard` clears it: `conftest.py` sets it,
+        `_run` copies `os.environ`, and the guard checks it before anything
+        else.
+        """
+        env = dict(os.environ)
+        env.update({k: v for k, v in overrides.items() if v is not None})
+        for key, value in overrides.items():
+            if value is None:
+                env.pop(key, None)
+        env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+        return subprocess.run(
+            [sys.executable, "-c", marker or self.MARKER_SYNC],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(REPO_ROOT),
+            timeout=180,
+        )
+
+    def _base_env(self, secret_value):
+        from backend.EchoFlow import secrets as secrets_mod
+
+        return {
+            # A real Django key, or the import fails on the *other* secret and
+            # every assertion below would be about the wrong variable.
+            "DJANGO_SECRET_KEY": "vQ8sTz2mRk5pLw9xYb3nHc7dFs1gJq6Zn4A",
+            "DJANGO_DEBUG": "False",
+            "ECHOFLOW_ALLOW_PLACEHOLDER_SECRETS": None,
+            "ECHOFLOW_TESTING": None,
+            "DJANGO_SETTINGS_MODULE": "backend.EchoFlow.settings",
+            "REVENUECAT_SECRET_KEY": secret_value,
+            # Referenced only so a future edit cannot silently rename it out
+            # from under this test.
+            secrets_mod.BYPASS_ENV_VAR: None,
+        }
+
+    # -- subprocess: the refusal and the bypasses ------------------------
+
+    def test_the_harness_itself_works(self):
+        """Control. A real key must clear the guard.
+
+        Without this, a subprocess that failed for an unrelated reason
+        (bad PYTHONPATH, settings import error) would make every refusal test
+        below pass for the wrong reason.
+        """
+        result = self._run(self._base_env(self.REAL_KEY), marker=self.MARKER_DIRECT)
+        assert result.returncode == 0, (
+            f"control run failed, so the refusals below prove nothing.\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert "GUARD-REACHED" in result.stdout
+
+    @pytest.mark.parametrize("value", PLACEHOLDERS)
+    def test_a_placeholder_is_refused(self, value):
+        result = self._run(self._base_env(value))
+        assert result.returncode != 0, (
+            f"REVENUECAT_SECRET_KEY={value!r} was accepted by a production "
+            "process — a deployment could hold a repository-known token for "
+            "the whole entitlement API"
+        )
+        assert "REVENUECAT_SECRET_KEY" in result.stderr, result.stderr
+        assert "RevenueCat" in result.stderr, (
+            "the error must name the service the secret protects, or the "
+            f"operator cannot tell where to get a real one.\n{result.stderr}"
+        )
+
+    @pytest.mark.parametrize(
+        "bypass_var",
+        ["ECHOFLOW_ALLOW_PLACEHOLDER_SECRETS", "DJANGO_DEBUG", "ECHOFLOW_TESTING"],
+    )
+    def test_each_documented_bypass_still_works(self, bypass_var):
+        """The escape hatches have to actually escape, or they are not escapes.
+
+        Pinned per-secret rather than only for `DJANGO_SECRET_KEY`, because the
+        bypasses live in `secrets.py` while this secret's call site lives in
+        another module: a refactor that passes different flags — notably
+        `allow_in_debug=False` — would turn a usable dev stack into a crash
+        loop for this key alone, and every other bypass test would stay green.
+        """
+        overrides = self._base_env("change-me")
+        overrides[bypass_var] = {"DJANGO_DEBUG": "true"}.get(bypass_var, "1")
+
+        result = self._run(overrides)
+
+        assert result.returncode == 0, (
+            f"{bypass_var} did not let this secret through; it must remain "
+            "usable by local dev and by the test harness.\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert "SYNC-REACHED" in result.stdout, (
+            "the bypass let the placeholder through the guard but the sync "
+            f"did not complete.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert "REVENUECAT_SECRET_KEY" in (result.stdout + result.stderr), (
+            f"the {bypass_var} bypass was silent — it must warn"
+        )
+
+    # -- in-process: what the suite itself can observe -------------------
+
+    def test_empty_is_skipped_not_refused(self, db, settings, user):
+        """Empty means "RevenueCat not configured", which is a supported mode.
+
+        Every shipped template ships this blank and `sync_entitlements`
+        already documented it as a skip. Turning that into an
+        `ImproperlyConfigured` would make a documented deployment shape
+        unbootable, so it must stay a no-op return — the same reasoning
+        `settings.py` applies to an empty `DB_PASSWORD`.
+        """
+        settings.REVENUECAT_SECRET_KEY = ""
+        from backend.app.services.revenuecat import sync_entitlements
+
+        with mock.patch(
+            "backend.app.services.revenuecat.get_subscriber_info"
+        ) as mock_get:
+            assert sync_entitlements(user) is False
+        mock_get.assert_not_called()
+
+    def test_a_realistic_key_reaches_the_api(self, db, settings, user):
+        """The counterpart: a guard that refused real keys would be reverted.
+
+        Asserted on the *call count*, because a guard that raised
+        unconditionally would also satisfy every refusal test above.
+        """
+        settings.REVENUECAT_SECRET_KEY = self.REAL_KEY
+        from backend.app.services.revenuecat import sync_entitlements
+
+        with mock.patch(
+            "backend.app.services.revenuecat.get_subscriber_info", return_value=None
+        ) as mock_get:
+            assert sync_entitlements(user) is False
+
+        assert mock_get.call_count == 1, (
+            "a realistic key must reach the API call — the guard is refusing "
+            "valid credentials"
+        )
+
+    def test_the_guard_is_reachable_from_the_sync_path(
+        self, db, settings, user, caplog
+    ):
+        """The guard must be *in* the code path, not merely defined.
+
+        Under pytest the bypass is always in effect (see the class docstring),
+        so this cannot observe the raise. What it can observe — and what a
+        guard added in the wrong place would fail — is that
+        `sync_entitlements` consults it: passing a placeholder produces the
+        bypass warning naming this exact variable. `get_subscriber_info` is
+        mocked so a guard regression cannot reach the live API.
+
+        Without this, `_verified_secret_key()` could be deleted and every
+        refusal test above would still pass, because they import it directly.
+        """
+        settings.REVENUECAT_SECRET_KEY = "change-me-to-a-long-random-string"
+        from backend.app.services.revenuecat import sync_entitlements
+
+        with mock.patch(
+            "backend.app.services.revenuecat.get_subscriber_info", return_value=None
+        ) as mock_get:
+            with caplog.at_level("WARNING"):
+                assert sync_entitlements(user) is False
+
+        assert mock_get.call_count == 1, (
+            "the network was reached, so the guard did not run on this path — "
+            "a placeholder is one refactor away from being sent to RevenueCat"
+        )
+        assert any(
+            "REVENUECAT_SECRET_KEY" in r.getMessage() for r in caplog.records
+        ), (
+            "the guard was not consulted by sync_entitlements; records were "
+            f"{[r.getMessage() for r in caplog.records]!r}"
+        )
+
+    def test_the_guard_does_not_change_the_settings_module(self):
+        """Enforced at the call site, so importing settings must still work.
+
+        The load-bearing difference from `DJANGO_SECRET_KEY`: RevenueCat is
+        OPTIONAL, and both `.env.example` and `.env.vps.example` ship
+        `REVENUECAT_SECRET_KEY=` blank. Guarding `settings.py:1273`
+        unconditionally would hard-fail every deployment that copied a
+        template unchanged. This asserts the shape that must hold, so a future
+        move to the import-time pattern has to argue with it rather than
+        inherit it by accident.
+        """
+        from backend.EchoFlow import settings as s
+
+        assert s.REVENUECAT_SECRET_KEY == os.environ.get(
+            "REVENUECAT_SECRET_KEY", ""
+        ), (
+            "REVENUECAT_SECRET_KEY is no longer a bare os.environ.get — if it "
+            "was moved to an import-time require_real_secret, the empty-value "
+            "skip in sync_entitlements and the blank shipped templates must "
+            "have been dealt with deliberately. See this class's docstring."
+        )
+
+    def test_the_shipped_templates_ship_a_placeholder(self):
+        """Read the value out of the tracked templates, do not trust a list.
+
+        Same reasoning as `TestShippedExampleSecretsAreRejected`: a test that
+        hardcodes the string stops guarding the moment someone edits an
+        example.
+        """
+        from backend.EchoFlow.secrets import is_placeholder_secret
+
+        found = {}
+        for name in (".env.example", ".env.vps.example", ".env.laptop.example"):
+            path = REPO_ROOT / name
+            if not path.exists():
+                continue
+            match = re.search(
+                r"^REVENUECAT_SECRET_KEY=(.*)$", path.read_text(), re.MULTILINE
+            )
+            if match:
+                found[name] = match.group(1).strip()
+
+        assert found, (
+            "REVENUECAT_SECRET_KEY disappeared from every env template — this "
+            "test would silently stop guarding."
+        )
+        for source, value in found.items():
+            assert is_placeholder_secret(value), (
+                f"{source} ships REVENUECAT_SECRET_KEY={value!r}, which the "
+                "guard does NOT treat as a placeholder."
+            )
 
 
 class TestShippedExampleSecretsAreRejected:

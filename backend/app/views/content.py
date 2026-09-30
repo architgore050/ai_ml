@@ -9,6 +9,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.http import HttpResponse
 from django.utils.html import escape
+from django.utils import timezone
 from rest_framework import viewsets, permissions, parsers, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -16,7 +17,6 @@ from django.shortcuts import get_object_or_404
 from ..media_urls import get_hls_playback_url
 from ..models import AudioClip, Report, TakedownRequest
 from ..serializers import AudioUploadSerializer, FeedClipSerializer, PublicClipSerializer
-from ..services import content_moderation as moderation_svc
 from ..services import uploads as uploads_svc
 from ..services.entitlements import is_license_restricted
 from ..services.hls_token import COOKIE_NAME, generate_playback_token, verify_token
@@ -410,8 +410,8 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
         The finding this answers described ``license_type`` as the thing that
         makes a clip NonCommercial. It does not. ``is_noncommercial`` and
         ``requires_share_alike`` are separate columns, absent from
-        ``AudioUploadSerializer.Meta.fields``, written only by the scraper
-        uploader — so PATCH cannot open the redistribution gate at all
+        ``AudioUploadSerializer.Meta.fields``, derived at upload time — so
+        PATCH cannot open the redistribution gate at all
         (pinned by
         ``test_the_rights_flags_are_not_writable_through_the_api``). What
         PATCH *could* do was silently rewrite the declared licence and
@@ -524,26 +524,28 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
             clip = get_object_or_404(
                 AudioClip.objects.filter(creator=request.user), pk=pk
             )
-        approved, reason = moderation_svc.run_moderation_check(clip.id)
-        # Reload clip from DB so moderation_approved reflects the update.
-        clip.refresh_from_db()
-        if approved:
-            # Enqueue HLS processing after approval.
-            uploads_svc.trigger_hls_processing(clip)
-            return Response({
-                "status": "approved",
-                "message": "Moderation approved. HLS processing started.",
-                "clip_id": clip.id,
-                "moderation_approved": clip.moderation_approved,
-            }, status=status.HTTP_200_OK)
-        else:
-            return Response({
-                "status": "rejected",
-                "message": "Moderation check failed.",
-                "reason": reason,
-                "clip_id": clip.id,
-                "moderation_approved": False,
-            }, status=status.HTTP_400_BAD_REQUEST)
+        # This endpoint authorizes processing; the actual moderation decision
+        # happens in the worker after Whisper has produced a transcript and
+        # KeyBERT has produced tags. Running the old service here made the
+        # transcript check permanently inert because no transcript existed yet.
+        clip.moderation_approved = True
+        clip.moderation_reason = "Pending automated moderation"
+        clip.moderated_at = timezone.now()
+        clip.moderated_by = request.user
+        clip.save(update_fields=[
+            "moderation_approved", "moderation_reason", "moderated_at",
+            "moderated_by",
+        ])
+
+        # Enqueue HLS processing after the owner/staff authorization. The
+        # worker will persist the final approved/rejected decision and evidence.
+        uploads_svc.trigger_hls_processing(clip)
+        return Response({
+            "status": "processing",
+            "message": "Moderation processing started.",
+            "clip_id": clip.id,
+            "moderation_approved": clip.moderation_approved,
+        }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='report', permission_classes=[permissions.IsAuthenticated])
     def report_clip(self, request, pk=None):

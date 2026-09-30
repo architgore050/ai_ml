@@ -81,8 +81,10 @@ EchoFlow uses **RevenueCat Billing** (Stripe-backed) for Pro subscription manage
 
 **Frontend:** `@revenuecat/purchases-js` SDK, `Paywall.tsx` component, `useSubscription` context
 
-### License-Aware Audio Scraping
-A `robots.txt`-respecting, rate-limited scraper ingests openly-licensed audio from multiple archives, normalizes/trims it, and feeds it through the same AI pipeline (see [Audio Scraping](#audio-scraping--ingestion)).
+### Audio ingestion
+The MVP accepts user-owned audio through `POST /clips/`. The former
+third-party scraper/import subsystem is not part of the public release; seed
+development media through the supported upload/API path.
 
 ## Architecture / Tech Stack
 
@@ -189,33 +191,6 @@ docker buildx prune --filter id=echoflow-hf
 
 Full design and invalidation rules: [docs/EXPLAIN/docker/01-multi-stage-dockerfile.md](docs/EXPLAIN/docker/01-multi-stage-dockerfile.md).
 
-## Audio Scraping / Ingestion
-
-EchoFlow includes a license-aware scraper for seeding the catalog from public, openly-licensed archives. It respects `robots.txt`, enforces per-host rate limits, validates content type, enforces a max download size, and normalizes/trims audio via pydub.
-
-**Supported sources** (from `ai_ml/scrapers/sources/`):
-
-| Source | Requirement | License enforcement |
-|--------|-------------|---------------------|
-| `wikimedia` | None | Filters to `audio/*` MIME |
-| `internet_archive` | None | Allowed-license filter |
-| `freesound` | `FREESOUND_API_KEY` env var | Filters to allowed licenses |
-| `kaggle` | `SCRAPER_KAGGLE_LOCAL_PATH` | Local `file://` ingestion |
-
-Allowed licenses are configurable via `SCRAPER_ALLOW_LICENSES` (default: `CC0, CC-BY, CC-BY-SA, CC-BY-NC`).
-
-```bash
-# Import 3 clips from Wikimedia Commons, trimmed to 30s
-docker compose exec web python manage.py scrape_audio --source=wikimedia --limit=3 --clip-length=30
-
-# Same ingestion, but as a Celery task (enqueue from inside the web container)
-docker compose exec web python -c "from backend.app.tasks import scrape_and_import; scrape_and_import.delay('internet_archive', limit=5)"
-```
-
-Scraped clips are stored under `media/audio_scraper/{source}/YYYY/MM/DD/`, provenance/license metadata is attached, and each clip is then processed through the full AI + HLS pipeline automatically.
-
-FFmpeg **must** be installed for scraping to work (used by audio normalization and HLS generation). See [Key Features](#key-features) for the full pipeline.
-
 ## Project Structure
 
 ```
@@ -223,7 +198,7 @@ EchoFlow/
 ├── .github/workflows/          # CI: django.yml (tests/migrations/static), docker-image.yml (image build+push), codeql.yml
 ├── backend/                    # Django application
 │   ├── EchoFlow/               # Project package — don't confuse with the app package below
-│   │   ├── settings.py         # All config: DB, Redis, Celery, JWT, scraper, CORS
+│   │   ├── settings.py         # All config: DB, Redis, Celery, JWT, CORS
 │   │   ├── urls.py             # Root URL config (admin + app routes)
 │   │   ├── celery.py           # Celery app (Redis broker)
 │   │   ├── health.py           # /health/ liveness and /ready/ readiness probes
@@ -238,7 +213,7 @@ EchoFlow/
 │   │   ├── db_routers.py       # Multi-DB routing (read-replica; auto-activates when READ_DATABASE_URL is set)
 │   │   ├── services/           # Service layer: interactions, shares, follows, comments, uploads, feed_pool, counter_store, sentry, task_publisher
 │   │   ├── management/
-│   │   │   └── commands/       # scrape_audio management command
+│   │   │   └── commands/       # operational management commands
 │   │   ├── migrations/
 │   │   └── tests/              # 20 pytest files (security, services, adversarial, integration, etc.)
 │   ├── scripts/                # Seed scripts (seed_db.py, seed_db2.py)
@@ -247,14 +222,7 @@ EchoFlow/
 │   ├── models/                 # Whisper / embedding / KeyBERT / acoustic wrappers
 │   ├── pipelines/              # audio_ingest, cold_start, recommendation
 │   ├── eval/                   # feed_metrics, vector_quality
-│   └── scrapers/               # License-aware audio ingestion (moved from backend/app/scrapers/)
-│       ├── base.py             # robots.txt checker, rate limiter, HTTP session
-│       ├── downloader.py       # Safe audio download (size/content-type guards)
-│       ├── normalizer.py       # Trim + normalize audio (pydub)
-│       ├── uploader.py         # Persist clip + provenance metadata
-│       ├── state.py            # Resumable state management
-│       ├── log.py              # CSV logging
-│   └── sources/            # wikimedia_commons, internet_archive, freesound, kaggle, openverse, librivox, free_music_archive, podcast_rss, bbc_sound_effects, musopen, loc_national_jukebox, usgov_audio, youtube, youtube_shorts
+│   └── pipelines/              # ingest, cold-start, recommendation
 ├── frontend/                   # Sample Vite/React client (HLS.js playback)
 ├── docs/                       # Architecture audits, EXPLAIN/, scaling analysis, deployment notes
 ├── docker/                     # nginx.conf, prometheus/, grafana/, certs/

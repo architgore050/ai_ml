@@ -195,10 +195,8 @@ def normalize_to_wav(input_file_path, sr=22050):
     This exists because librosa.load() tries soundfile (libsndfile) first and
     silently falls back to the deprecated `audioread` path — logging a
     UserWarning/FutureWarning — on any container/codec libsndfile can't
-    decode. Direct browser/file uploads hit this because, unlike the scraper
-    ingestion path (which already runs everything through
-    scrapers/normalizer.py), nothing normalizes user uploads before they're
-    handed to librosa. Doing one authoritative ffmpeg decode here removes the
+    decode. Direct browser/file uploads need one authoritative ffmpeg decode
+    before they are handed to librosa. Doing that here removes the
     audioread fallback entirely (so this doesn't silently start hard-failing
     when librosa 1.0 drops that fallback) and gives every downstream step
     (librosa, Whisper, ffmpeg HLS) the same known-good source file instead of
@@ -343,6 +341,7 @@ def _process_audio_to_hls_impl(self, clip_id, timer):
             model = get_whisper_model()
             segments, info = model.transcribe(normalized_path, beam_size=5)
             transcript_text = " ".join([segment.text for segment in segments]).strip()
+            clip.transcript_text = transcript_text
 
             # B. Semantic Vector via sentence-transformers
             if transcript_text:
@@ -393,19 +392,31 @@ def _process_audio_to_hls_impl(self, clip_id, timer):
                 logger.error("Moderation rejected clip %s (transcript): %s", clip_id, transcript_reason)
                 clip.moderation_approved = False
                 clip.status = 'rejected'
-                clip.save(update_fields=['moderation_approved', 'status', 'tags'])
+                clip.moderation_reason = transcript_reason or ''
+                clip.moderated_at = timezone.now()
+                clip.save(update_fields=[
+                    'moderation_approved', 'status', 'tags', 'transcript_text',
+                    'semantic_vector', 'moderation_reason', 'moderated_at',
+                ])
                 timer.set_outcome('moderation_rejected')
                 return
             if not tags_approved:
                 logger.error("Moderation rejected clip %s (tags): %s", clip_id, tags_reason)
                 clip.moderation_approved = False
                 clip.status = 'rejected'
-                clip.save(update_fields=['moderation_approved', 'status', 'tags'])
+                clip.moderation_reason = tags_reason or ''
+                clip.moderated_at = timezone.now()
+                clip.save(update_fields=[
+                    'moderation_approved', 'status', 'tags', 'transcript_text',
+                    'semantic_vector', 'moderation_reason', 'moderated_at',
+                ])
                 timer.set_outcome('moderation_rejected')
                 return
 
             # All moderation checks passed — set approved.
             clip.moderation_approved = True
+            clip.moderation_reason = ''
+            clip.moderated_at = timezone.now()
         except (OSError, ConnectionError):
             logger.exception("AI inference transient error for clip %s; re-raising for retry", clip_id)
             raise
@@ -1165,131 +1176,6 @@ def cleanup_stuck_processing(threshold_minutes=15, max_per_run=50):
     if give_up:
         return f"Re-enqueued {re_enqueued}, gave up on {give_up} (>{int(give_up_threshold.total_seconds() // 60)}m) clips."
     return f"Re-enqueued {re_enqueued} stuck clips (threshold={threshold_minutes}m)."
-
-
-@shared_task(bind=True, max_retries=3, default_retry_delay=60, autoretry_for=RETRYABLE_ERRORS, retry_backoff=True, retry_backoff_max=600)
-def scrape_and_import(self, source_name, limit=5, clip_length=300, allow_nc=None, include_share_alike=None):
-    """Celery task wrapper to run a scraper source and import clips.
-
-    This task delegates to the source connectors and uses the local
-    downloader/normalizer/uploader to create `AudioClip` records and
-    then triggers `process_audio_to_hls` for each created clip.
-
-    License enforcement mirrors the management command (closes the gap noted
-    in docs/EXPLAIN/scraping/03-licensing-safety.md): items whose license
-    family does not permit commercial use are skipped unless allow_nc=True.
-    CC-BY-SA items are imported with requires_share_alike=True and
-    moderation_approved=False (model default), so they require operator
-    approval via /clips/{id}/approve-moderation/ before reaching feeds.
-    """
-    from ai_ml.scrapers.sources import SOURCES
-    from ai_ml.scrapers.base import (
-        normalize_license,
-        license_features,
-        license_allows_commercial,
-        is_share_alike_license,
-    )
-    from django.conf import settings as dj_settings
-
-    # SECURITY: master kill switch, same as the management command. Raising
-    # rather than returning a string so a caller that ignores the return
-    # value cannot mistake "refused" for "imported nothing".
-    if not getattr(dj_settings, 'SCRAPER_ENABLED', False):
-        raise RuntimeError(
-            'scrape_and_import refused: SCRAPER_ENABLED is not set. The '
-            'license classifier is the only writer of AudioClip.'
-            'is_noncommercial / requires_share_alike, which gate the feed and '
-            'POST /media/playback-token/. Re-verify a source\'s licensing by '
-            'hand before enabling — see '
-            'docs/EXPLAIN/scraping/03-licensing-safety.md.'
-        )
-
-    module = SOURCES.get(source_name)
-    if not module:
-        raise RuntimeError(f"Unknown source: {source_name}")
-
-    from django.contrib.auth import get_user_model
-    UserModel = get_user_model()
-    user = UserModel.objects.filter(is_superuser=True).first()
-    if not user:
-        user = UserModel.objects.create_user(username='scraper')
-        user.set_unusable_password()
-        user.save()
-
-    # Honor explicit overrides; else fall back to env-driven settings.
-    if allow_nc is None:
-        allow_nc = getattr(dj_settings, 'SCRAPER_ALLOW_NC', False)
-    if include_share_alike is None:
-        include_share_alike = getattr(dj_settings, 'SCRAPER_ALLOW_SHARE_ALIKE', False)
-
-    from ai_ml.scrapers import downloader, normalizer, uploader
-
-    items = module.fetch_audio(limit=limit)
-    imported = 0
-    skipped = 0
-    for item in items:
-        url = item.get('url')
-        title = item.get('title') or 'scraped audio'
-        page = item.get('page_url') or ''
-        lic_raw = item.get('license')
-        original_id = item.get('id')
-        family = normalize_license(lic_raw)
-        nc, sa = license_features(family)
-        nc = nc or bool(item.get('is_noncommercial'))
-        if not license_allows_commercial(family, allow_nc=allow_nc):
-            logger.info("scrape_and_import: skipping %s license=%s family=%s",
-                        url, lic_raw, family)
-            skipped += 1
-            continue
-        sa = sa or is_share_alike_license(family)
-
-        local_input = None
-        tmp_out = None
-        try:
-            if url.startswith('file://'):
-                local_input = url[len('file://'):]
-            else:
-                local_input = downloader.download_audio(url)
-
-            tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3').name
-            normalizer.normalize_and_trim(local_input, tmp_out, max_seconds=clip_length, target_format='mp3')
-
-            clip = uploader.save_clip(
-                user=user,
-                title=title,
-                source_name=source_name,
-                source_url=page,
-                license=lic_raw or 'unknown',
-                attribution_text=page,
-                local_file_path=tmp_out,
-                original_source_id=original_id,
-                is_noncommercial=nc,
-                requires_share_alike=sa,
-                license_family=family,
-            )
-
-            publish(process_audio_to_hls, str(clip.id))
-            imported += 1
-            logger.info("Imported clip %s from %s (family=%s nc=%s sa=%s)",
-                        clip.id, source_name, family, nc, sa)
-
-        except Exception as e:
-            logger.error("Failed to import %s: %s", url, e)
-
-        finally:
-            # local_input/tmp_out are always tempfile-backed local scratch
-            # paths here (never the durable store — see uploader.save_clip,
-            # which already writes through default_storage), so there's
-            # nothing to protect against deleting; clean up unconditionally.
-            for p in (local_input, tmp_out):
-                try:
-                    if p and os.path.exists(p):
-                        os.remove(p)
-                except Exception as e:
-                    logger.error("Failed to clean up temp file %s: %s", p, e)
-
-    logger.info("scrape_and_import(%s): imported=%d skipped=%d allow_nc=%s sa=%s",
-                source_name, imported, skipped, allow_nc, include_share_alike)
 
 
 # ---------------------------------------------------------------------------

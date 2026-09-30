@@ -253,10 +253,8 @@ def suggestions(client, feed_view):
 #: The expected `(is_noncommercial, requires_share_alike)` for every entry in
 #: `AudioUploadSerializer.LICENSE_CHOICES`.
 #:
-#: Checked against `ai_ml.scrapers.base.license_features` (the authority, which
-#: the scraper uploader calls to populate these same two columns) rather than
-#: from memory — `test_parity_with_the_scraper_classifier` re-derives them at
-#: run time so this literal cannot rot silently.
+#: This is a golden policy table rather than a dependency on an ingestion
+#: subsystem; the upload serializer is now the sole active writer.
 EXPECTED_FEATURES = {
     "Owned": (False, False),
     "CC0": (False, False),
@@ -601,30 +599,25 @@ def test_a_stranger_cannot_relabel_someone_elses_clip(uploader_client,
 
 
 # ---------------------------------------------------------------------------
-# 5. The scraper path is untouched
+# 5. Persisted rights flags remain authoritative
 # ---------------------------------------------------------------------------
 
-def test_a_row_written_outside_the_serializer_keeps_the_classifier_flags(
+def test_a_row_with_restricted_rights_keeps_the_classifier_flags(
     uploader_client, peer_client
 ):
-    """The scraper is the one writer with a real classifier, and it populates
-    these columns directly. Nothing on the API path may re-derive, clear or
-    second-guess them.
+    """Persisted rights flags are never cleared by ordinary metadata edits.
 
-    This is also the sharpest statement of DEFECT A: before the fix this was
-    the ONLY shape a restricted clip could have, which is exactly why the
-    defect was invisible to a suite whose fixtures were all built with
-    `AudioClip.objects.create(...)`.
+    This covers legacy/imported rows without depending on the removed scraper.
     """
-    from ai_ml.scrapers.base import license_features
+    from backend.app.serializers import license_restriction_features
 
     up_client, up_user = uploader_client
     other_client, _peer = peer_client
 
-    nc, sa = license_features('CC-BY-NC')
+    nc, sa = license_restriction_features('CC-BY-NC')
     assert (nc, sa) == (True, False), (
-        "the in-repo authority changed under this test — re-derive "
-        "EXPECTED_FEATURES before trusting the assertions below"
+        "the rights policy changed under this test — update the golden "
+        "policy expectations before trusting the assertions below"
     )
 
     clip = AudioClip.objects.create(
@@ -750,27 +743,13 @@ def test_unknown_is_logged_against_the_specific_clip(uploader_client,
 
 
 # ---------------------------------------------------------------------------
-# 7. Parity with the in-repo authority
+# 7. Golden rights-policy table
 # ---------------------------------------------------------------------------
 
-def test_parity_with_the_scraper_classifier():
-    """Guards the local table against drift from
-    `ai_ml.scrapers.base.license_features` — what `ai_ml/scrapers/uploader.py`
-    uses to populate these very same two columns.
-
-    `importorskip` is deliberate. The table is defined LOCALLY in
-    `serializers.py` rather than imported, so that a missing scraper package
-    cannot take the rights gate down with it: `serializers.py` is imported by
-    every request the platform serves, and `ai_ml/scrapers/` has been deleted
-    by two separate commits in this repo's history. The skip is the cost of
-    that isolation; this test is what buys the guarantee back.
-    """
-    license_features = pytest.importorskip(
-        "ai_ml.scrapers.base", reason="scraper package not installed"
-    ).license_features
-
+def test_rights_policy_table_is_explicit_and_complete():
+    """The upload rights policy remains tested after scraper removal."""
     from backend.app.serializers import LICENSE_RESTRICTION_FEATURES
 
     for license_type, expected in sorted(EXPECTED_FEATURES.items()):
-        assert LICENSE_RESTRICTION_FEATURES[license_type] == \
-            license_features(license_type) == expected, license_type
+        assert LICENSE_RESTRICTION_FEATURES[license_type] == expected, license_type
+    assert set(LICENSE_RESTRICTION_FEATURES) == set(EXPECTED_FEATURES)

@@ -48,6 +48,14 @@ Every tracked env template ships documentation placeholders:
     resolved password, and an empty one is skipped rather than rejected:
     bare-metal development against a Postgres that trusts the socket is a
     legitimate configuration, not a placeholder.
+  * ``REVENUECAT_SECRET_KEY`` is enforced in
+    ``backend/app/services/revenuecat.py::_verified_secret_key`` rather than
+    here or in ``settings.py``, because that module is the only place that
+    decides whether to make the call. Same predicate, same vocabulary, same
+    three bypasses — only the call site differs. It is called out here because
+    "which secrets does the guard cover?" has no single answer you can read
+    off the settings module, and that is exactly the gap that let this secret
+    stay unguarded while the three above were fixed.
 
 THE TRADE-OFF, STATED PLAINLY
 =============================

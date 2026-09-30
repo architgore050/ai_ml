@@ -120,6 +120,18 @@ export default (_context: ConfigContext): ExpoConfig => {
       favicon: './assets/favicon.png',
     },
     plugins: [
+      // Trust the self-signed dev CA so a physical phone can complete the TLS
+      // handshake against https://<LAN-IP>:18443. Android 7+ ignores
+      // user-installed CAs unless the app opts in, and `android/` is gitignored
+      // and wiped by `prebuild --clean`, so this must be a config plugin.
+      //
+      // It injects into src/debug/ ONLY and no-ops for preview/production — see
+      // the SECURITY note in the plugin. It throws if the channel is unset, so
+      // a missing env var cannot quietly widen the trust boundary.
+      [
+        './plugins/withDevCaTrust',
+        { releaseChannel },
+      ],
       // D3: file-based routing. Auth lives in route groups — app/(auth)/ vs
       // app/(tabs)/ — which is what makes the `scheme: "echoflow"` declared
       // above actually do something. The old app declared it and had zero

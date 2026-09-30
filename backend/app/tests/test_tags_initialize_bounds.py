@@ -34,6 +34,7 @@ first one is the no-regression case: this endpoint is real product
 functionality (the 8-vibe cold-start onboarding modal calls it), so it has
 to keep working for normal input, not just refuse abuse.
 """
+from conftest import assert_view_queries  # noqa: E402  (query budget excl. middleware)
 import time
 import unittest
 from unittest import mock
@@ -151,7 +152,7 @@ class TagsInitializeBoundsTests(TestCase):
         # never built, so no AudioClip SELECT was issued. It is deterministic
         # (unlike a wall-clock bound) and it is the property that matters —
         # an over-long list must cost zero database work.
-        with self.assertNumQueries(0):
+        with assert_view_queries(0):
             r = self._post({'selected_tags': tags})
 
         self._assert_error_shape(r)
@@ -163,7 +164,7 @@ class TagsInitializeBoundsTests(TestCase):
         payload = {'selected_tags': [f'tag{i}' for i in range(50_000)]}
 
         started = time.monotonic()
-        with self.assertNumQueries(0):
+        with assert_view_queries(0):
             r = self._post(payload)
         elapsed = time.monotonic() - started
 
@@ -192,14 +193,14 @@ class TagsInitializeBoundsTests(TestCase):
         ]
         for value, label in cases:
             with self.subTest(value=label):
-                with self.assertNumQueries(0):
+                with assert_view_queries(0):
                     r = self._post({'selected_tags': value})
                 # The regression is a 500: `for tag in 5` raised
                 # TypeError, and "jazz"/{"a": ...} silently built nonsense.
                 self._assert_error_shape(r)
 
     def test_missing_field_is_rejected(self):
-        with self.assertNumQueries(0):
+        with assert_view_queries(0):
             r = self.client.post(URL, {}, format='json')
         self._assert_error_shape(r)
 
@@ -208,13 +209,13 @@ class TagsInitializeBoundsTests(TestCase):
     def test_non_string_element_is_rejected_not_crashed(self):
         for bad in (5, None, {'a': 1}, ['nested'], True):
             with self.subTest(element=repr(bad)):
-                with self.assertNumQueries(0):
+                with assert_view_queries(0):
                     r = self._post({'selected_tags': ['jazz', bad]})
                 self._assert_error_shape(r)
 
     def test_over_length_single_tag_is_rejected(self):
         from backend.app.views.feed import _MAX_TAG_LENGTH
-        with self.assertNumQueries(0):
+        with assert_view_queries(0):
             r = self._post({'selected_tags': ['jazz', 'x' * (_MAX_TAG_LENGTH + 1)]})
         self._assert_error_shape(r)
         self.assertIn(str(_MAX_TAG_LENGTH), r.data['error'])
@@ -244,7 +245,7 @@ class TagsInitializeBoundsTests(TestCase):
     def test_whitespace_only_tag_is_rejected(self):
         """Stripped to empty it can never match, so building a clause for it
         is pure waste — and a caller who sends it deserves to be told."""
-        with self.assertNumQueries(0):
+        with assert_view_queries(0):
             r = self._post({'selected_tags': ['jazz', '   ']})
         self._assert_error_shape(r)
 
@@ -263,14 +264,14 @@ class TagsInitializeBoundsTests(TestCase):
         tries to inline it as a jsonb literal. Rejecting NUL is the same
         rule CommentSerializer.validate_text already applies
         (serializers.py:540-541)."""
-        with self.assertNumQueries(0):
+        with assert_view_queries(0):
             r = self._post({'selected_tags': ['jazz', 'ja\x00zz']})
         self._assert_error_shape(r)
 
     # --- 8/9. empty list and duplicates ------------------------------------
 
     def test_empty_list_is_rejected_with_a_useful_message(self):
-        with self.assertNumQueries(0):
+        with assert_view_queries(0):
             r = self._post({'selected_tags': []})
         self._assert_error_shape(r)
         self.assertIn('at least one', r.data['error'])

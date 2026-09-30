@@ -28,6 +28,7 @@ requests through the share endpoint defeat that refusal. The same holds for
 place for counter/cache behaviour; this file is about what the HTTP endpoint
 will and will not accept.
 """
+from conftest import assert_view_queries  # noqa: E402  (query budget excl. middleware)
 import pytest
 from rest_framework.test import APIClient
 
@@ -289,29 +290,27 @@ class TestShareListQueryCount:
                 sender=author, receiver=receiver, clip=clip
             )
 
-    def test_share_list_query_count_is_flat(self, receiver, django_user_model,
-                                           django_assert_num_queries):
+    def test_share_list_query_count_is_flat(self, receiver, django_user_model):
         self._seed_shares(4, receiver, django_user_model)
         client = authed(receiver)
         # One warm-up so schema/prepared-statement setup is not counted.
         client.get("/share/")
-        with django_assert_num_queries(3):
+        with assert_view_queries(3):
             response = client.get("/share/")
         assert response.status_code == 200
         assert len(response.json()["results"]) == 4
 
-    def test_inbox_query_count_is_flat(self, receiver, django_user_model,
-                                       django_assert_num_queries):
+    def test_inbox_query_count_is_flat(self, receiver, django_user_model):
         self._seed_shares(4, receiver, django_user_model)
         client = authed(receiver)
         client.get("/share/inbox/")
-        with django_assert_num_queries(2):
+        with assert_view_queries(2):
             response = client.get("/share/inbox/")
         assert response.status_code == 200
         assert len(response.json()) == 4
 
-    def test_the_list_is_deterministically_ordered(self, receiver, django_user_model,
-                                                   django_assert_num_queries):
+    def test_the_list_is_deterministically_ordered(self, receiver,
+                                                   django_user_model):
         """ShareEvent has no Meta.ordering and DRF paginates this queryset, so
         an unordered page can repeat or skip rows. Assert the order exists and
         that no UnorderedObjectListWarning is raised."""

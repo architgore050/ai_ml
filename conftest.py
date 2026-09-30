@@ -144,6 +144,8 @@ _dju.config = _patched_config
 # wrapper's settings_dict. We patch it directly so the wrapper's
 # get_connection_params() returns the TEST_DB_* values.
 from django.db import connection as _default_connection
+from contextlib import contextmanager
+from django.test.utils import CaptureQueriesContext
 _orig_settings_dict = _default_connection.settings_dict
 _default_connection.settings_dict = {
     **_orig_settings_dict,
@@ -334,6 +336,59 @@ def pytest_sessionfinish(session, exitstatus):
     yield
     if not os.environ.get('ECHOFLOW_KEEP_TEST_DB'):
         _drop_test_database()
+
+
+# ---------------------------------------------------------------------------
+# Query-count assertion that excludes per-request middleware overhead
+# ---------------------------------------------------------------------------
+
+#: The audit table written by ``CorrelationIdMiddleware``'s ``finally`` block.
+AUDIT_LOG_TABLE = "app_auditlog"
+
+
+@contextmanager
+def assert_view_queries(num, connection=None):
+    """``assertNumQueries(num)``, minus the audit-log INSERT.
+
+    Why this exists
+    ---------------
+    ``CorrelationIdMiddleware`` writes one ``AuditLog`` row per request. It
+    passed ``user=<int>`` into a ``ForeignKey``, so the INSERT raised
+    ``ValueError`` on every authenticated request, the bare ``except``
+    swallowed it, and **no audit row was ever written** -- the audit table
+    recorded anonymous traffic and nothing else.
+
+    Fixing that (commit ``c12f16b``) made the write real. It now reaches
+    Postgres on every request, which added exactly one INSERT to every
+    ``assertNumQueries`` budget in the suite and broke 20 assertions.
+
+    Those 20 are measuring the **view**, not the middleware. In
+    ``test_tags_initialize_bounds.py`` the assertion is literally
+    ``assertNumQueries(0)``: the structural proof that a rejected payload
+    never reaches the ORM at all. Raising the budget to ``1`` would destroy
+    precisely the property it exists to pin -- and would re-break on the next
+    middleware change, because the coupling would still be there.
+
+    So the expected numbers stay exactly what they were: count the queries,
+    then subtract the audit write. The intent of every assertion is
+    preserved, and none of them is coupled to the middleware stack.
+
+    A budget is *not* a substitute for reading the failure message: the
+    message below lists the queries that were counted, excluding the audit
+    INSERT, so a regression names its own SQL.
+    """
+    conn = connection if connection is not None else _default_connection
+    with CaptureQueriesContext(conn) as ctx:
+        yield
+    captured = ctx.captured_queries
+    audit = [q for q in captured if AUDIT_LOG_TABLE in q["sql"]]
+    counted = [q for q in captured if AUDIT_LOG_TABLE not in q["sql"]]
+    detail = "\n".join(f"  {q['sql'][:200]}" for q in counted) or "  (none)"
+    assert len(counted) == num, (
+        f"Expected {num} view quer{'y' if num == 1 else 'ies'}, got "
+        f"{len(counted)} "
+        f"({len(audit)} middleware audit INSERT(s) excluded).\n{detail}"
+    )
 
 
 # ---------------------------------------------------------------------------

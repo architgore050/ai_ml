@@ -315,6 +315,31 @@ export const ownProfileSchema = z.object({
 export type OwnProfile = z.infer<typeof ownProfileSchema>;
 
 /* ------------------------------------------------------------------ */
+/* GET /profile/{id}/ — another user's public profile                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The profile shown for another account. Keep this separate from
+ * `ownProfileSchema`: the own-profile response may include private fields
+ * (email and liked clips), while this response must never make a caller expect
+ * them. `is_following` is nullable/optional for the same compatibility reason
+ * as it is on `FeedClip`: absence means the server did not provide a safe
+ * initial value, so the follow control stays inert.
+ */
+export const publicProfileSchema = z.object({
+  id: z.number().int().positive(),
+  username: z.string(),
+  profile_picture: z.string().nullable().optional(),
+  profile_picture_url: z.string().nullable().optional(),
+  followers_count: z.number(),
+  following_count: z.number(),
+  uploads_count: z.number(),
+  is_following: z.boolean().nullish(),
+  date_joined: z.string().optional(),
+});
+export type PublicProfile = z.infer<typeof publicProfileSchema>;
+
+/* ------------------------------------------------------------------ */
 /* Comments — cursor envelope                                          */
 /* ------------------------------------------------------------------ */
 

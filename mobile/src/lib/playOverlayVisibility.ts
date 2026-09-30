@@ -217,7 +217,7 @@ export type PlayOverlayEffect = {
 /**
  * The visibility rule, in one place.
  *
- *     visible = paused-latch OR open-window      (and neither when blocked)
+ *     visible = initial/paused state OR open-window      (and neither when blocked)
  *
  * ## The decision, stated rather than implied
  *
@@ -230,7 +230,9 @@ export type PlayOverlayEffect = {
  * art. Transient while playing, persistent while paused, and the rule is in the
  * API (`visible`) rather than in a comment beside a boolean.
  *
- * **A paused reel keeps the triangle.** Once the user has paused it, the reel
+ * **An idle or paused reel keeps the triangle.** A listener must be able to
+ * see the first action before discovering the full-card gesture. Once the user
+ * has paused it, the reel likewise
  * has to say how to resume; the card's own copy ("Now playing"/creator name) is
  * not an affordance and the transport controls are not in the centre. That is
  * the same argument the source's own `showPlayIcon` makes for the 600 ms case,
@@ -265,6 +267,15 @@ export function playOverlayVisibility(input: {
   // outlive the pause. See `pausedLatched`.
   if (input.state.pausedLatched && input.playback === 'paused') {
     return { visible: true, icon, autoHideAt: input.state.hideAt };
+  }
+
+  // A fresh reel is normally `idle` while its token/source settles. The former
+  // implementation left the full-card target accessible but drew no visible
+  // affordance until a user tapped an empty-looking reel. Keep the triangle
+  // visible for every non-playing, non-ended playable state; the terminal
+  // guard above still wins, and playing clips retain the transient bars.
+  if (input.playback !== 'playing' && input.playback !== 'ended') {
+    return { visible: true, icon, autoHideAt: null };
   }
 
   const open = input.state.hideAt !== null && input.now < input.state.hideAt;

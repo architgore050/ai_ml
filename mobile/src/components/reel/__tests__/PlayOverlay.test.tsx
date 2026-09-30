@@ -264,9 +264,10 @@ describe('PlayOverlay', () => {
 
       expect(target.props.accessibilityRole).toBe('button');
       expect(target.props.accessible).toBe(true);
-      // `visible` gates the CIRCLE, never this target: a reel that decided not
-      // to draw a circle must still be playable.
-      expect(queryNode(r, 'play-overlay-circle')).toBeNull();
+      // An idle reel presents a visible affordance as well as retaining the
+      // full-card target for its gesture contract.
+      expect(queryNode(r, 'play-overlay-circle')).not.toBeNull();
+      expect(queryNode(r, 'play-overlay-triangle')).not.toBeNull();
     });
 
     it('sits above the card, below the action cluster, and fills the reel', async () => {

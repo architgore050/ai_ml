@@ -278,9 +278,10 @@ describe('playOverlayVisibility', () => {
   });
 
   describe('clip scoping', () => {
-    it('discards a pending window when the clip changes, so the NEW clip starts hidden', () => {
+    it('discards a pending window when the clip changes, while a paused new clip keeps its own affordance', () => {
       // A tap on the previous reel must not leave its 600 ms window to hide the
-      // next reel's overlay, and must not leave its latch to SHOW one either.
+      // next reel's overlay. The next clip has fresh state; paused playback
+      // itself now deliberately shows the resume triangle.
       const armed = tapped(initialPlayOverlay(CLIP), T0, 'paused');
       expect(armed.pausedLatched).toBe(true);
 
@@ -294,7 +295,7 @@ describe('playOverlayVisibility', () => {
           cardStatus: SETTLED,
           playback: 'paused',
         }).visible,
-      ).toBe(false);
+      ).toBe(true);
     });
 
     it('drops an armed 600 ms window on a clip change too, not only a latch', () => {

@@ -12,6 +12,8 @@ import type { ExpoConfig, ConfigContext } from 'expo/config';
 // default with a device-shaped blast radius. `assertHttps` fails the build
 // rather than shipping a plaintext app.
 const DEFAULT_API_BASE_URL = 'https://localhost:18443';
+const APP_VERSION = '1.0.0';
+type ReleaseChannel = 'development' | 'preview' | 'production';
 
 // HACK: ConfigContext.env is typed NodeJS.ProcessEnv, which reads as always
 // present, but @expo/config evaluates app.config.ts with `env` undefined in
@@ -24,9 +26,21 @@ function readEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
   return env ?? process.env ?? {};
 }
 
-function resolveApiBaseUrl(env: NodeJS.ProcessEnv): string {
+function resolveReleaseChannel(env: NodeJS.ProcessEnv): ReleaseChannel {
+  const value = env.EXPO_PUBLIC_RELEASE_CHANNEL?.trim() || 'development';
+  if (value === 'development' || value === 'preview' || value === 'production') return value;
+  throw new Error(`EXPO_PUBLIC_RELEASE_CHANNEL must be development, preview, or production; got "${value}".`);
+}
+
+function resolveApiBaseUrl(env: NodeJS.ProcessEnv, channel: ReleaseChannel): string {
   const raw = env.EXPO_PUBLIC_API_BASE_URL?.trim();
-  if (!raw) return DEFAULT_API_BASE_URL;
+  // A localhost default is useful only for an interactive local-development
+  // command. Preview and production must name an explicit origin: silently
+  // baking localhost into either artifact would ship a dead app.
+  if (!raw) {
+    if (channel === 'development') return DEFAULT_API_BASE_URL;
+    throw new Error(`EXPO_PUBLIC_API_BASE_URL is required for the ${channel} build profile.`);
+  }
 
   // Fail loudly. A silent fallback here is how the old app got `http://` baked
   // in: the URL was wrong and nothing complained until a request failed.
@@ -62,12 +76,17 @@ export default (_context: ConfigContext): ExpoConfig => {
   // `expo install`, `expo prebuild` and EAS, and they do not all populate
   // process.env identically.
   const env = readEnv(process.env);
-  const apiBaseUrl = resolveApiBaseUrl(env);
+  const releaseChannel = resolveReleaseChannel(env);
+  const apiBaseUrl = resolveApiBaseUrl(env, releaseChannel);
+  const runtimeVersion = env.EXPO_PUBLIC_RUNTIME_VERSION?.trim()
+    || (releaseChannel === 'production' ? APP_VERSION : `${APP_VERSION}-${releaseChannel}`);
+  if (!runtimeVersion) throw new Error('EXPO_PUBLIC_RUNTIME_VERSION must not be empty.');
 
   return {
     name: 'EchoFlow',
     slug: 'echoflow-mobile',
-    version: '1.0.0',
+    version: APP_VERSION,
+    runtimeVersion,
     orientation: 'portrait',
     scheme: 'echoflow',
     // D3: expo-router owns the entry point, so `main` moves off index.ts.
@@ -138,6 +157,7 @@ export default (_context: ConfigContext): ExpoConfig => {
     },
     extra: {
       apiBaseUrl,
+      releaseChannel,
       // brand tokens surfaced to app.config consumers; runtime code reads
       // src/design/tokens.ts, not this, so there is one source of truth.
       brand: { midnight: MIDNIGHT, terracotta: TERRACOTTA },

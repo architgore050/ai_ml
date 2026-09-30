@@ -617,21 +617,24 @@ class TestComposeNoHardcodedDebug:
             f'block: {entries}'
         )
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason=(
-            'docker-compose.test.yml pins DJANGO_DEBUG=True and that is '
-            'LOAD-BEARING, not an accident: the suite drives the app through '
-            'Django\'s test client on http://testserver/ with no '
-            'X-Forwarded-Proto, so SECURE_SSL_REDIRECT=True would 301 every '
-            'request in the suite. conftest.py:21 also does '
-            'os.environ.setdefault("DJANGO_DEBUG", "True"), which cannot '
-            'override a container that already sets it to False. The fix is a '
-            'settings/conftest carve-out for tests (owned elsewhere), not a '
-            'compose flip. Tracked here so it is not forgotten.'
-        ),
-    )
-    def test_test_compose_debug_true_is_a_known_exception(self):
+    def test_the_test_stack_also_interpolates_debug(self):
+        """`docker-compose.test.yml` used to be the one holdout, pinned to
+        `DJANGO_DEBUG=True`.
+
+        It was load-bearing at the time, and for a real reason: the suite drives
+        the app through Django's test client on `http://testserver/` with no
+        `X-Forwarded-Proto`, so `SECURE_SSL_REDIRECT=True` 301s every request.
+        Two things made the pin unnecessary. `settings.py` now gates the
+        production transport block on `EchoFlow.secrets.testing_enabled()`, not
+        on `DEBUG`, and that check recognises pytest itself — which is imported
+        strictly before pytest-django calls `django.setup()`, unlike the
+        rootdir `conftest.py` whose `os.environ` writes land too late. And
+        `conftest.py` no longer fakes `DJANGO_DEBUG` to get the effect, so the
+        suite reports the container's real value instead of a convenient lie.
+
+        The old xfail is now a plain assertion: the exception is gone, and this
+        fails if the literal comes back.
+        """
         path = REPO_ROOT / 'docker-compose.test.yml'
         offenders = [
             f'docker-compose.test.yml:{lineno} {value!r}'
@@ -639,11 +642,13 @@ class TestComposeNoHardcodedDebug:
             if key == 'DJANGO_DEBUG' and value.lower() in TRUTHY_DEBUG
         ]
         assert not offenders, (
-            'docker-compose.test.yml now sets DJANGO_DEBUG=${DJANGO_DEBUG:-False} '
-            '(or no longer declares it). This xfail was tracking that: a test '
-            'settings/conftest carve-out landed, so the compose literal can go. '
-            'Verify the suite still passes over plain http://testserver/ '
-            'before removing it.\n  ' + '\n  '.join(offenders)
+            'docker-compose.test.yml must interpolate DJANGO_DEBUG, like every '
+            'other compose file. A literal `True` here means the documented '
+            'test stack runs with DEBUG=True regardless of .env, which is the '
+            'exact unoverridable-literal problem this whole check exists to '
+            'catch — and the suite no longer needs it, because settings.py '
+            'gates the transport block on testing_enabled().\n  '
+            + '\n  '.join(offenders)
         )
 
 

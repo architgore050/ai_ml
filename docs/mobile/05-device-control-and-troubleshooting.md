@@ -178,3 +178,196 @@ Before a preview build, repeat this pass against staging with a non-local
 HTTPS hostname and a deployed HLS Worker. A development client plus `adb
 reverse` is intentionally a local verification path, not a distribution
 configuration.
+
+## The complete request path
+
+There are two independent paths involved in listening. Keeping them separate
+is useful when diagnosing a failure:
+
+```text
+Android JavaScript bundle
+        │
+        ├── Metro :8081 (development code only)
+        │
+        └── HTTPS API :18443
+              │ nginx :443 inside the local compose network
+              └── Django :8000
+
+Playback token: mobile ──POST /media/playback-token/<clip>/──> Django
+Audio bytes:   native player ──HLS URL + media-token header──> nginx :19443
+                                                       └──> Worker :8787
+                                                            └──> MinIO :19000
+```
+
+The API response and the HLS response are therefore different checks. A
+successful `/feed/` request proves that authentication and Django are working;
+it says nothing about whether the media Worker is listening. A successful token
+mint proves that Django issued a credential; it does not prove that the HLS
+object exists. The useful sequence is:
+
+1. Confirm Metro is serving the current bundle.
+2. Confirm the app can call `/profile/me/` and `/feed/` through nginx.
+3. Confirm `POST /media/playback-token/<id>/` returns a native token.
+4. Confirm the manifest returns `200` with that token.
+5. Confirm the variant playlist and at least one segment return `200` or
+   `206`.
+6. Confirm the native player status changes from idle/loading to playing.
+
+Stopping at step 2 is how a healthy API can be mistaken for a broken audio
+stack.
+
+## What the mobile playback code does
+
+The feed owns one application-wide native player through `PlayerHost` and the
+Zustand player store. A reel is not allowed to create its own player. This is
+important because a card is recycled by `FlatList`; a player owned by a card
+would be destroyed during a swipe and audio would stop or continue against the
+wrong title.
+
+When a reel becomes active, `usePlaybackToken` obtains a short-lived token. The
+feed passes the clip URL and token to `loadClip` in `src/store/player.ts`.
+`loadClip` uses the server-provided `hls_playlist_url` verbatim and supplies
+`X-EchoFlow-Media-Token` as a per-source header. It does not rebuild the URL
+from the API base URL and it does not depend on a browser cookie. Android's
+native media stack cannot be assumed to share the JavaScript cookie jar.
+
+Discover follows the same player contract. Its play button sets a one-item
+queue for lock-screen metadata, mints a token, and invokes `loadClip`. Pressing
+the same button while playing calls `pause`; pressing it while paused calls
+`resume`. A pending token request disables only that card and exposes a busy
+accessibility state.
+
+The HLS Worker validates both the token signature and the requested clip path
+before asking MinIO for `hls/<clip-id>/...`. A valid token for clip A cannot be
+replayed against clip B. CORS is an additional browser policy; it is not an
+authorization mechanism and it is not a substitute for the media token.
+
+## Why the feed spinner happened
+
+The feed screen previously withheld its `FlatList` until an `onLayout` callback
+reported a non-zero height. That was intended to prevent zero-height
+`FlatList` cells, because `pagingEnabled` needs a real page size. On the test
+phone, Android rendered the tab scene but did not deliver that first layout
+callback. The request completed successfully, but the list was never mounted,
+so the only visible state remained `Loading feed`.
+
+The fix keeps exact layout measurements when available, but initializes the
+viewport to `window height - layout.navClearance`. The fallback is only a
+bootstrap value; a later `onLayout` replaces it. This handles the device that
+exhibited the problem while preserving the measured-height contract for
+orientation and inset changes.
+
+The trace also showed several `/feed/` requests. That is expected when the
+buffer sees a low queue-health value, but `/feed/` is destructive: every
+successful page consumes Redis queue entries. During diagnosis, use the
+non-destructive Discover suggestions endpoint for repeated checks and avoid
+refreshing one disposable account in a tight loop.
+
+## Investigation method used for the phone issue
+
+The diagnosis was made from independent evidence rather than from the spinner
+text alone:
+
+- The API was queried with a valid disposable account. `/feed/` returned
+  ready clips and `/suggestions/?category=all` returned a populated fallback.
+- nginx access logs showed the phone's `okhttp` requests and successful `200`
+  responses, ruling out an interests-only cold-start explanation.
+- The accessibility tree continued to expose `Loading feed` after those
+  responses, which narrowed the problem to rendering/layout state.
+- A temporary diagnostic log in `useFeedBuffer` confirmed the request entered,
+  resolved, and exited. Those logs were removed before committing.
+- The screen was then changed to use the height fallback and its render tests
+  were updated to assert content before the first layout callback.
+
+This sequence is worth repeating for future device bugs: establish server
+truth, establish client request truth, inspect rendered accessibility state,
+then change one boundary at a time.
+
+## Gotchas and non-obvious constraints
+
+### Compose and hostnames
+
+The local stack is not interchangeable with the default compose project. Always
+pass both `-f docker-compose.local.yml` and `--env-file .env.local`. Omitting
+the env file can point at a different database password; combining compose
+files can create a different project and orphan the services that were being
+tested.
+
+The HLS Worker is a host process. It cannot resolve Docker-only names such as
+`minio-local`; the run script therefore uses the host-published MinIO port
+`127.0.0.1:19000`. Conversely, nginx is in Docker and reaches the Worker using
+`host.docker.internal:8787`, which is why the Worker binds `0.0.0.0` rather than
+only `127.0.0.1`.
+
+### HTTPS and certificates
+
+The mobile API URL must be HTTPS because nginx is the supported public entry
+point. The local certificate is self-signed, so the Android development build
+contains the debug network-security configuration needed to trust the local CA.
+That trust is a development convenience. A preview build must use a publicly
+trusted staging certificate and must never ship the local CA trust rule as a
+production workaround.
+
+### Metro and ADB reverse
+
+`adb reverse tcp:8081 tcp:8081` maps the device's loopback port to the host's
+Metro port. It is not a general network bridge: it does not make API port
+`18443` or HLS port `19443` available. Those services are reached through the
+API URL already baked into the Expo configuration.
+
+The reverse rule disappears when the device or ADB daemon is reset. A stale
+development-client URL can also refer to a LAN address even though Metro is
+bound to loopback. `ECONNREFUSED` naming the host LAN address is therefore a
+transport setup problem, not a JavaScript bundle problem.
+
+### Test Store RevenueCat
+
+The development build uses the RevenueCat Test Store key through an environment
+variable. It is deliberately not hardcoded in committed source. A successful
+Test Store purchase updates native CustomerInfo immediately, but the local
+backend subscription display may remain on Free until its server sync path is
+configured. Do not interpret that UI mismatch as a failed native purchase, and
+do not put a production Google Play service-account credential into this local
+workflow.
+
+### Logs and secrets
+
+nginx logs contain paths and status codes, while token bodies and authorization
+headers must never be copied into documentation or pasted into issue reports.
+When collecting evidence, record the clip UUID only if it is needed to
+reproduce the issue, redact access tokens, and prefer status/latency lines over
+full request dumps. `.env.local`, `.dev.vars`, and `mobile/.env.local` remain
+ignored local files.
+
+## Ownership and hand-off boundaries
+
+Mobile owns the feed layout, player store, token request integration, Discover
+controls, accessibility labels, and the Expo/ADB workflow. The backend owner
+owns Django token issuance, feed queue semantics, serializers, and database
+state. The storage/edge owner owns the Worker, nginx media listener, MinIO/R2
+object layout, and production CORS configuration.
+
+When reporting an issue across that boundary, include the smallest evidence
+that identifies the owner:
+
+- `401` on `/feed/`: auth/token lifecycle or backend auth configuration;
+- `200` on `/feed/` but spinner: mobile rendering/layout;
+- `409` from playback-token: media processing state/backend contract;
+- `403` from HLS with a newly minted token: token secret, path scope, or header
+  transport;
+- `502` from HLS: Worker process, nginx upstream, or MinIO reachability;
+- `200` manifest but no segments: playlist object paths, Range handling, or
+  native player request headers.
+
+## Open work after this pass
+
+The next device session should verify the new feed-height fallback on a clean
+restart, then press the central play button and capture the native playback
+status. Discover should be checked at the device's actual font/display scale,
+including a long title and a loading state.
+
+After local verification, the release path still needs a staging HTTPS backend,
+a deployed HLS Worker, a preview EAS build, and Maestro coverage for
+authenticate/play, like/comment/share, and create/upload/publish. The local
+development client proves integration mechanics; it is not evidence that an
+Android internal-distribution artifact is ready.

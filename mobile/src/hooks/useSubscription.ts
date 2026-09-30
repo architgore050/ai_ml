@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import RevenueCatUI from 'react-native-purchases-ui';
+import Purchases, { type PurchasesPackage } from 'react-native-purchases';
 
 import {
   getSubscription,
@@ -11,11 +11,11 @@ import {
   getRevenueCatCustomerInfo,
   identifyRevenueCat,
   logoutRevenueCat,
-  revenueCatEntitlementId,
 } from '../lib/revenuecat';
 import { useAuthStore } from '../store/auth';
 
 export type SubscriptionState = {
+  plans: SubscriptionPlan[];
   status: SubscriptionStatus | null;
   isPro: boolean;
   loading: boolean;
@@ -24,8 +24,11 @@ export type SubscriptionState = {
   refresh: () => Promise<void>;
   sync: () => Promise<void>;
   presentPaywall: () => Promise<void>;
+  purchasePlan: (productId: string) => Promise<void>;
   openCustomerPortal: () => Promise<string>;
 };
+
+export type SubscriptionPlan = { productId: string; title: string; price: string };
 
 /**
  * Coordinates the API-owned entitlement with RevenueCat's native customer
@@ -35,10 +38,23 @@ export type SubscriptionState = {
 export function useSubscription(): SubscriptionState {
   const authStatus = useAuthStore((state) => state.status);
   const [status, setStatus] = useState<SubscriptionStatus | null>(null);
+  const [plans, setPlans] = useState<SubscriptionPlan[]>([]);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const generation = useRef(0);
+  const packages = useRef(new Map<string, PurchasesPackage>());
+
+  const loadPlans = useCallback(async () => {
+    const offering = (await Purchases.getOfferings()).current;
+    if (!offering?.availablePackages.length) throw new Error('No subscription plans are available.');
+    packages.current = new Map(offering.availablePackages.map((item) => [item.product.identifier, item]));
+    setPlans(offering.availablePackages.map((item) => ({
+      productId: item.product.identifier,
+      title: item.product.title,
+      price: item.product.priceString,
+    })));
+  }, []);
 
   const refresh = useCallback(async () => {
     const generationAtStart = generation.current;
@@ -54,6 +70,7 @@ export function useSubscription(): SubscriptionState {
       try {
         await identifyRevenueCat(next.app_user_id);
         await getRevenueCatCustomerInfo();
+        await loadPlans();
       } catch (sdkCause) {
         if (generation.current === generationAtStart) {
           setError(sdkCause instanceof Error ? sdkCause.message : 'RevenueCat is unavailable.');
@@ -66,13 +83,15 @@ export function useSubscription(): SubscriptionState {
     } finally {
       if (generation.current === generationAtStart) setRefreshing(false);
     }
-  }, []);
+  }, [loadPlans]);
 
   useEffect(() => {
     generation.current += 1;
     const currentGeneration = generation.current;
     if (authStatus !== 'authenticated') {
       setStatus(null);
+      setPlans([]);
+      packages.current.clear();
       setError(null);
       setLoading(false);
       void logoutRevenueCat().catch(() => undefined);
@@ -90,9 +109,13 @@ export function useSubscription(): SubscriptionState {
   }, [refresh]);
 
   const presentPaywall = useCallback(async () => {
-    await RevenueCatUI.presentPaywallIfNeeded({
-      requiredEntitlementIdentifier: revenueCatEntitlementId(),
-    });
+    await loadPlans();
+  }, [loadPlans]);
+
+  const purchasePlan = useCallback(async (productId: string) => {
+    const selected = packages.current.get(productId);
+    if (!selected) throw new Error('That plan is no longer available. Refresh plans and try again.');
+    await Purchases.purchasePackage(selected);
     await sync();
   }, [sync]);
 
@@ -102,6 +125,7 @@ export function useSubscription(): SubscriptionState {
   }, []);
 
   return {
+    plans,
     status,
     isPro: status?.is_pro ?? false,
     loading,
@@ -110,6 +134,7 @@ export function useSubscription(): SubscriptionState {
     refresh,
     sync,
     presentPaywall,
+    purchasePlan,
     openCustomerPortal,
   };
 }

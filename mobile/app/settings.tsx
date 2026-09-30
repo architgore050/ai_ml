@@ -17,12 +17,23 @@ export default function SettingsScreen() {
   const [description, setDescription] = useState('');
   const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
   const [busy, setBusy] = useState(false);
+  const [purchasingProductId, setPurchasingProductId] = useState<string | null>(null);
 
   useEffect(() => { void getLegalCompliance().then((value) => setContacts(value as Record<string, unknown>)).catch(() => undefined); }, []);
 
   const openPortal = async () => {
     try { await WebBrowser.openBrowserAsync(await subscription.openCustomerPortal()); }
     catch (cause) { Alert.alert('Could not open billing', cause instanceof Error ? cause.message : 'Try again.'); }
+  };
+  const showPlans = async () => {
+    try { await subscription.presentPaywall(); }
+    catch (cause) { Alert.alert('Could not open plans', cause instanceof Error ? cause.message : 'Try again.'); }
+  };
+  const purchasePlan = async (productId: string) => {
+    setPurchasingProductId(productId);
+    try { await subscription.purchasePlan(productId); }
+    catch (cause) { Alert.alert('Purchase could not be completed', cause instanceof Error ? cause.message : 'Try again.'); }
+    finally { setPurchasingProductId(null); }
   };
   const sendGrievance = async () => {
     if (!subject.trim() || !description.trim()) return;
@@ -45,6 +56,10 @@ export default function SettingsScreen() {
     <Text style={styles.title}>Settings</Text>
     <Section title="Subscription">
       <Text style={styles.body}>{subscription.isPro ? 'Pro is active.' : 'Free plan'}</Text>
+      {!subscription.isPro ? <Button label="View plans" onPress={() => void showPlans()} /> : null}
+      {!subscription.isPro ? subscription.plans.map((plan) => (
+        <Button key={plan.productId} label={`${plan.title} — ${plan.price}`} onPress={() => void purchasePlan(plan.productId)} loading={purchasingProductId === plan.productId} disabled={purchasingProductId !== null} variant="ghost" />
+      )) : null}
       <Button label="Manage subscription" onPress={() => void openPortal()} variant="ghost" />
       <Button label="Refresh subscription" onPress={() => void subscription.sync()} variant="ghost" loading={subscription.refreshing} />
       {subscription.error ? <Text accessibilityLiveRegion="polite" style={styles.error}>{subscription.error}</Text> : null}

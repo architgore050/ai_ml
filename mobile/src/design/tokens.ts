@@ -22,6 +22,19 @@
  *   tailwind.config.js:31-44  radii + spacing
  *   tailwind.config.js:45-49  glow box-shadows
  *
+ * The gradient group is the one exception to "everything above is a CSS
+ * variable line": no `linear-gradient()` in the design source lives in
+ * globals.css — all four are inline `style` objects in the components, so they
+ * are recorded by component file instead:
+ *
+ *   molecules.tsx:24    Btn `fill` — 135deg, --terracotta -> --accent-hover
+ *   ReelCard.tsx:103    reel backdrop — 135deg, ${c}10 0% / ${c}22 50% / #121416
+ *   ReelCard.tsx:180    waveform bars — `to top`, ${c} -> var(--sage)
+ *   WaveformBar.tsx:36  progress fill — 90deg, ${c} -> var(--terracotta)
+ *
+ * where `${c}` is `getCatColor(clip.category)`, the same per-clip category
+ * colour that `categories.ts::categoryColor` exposes here.
+ *
  * TWO RESOLVED CONFLICTS — do not "fix" either of these back:
  *
  *  1. `surface.bright` is #38393c, from globals.css:11. tailwind.config.js:15
@@ -38,6 +51,11 @@
  */
 
 /* eslint-disable no-restricted-syntax */
+
+// Type-only, so it is erased at compile time and the token table stays a plain
+// data module with no runtime dependency on the view layer. See
+// LinearGradientSpec below for what the library actually accepts.
+import type { LinearGradientProps } from 'expo-linear-gradient';
 
 // ---------------------------------------------------------------------------
 // Colour
@@ -181,10 +199,41 @@ export const glass = {
  * so this exposes the alpha steps as data and `tint()` in tokens below does the
  * composition. Keeping the steps named is the point — the old app had 16
  * hardcoded alpha values with no scale behind them.
+ *
+ * THE KEY IS THE HEX SUFFIX, not a label. The web source writes the alpha as
+ * the literal tail of an 8-digit hex — `${c}10`, `${c}22`, `${c}44` — and
+ * `getCatColor` output is concatenated with it as a *string*
+ * (ReelCard.tsx:103), so a step here has to match those suffixes exactly.
+ * `'10'` is therefore not a spelling of `'0A'` and not a rounding of `'18'`:
+ * `0x10` and `0x0A` are different bytes and the source asks for `0x10`.
+ *
+ * Inserted 2026-09-30 (Phase F) for the reel backdrop. Ordered by hex byte, so
+ * `'10'` sits after `'0A'`, which is where the suffix scale puts it. NOTE the
+ * value ordering disagrees — see the scale note below.
+ *
+ * KNOWN SCALE ANOMALY (found 2026-09-30, deliberately NOT fixed here): the seven
+ * pre-existing steps transcribe the hex digits as a *decimal* fraction —
+ * `0x18` is written `0.18`, `0x22` is `0.22` — whereas CSS resolves an alpha
+ * byte as n/255, which would make those `0.094`, `0.133`, `0.200`, `0.267`,
+ * `0.333`. So the legacy steps render 1.65x-2.55x MORE opaque than the web
+ * source they came from, and `'10'` (0x10/256 = 0.0625) is the only step here
+ * that matches its CSS value (exact parity would be 16/255 = 0.0627; the
+ * 0.0002 difference is imperceptible). That is why `'10'` = 0.0625 sorts
+ * *below* `'0A'` = 0.1 numerically while sitting above it by key.
+ *
+ * Do not "correct" the legacy values to n/255 in a drive-by edit: they have
+ * live consumers (`components/ui/primitives.ts` renders `tint(accent.base,'18')`
+ * on-screen today) and re-grading them is a visual redesign, not a token
+ * rename. Tracked in docs/frontend_rebuild_plan.md.
+ *
+ * GOTCHA: `'10'` is an integer-like object key, so JS hoists it to the FRONT of
+ * `Object.keys(tintSteps)` (`10 18 22 08 0A 33 44 55`) even though it is
+ * written after `'0A'`. Anything iterating this table must `.sort()` it.
  */
 export const tintSteps = {
   '08': 0.08,
   '0A': 0.1,
+  '10': 0.0625,
   '18': 0.18,
   '22': 0.22,
   '33': 0.33,
@@ -202,6 +251,238 @@ export function tint(hex: `#${string}`, step: TintStep): string {
   const b = parseInt(hex.slice(5, 7), 16);
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
+
+/**
+ * `tint()` for colours that arrive from outside this module — chiefly
+ * `categoryColor()`, which returns a plain `string`. Reads the `tintSteps`
+ * table above, so it is the SAME scale; the only difference is the input.
+ *
+ * WHY IT EXISTS — `tint()` cannot be handed a category colour, on either axis:
+ *
+ *  - **Compile-time.** `tint` takes `` `#${string}` `` but `categoryColor()`
+ *    returns `string` (`categories.ts:75`). `tint(categoryColor(cat), '10')` is
+ *    TS2345 "Argument of type 'string' is not assignable to parameter of type
+ *    '`#${string}`'". Verified. The fix is a cast at every call site, which is
+ *    exactly the kind of assertion that stops meaning anything after the first
+ *    few.
+ *  - **Runtime.** `tint` assumes a 6-digit `#`-prefixed hex and does not
+ *    validate. It does not fail, it returns plausible garbage:
+ *      tint('#fff', '10')     -> 'rgba(255, 15, NaN, 0.0625)'   (NaN blue)
+ *      tint('#fff0', '10')    -> 'rgba(255, 240, NaN, 0.0625)'  (NaN blue)
+ *      tint('9d8e84', '10')   -> 'rgba(216, 232, 4, 0.0625)'    (no NaN —
+ *                               three real numbers, wrong colour; the worst
+ *                               case, because nothing marks it as bad)
+ *      tint('#e8a87cff','10') -> alpha silently dropped
+ *      tint('rgb(1,2,3)','10')-> 'rgba(NaN, NaN, NaN, 0.0625)'
+ *    All verified by execution. `tint()`'s signature is unchanged and its
+ *    existing literal callers in `components/ui/primitives.ts` are unaffected;
+ *    this is the entry point for runtime-sourced colours.
+ *
+ * Accepts 3-, 6- or 8-digit hex, with or without `#`. 8-digit input keeps its
+ * own alpha rather than pretending it was opaque. Throws on anything that is
+ * not hex at all, because the alternative — the silent `rgba(NaN,…)` above — is
+ * an invisible wrong colour, and every value that reaches this in practice
+ * comes from `categoryColor()`, which only ever returns one of six literals.
+ */
+export function tintColor(hex: string, step: TintStep): string {
+  const alpha = tintSteps[step];
+  // Expand 3/4-digit shorthand (#rgb, #rgba) so the byte pair below is real.
+  const body = hex.startsWith('#') ? hex.slice(1) : hex;
+  const full =
+    body.length === 3 || body.length === 4
+      ? [...body]
+          .slice(0, 3)
+          .map((ch) => ch + ch)
+          .join('')
+      : body;
+  if (!/^[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/.test(full)) {
+    throw new Error(
+      `tintColor: expected a 3-, 6- or 8-digit hex, received ${JSON.stringify(hex)}`,
+    );
+  }
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  const own = full.length === 8 ? parseInt(full.slice(6, 8), 16) / 255 : undefined;
+  return `rgba(${r}, ${g}, ${b}, ${own === undefined ? alpha : own})`;
+}
+
+// ---------------------------------------------------------------------------
+// Gradients
+// ---------------------------------------------------------------------------
+
+/** A point in `expo-linear-gradient`'s unit box: 0..1 of the element's w/h. */
+type Point = { x: number; y: number };
+
+/**
+ * Props for one `<LinearGradient>`, narrowed to the four this file ever sets.
+ *
+ * `Pick` of the library's OWN type, not a hand-rolled lookalike, so a spec is
+ * structurally guaranteed to be splattable into the component and a breaking
+ * change upstream surfaces here instead of at the render site.
+ *
+ * Two corrections to the brief this was designed against, both verified in
+ * node_modules/expo-linear-gradient/build/LinearGradient.d.ts — the public
+ * props are NOT the native module's props:
+ *
+ *  - the point props are **`start` / `end`**, not `startPoint` / `endPoint`.
+ *    `startPoint`/`endPoint` live on `NativeLinearGradientProps`
+ *    (NativeLinearGradient.types.d.ts:6-7), the internal spec, and are not what
+ *    a component receives.
+ *  - `colors` is `readonly [ColorValue, ColorValue, ...ColorValue[]]` — a tuple
+ *    of at least two, not `string[]` — and `locations` is the matching
+ *    `readonly [number, number, ...number[]]`, which must be **ascending** and
+ *    the same length as `colors`.
+ *
+ * `colors` and `locations` are kept as the library's own types so their arity
+ * rules keep applying. `start`/`end` are narrowed to the `{ x, y }` object
+ * form this file emits, because the library's `LinearGradientPoint` is a union
+ * (`{ x, y }` | `[x, y]`) that is also nullable — which makes a bare `Pick`
+ * splattable but unreadable, since `spec.start.x` would not compile. The
+ * narrowed form is still assignable to the prop, so `<LinearGradient
+ * {...gradients.brand} />` still typechecks.
+ */
+export type LinearGradientSpec = Pick<LinearGradientProps, 'colors' | 'locations'> & {
+  start: Point;
+  end: Point;
+};
+
+/**
+ * CSS `linear-gradient(<deg>, …)` angle -> `expo-linear-gradient` start/end.
+ *
+ * THE TWO ARE NOT THE SAME PARAMETERISATION, and this is the whole reason the
+ * helper exists. CSS measures an angle in degrees clockwise from "to top".
+ * expo-linear-gradient takes a pair of POINTS in the unit box (0..1 of the
+ * element's width and height), not an angle and not a direction vector. A 135deg
+ * gradient therefore has no literal to copy.
+ *
+ * DERIVATION. Screen y grows DOWNWARD, in CSS and in RN alike, so the gradient
+ * direction for angle t is
+ *
+ *     d = (sin t, -cos t)
+ *
+ *   t=0    -> (0, -1)  up        t=90   -> (1, 0)  right
+ *   t=180  -> (0,  1)  down      t=270  -> (-1, 0) left
+ *
+ * t=135deg:  sin 135 = 2^0.5/2 = 0.7071,  cos 135 = -2^0.5/2, so
+ *   d = (0.7071, -(-0.7071)) = (0.7071, 0.7071)  -> right and down, i.e.
+ * top-left to bottom-right, which is what ReelCard.tsx:103 and
+ * molecules.tsx:24 both draw.
+ *
+ * Only the DIRECTION of end - start is rendered; its length is irrelevant (the
+ * stops are laid along the vector and the colour list spans it), so the vector
+ * is anchored at the element centre, which keeps 135deg and its reverse
+ * 315deg trivially comparable:
+ *
+ *     start = (0.5, 0.5) - d/2      end = (0.5, 0.5) + d/2
+ *     d/2 = 0.7071 / 2 = 0.353553 = 2^0.5 / 4 = 1 / (2 * 2^0.5)
+ *     start = (0.146447, 0.146447)   end = (0.853553, 0.853553)
+ *
+ * CHECKS, all verified by execution:
+ *  - slope (end.y - start.y) / (end.x - start.x) = 1 exactly => a true 45deg
+ *    line, and the pair is symmetric about 0.5 in both axes.
+ *  - at 180deg the helper returns start (0.5, 0) and end (0.5, 1), which is
+ *    EXACTLY this library's documented defaults. That is the sign-convention
+ *    check: had y been taken as growing upward, the 0deg case would be right
+ *    and this one inverted.
+ *  - it therefore also says 0deg is `to top`, i.e. bottom to top, so the
+ *    waveform's first colour lands at the BOTTOM. That is what the source means
+ *    (ReelCard.tsx:180).
+ *  - equivalently the 135deg line is the same line as start (0,0) -> end (1,1);
+ *    the centre-anchored form is preferred only because it makes the angle
+ *    legible and survives a future box that is not square.
+ *
+ * ROUNDING: results are rounded to 6 dp. That is not cosmetic — `Math.sin(PI)`
+ * is 1.22e-16, not 0, so an unrounded 180deg returns x = 0.4999999999999999
+ * rather than 0.5, while 90deg/270deg round back to exactly 0/0.5/1 on their
+ * own. 6 dp is ~0.0004 px on a 400px card, i.e. far below anything observable,
+ * and it keeps the four cardinal angles exact.
+ */
+export function linearGradientPoints(cssDegrees: number): { start: Point; end: Point } {
+  const rad = (cssDegrees * Math.PI) / 180;
+  const dx = Math.sin(rad);
+  const dy = -Math.cos(rad);
+  const q = (n: number): number => Math.round(n * 1e6) / 1e6;
+  return {
+    start: { x: q(0.5 - dx / 2), y: q(0.5 - dy / 2) },
+    end: { x: q(0.5 + dx / 2), y: q(0.5 + dy / 2) },
+  };
+}
+
+/**
+ * The design source's four linear gradients. Take the per-clip category colour
+ * from `categories.ts::categoryColor` and pass it in; nothing here is a baked
+ * hex except the two brand stops, which are genuinely fixed.
+ *
+ * NOT in this file, on purpose: the ambient orbs. ReelCard.tsx:121-128 makes each
+ * one a plain element with a flat fill plus a CSS `filter: blur(60px)` /
+ * `blur(40px)`, which is a different mechanism on both platforms — on RN it is a
+ * solid `backgroundColor` plus `filter: [{ blur: N }]`, not a gradient at all.
+ * Encoding them as colours here would imply a gradient that does not exist.
+ *
+ * The radial dot-grid overlay (ReelCard.tsx:129-133) is likewise not a gradient
+ * token; it is a repeated image.
+ */
+export const gradients: {
+  /** Fixed: the source's stops are CSS variables, not category-derived. */
+  readonly brand: LinearGradientSpec;
+  readonly reelBackdrop: (categoryColor: string) => LinearGradientSpec;
+  readonly progressFill: (categoryColor: string) => LinearGradientSpec;
+  readonly waveformBar: (categoryColor: string) => LinearGradientSpec;
+} = {
+  /**
+   * molecules.tsx:24 — `linear-gradient(135deg, var(--terracotta),
+   * var(--accent-hover))` on `Btn`'s `fill` variant. Two stops and NO explicit
+   * locations, so `locations` is omitted rather than pinned to [0, 1] — the
+   * source expresses an even distribution by not expressing one, and the
+   * library's own default is the even spread. Paired with `color: '#000'`, which
+   * the source sets on the same element.
+   */
+  brand: {
+    colors: [brand.terracotta, brand.terracottaHover],
+    ...linearGradientPoints(135),
+  },
+
+  /**
+   * ReelCard.tsx:103 — `linear-gradient(135deg, ${c}10 0%, ${c}22 50%,
+   * #121416 100%)`, the reel's own background when `clip.cover_image` is
+   * absent. The one gradient here with explicit stop positions, hence the
+   * `locations`. `#121416` is `surface.base`/`surface.dim` verbatim.
+   *
+   * Both alpha stops go through `tintColor`, not `tint`: `${c}10`/`${c}22` are
+   * string concatenations in the source, and the argument here is the plain
+   * `string` that `categoryColor()` hands back.
+   */
+  reelBackdrop: (categoryColor: string) => ({
+    colors: [tintColor(categoryColor, '10'), tintColor(categoryColor, '22'), surface.base],
+    locations: [0, 0.5, 1],
+    ...linearGradientPoints(135),
+  }),
+
+  /**
+   * WaveformBar.tsx:36 — `linear-gradient(90deg, ${c}, var(--terracotta))` on
+   * the played portion of the seek bar. 90deg is `to right`, so the category
+   * colour leads on the left and the accent trails on the right; the reverse
+   * would put the playhead colour on the wrong side of the wipe.
+   */
+  progressFill: (categoryColor: string) => ({
+    colors: [categoryColor, brand.terracotta],
+    ...linearGradientPoints(90),
+  }),
+
+  /**
+   * ReelCard.tsx:180 — `linear-gradient(to top, ${c}, var(--sage))` on each of
+   * the 40 decorative background bars. `to top` IS `0deg`, so the first colour
+   * is at the BOTTOM of each bar and sage sits at the top. The trap here is not
+   * the 135deg diagonal one — it is 0 against 180: swapping them puts sage at
+   * the bottom of every bar, and that still renders as a plausible gradient, so
+   * nothing but the numbers catches it.
+   */
+  waveformBar: (categoryColor: string) => ({
+    colors: [categoryColor, brand.sage],
+    ...linearGradientPoints(0),
+  }),
+};
 
 // ---------------------------------------------------------------------------
 // Radius — globals.css:81-85, tailwind.config.js:31-37

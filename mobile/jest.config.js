@@ -8,6 +8,22 @@ module.exports = {
   transformIgnorePatterns: [
     'node_modules/(?!(?:.pnpm/)?((jest-)?react-native|@react-native(-community)?|expo(nent)?|@expo(nent)?/.*|@expo-google-fonts/.*|react-navigation|@react-navigation/.*|@sentry/react-native|native-base|react-native-svg|react-native-reanimated|react-native-worklets|@gorhom/.*))',
   ],
+  // reanimated 4 depends on worklets 0.10, and BOTH crash at IMPORT time under
+  // jest, before a single line of test code runs:
+  //   TypeError: Cannot read properties of undefined (reading 'loadUnpackers')
+  //     at loadUnpackers (react-native-worklets/src/WorkletsModule/NativeWorklets.native.ts:411)
+  //     at Object.require (react-native-reanimated/src/index.ts:5)
+  // `NativeWorklets.native.ts:35-40` calls `installUnpackers(globalThis.__workletsModuleProxy)`
+  // on the assumption the WorkletsModule TurboModule exists. Under jest it does not,
+  // so the proxy is undefined and the first property access throws. jest-expo mocks
+  // the LEGACY `ReanimatedModule` TurboModule but not the worklets one reanimated 4
+  // actually needs -- a version-skew gap that no amount of `jest.mock` can close,
+  // because the crash is in a node_modules import, not in anything we control.
+  // The worklets-shipped resolver fixes it at the resolution layer: for any request
+  // under (or naming) `react-native-worklets` it drops `.native` from `extensions`, so
+  // `NativeWorkletsModule` resolves to the non-native spec and the TurboModule lookup
+  // never happens. This must be a top-level `resolver`, not part of moduleNameMapper.
+  resolver: 'react-native-worklets/jest/resolver',
   moduleNameMapper: {
     '^@/(.*)$': '<rootDir>/src/$1',
   },

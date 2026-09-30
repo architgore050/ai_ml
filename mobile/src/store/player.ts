@@ -69,17 +69,74 @@ export function getPlayerOrNull(): AudioPlayer | null {
  * Release the native player and clear the store's claim that something is
  * playing. Call from the root component's effect cleanup.
  *
- * Clearing the store is not optional. The effect body creates nothing, so its
- * cleanup can fire at any time relative to the component that actually uses the
- * player — and reachable today on any Fast Refresh of `_layout.tsx`. Without
- * the reset the store keeps `status: 'playing'` and `playingClipId` for a
- * player that no longer exists, and since no dependency changes, **no load is
- * ever re-triggered**: playback is dead behind a "Now playing" card.
+ * ## `release()`, NOT `remove()` — do not "simplify" this back
+ * `AudioPlayer` extends `SharedObject<AudioEvents>`
+ * (`expo-audio/build/AudioModule.types.d.ts:24`), and the two methods look
+ * interchangeable from JS. They are not:
+ *
+ *  - `remove()` is a **one-line dictionary delete**, not a teardown. iOS:
+ *    `ios/AudioModule.swift:251-253` → `self.registry.remove(player)` →
+ *    `players.removeValue(forKey:)`; Android: `AudioModule.kt:544-546` →
+ *    `players.remove(player.id)`. Neither path calls `teardownPlayer()`, so the
+ *    periodic time observer is never unregistered, the `AVPlayer`/ExoPlayer is
+ *    never released, and the lock screen is never cleared.
+ *  - `release()` (declared on the `SharedObject` base,
+ *    `expo-modules-core/src/ts-declarations/SharedObject.ts:22`) is the real
+ *    teardown. iOS `sharedObjectWillRelease()`
+ *    (`ios/AudioPlayer.swift:506-518`) does all of the above; Android
+ *    `sharedObjectDidRelease()` → `releasePlayer()` (`AudioPlayer.kt:274-286`)
+ *    releases the ExoPlayer, the MediaSession and the visualizer.
+ *
+ * The failure mode of using `remove()` is silent and expensive: the store
+ * nulls `instance` and resets to `playback: 'idle'`, while the native player
+ * **keeps playing and keeps pushing status events** into a store that claims
+ * nothing is playing. The next `getPlayer()` then constructs a SECOND native
+ * player, and two are now alive.
+ *
+ * ## Ordering, because `release()` is TERMINAL
+ * After `release()` the JS and native objects are detached, and any subsequent
+ * native call on that object throws `InvalidSharedObjectIdException`
+ * (`expo-modules-core/android/.../SharedObjectRegistry.kt:87-98` zeroes the
+ * id and `toNativeObject` throws on the lookup). So `release()` must be the
+ * last thing that touches the instance, and the `instance === null` guard
+ * matters: calling it twice would be the terminal call on a dead object.
+ *
+ * The slot is nulled BEFORE the native call so a re-entrant `getPlayer()`
+ * during `release()` cannot hand out an object that is about to be detached.
+ *
+ * The reset is in a `finally` because it is the part that must not be skipped.
+ * `release()` is a far bigger native operation than `remove()` was — Android's
+ * `releasePlayer()` releases the ExoPlayer, the MediaSession and the
+ * visualizer and unbinds the playback service (`AudioPlayer.kt:279-286`) — so
+ * it has real ways to throw where the old dictionary-delete could not. If it
+ * throws and the store reset is skipped, we are strictly worse off than the bug
+ * this function exists to prevent: the store keeps asserting `playback:
+ * 'playing'` for a player that is gone, and because no dependency changes, no
+ * load is ever re-triggered. Nothing after the `finally` touches `dying`, so
+ * this does not weaken the terminal-call rule.
+ *
+ * ## Clearing the store is not optional
+ * The effect body creates nothing, so its cleanup can fire at any time relative
+ * to the component that actually uses the player — and reachable today on any
+ * Fast Refresh of `_layout.tsx`. Without the reset the store keeps
+ * `status: 'playing'` and `playingClipId` for a player that no longer exists,
+ * and since no dependency changes, **no load is ever re-triggered**: playback
+ * is dead behind a "Now playing" card. The reset is outside the `instance ===
+ * null` guard on purpose: `releasePlayer()` is a public cleanup entry point,
+ * and "no player to release" is not a reason to leave the store asserting
+ * otherwise.
  */
 export function releasePlayer(): void {
-  instance?.remove();
+  const dying = instance;
   instance = null;
-  usePlayerStore.getState().reset();
+  try {
+    if (dying) {
+      // TERMINAL. Nothing after this line may touch `dying`.
+      dying.release();
+    }
+  } finally {
+    usePlayerStore.getState().reset();
+  }
 }
 
 export type PlaybackStatus =
@@ -116,6 +173,23 @@ export type PlaybackStatus =
  * `ended` is why the plan's pacing rule can be implemented at all
  * (`motion.pacing.completionThreshold`): natural completion must not be
  * reported as a skip.
+ *
+ * ## `ended` is LATCHED by the store, and it has to be
+ * `didJustFinish` is a **single-event pulse** on both native platforms, not a
+ * flag that stays true: `ios/AudioPlayer.swift:146` hardcodes
+ * `"didJustFinish": false` in `currentStatus()` and only the end-notification
+ * override sets it true (`ios/AudioPlayer.swift:467`); Android does the same
+ * (`AudioPlayer.kt:211` hardcodes it false, and `justFinished` in
+ * `BaseAudioPlayer.kt:99-102` is only true for the one callback that
+ * transitions *into* `STATE_ENDED`). Web is the outlier and latches
+ * incidentally, because `HTMLMediaElement.ended` is a sticky property
+ * (`src/AudioUtils.web.ts:70`).
+ *
+ * So an un-latched store would show `ended` for one 500 ms tick and then fall
+ * back to `paused` on the next one — which silently breaks both the
+ * auto-advance and the `progress >= 0.99` pacing rule, because neither would
+ * ever observe the state it keys on. `syncFromPlayer` therefore latches it in
+ * `endedForClipId`; see that field.
  */
 export type PlaybackState =
   | 'idle'
@@ -150,6 +224,16 @@ export type PlayerState = {
   duration: number;
   /** Null until a load succeeds; the id actually playing, not the requested one. */
   playingClipId: string | null;
+  /**
+   * The clip whose native `didJustFinish` pulse we have already consumed, or
+   * null. This is the `ended` LATCH — see `PlaybackState`.
+   *
+   * It holds a clip id rather than a boolean so the latch is scoped: it clears
+   * when `playingClipId` changes (a new `loadClip`) instead of needing a
+   * separate "someone pressed stop" reset path, which nothing would remember
+   * to call.
+   */
+  endedForClipId: string | null;
   error: string | null;
 
   setQueue: (clips: FeedClip[]) => void;
@@ -195,6 +279,45 @@ export function playbackStateFrom(snapshot: NativeStatusSnapshot): PlaybackState
   return 'idle';
 }
 
+/**
+ * Defend the two numbers every consumer of this store depends on.
+ *
+ * Both bad values are produced by expo-audio itself, not by a caller bug, so
+ * the coercion has to live in the store rather than in the view that happens to
+ * read the value first — otherwise each new consumer re-implements it, or
+ * forgets to.
+ *
+ *  - **Non-finite `currentTime`.** iOS guards the *property*
+ *    (`ios/AudioPlayer.swift:62-70`: `seconds.isNaN ? 0.0 : seconds`) but the
+ *    periodic time observer merges the raw observer value into the event with
+ *    no such guard (`ios/AudioPlayer.swift:482-488`,
+ *    `"currentTime": time.seconds`). A `NaN` there reaches the store. It is an
+ *    invalid React Native style value for the progress width, and it silently
+ *    poisons completion telemetry (`currentTime / duration`), which is a
+ *    recommender input.
+ *  - **Out-of-range `currentTime`.** On a `DISCONTINUITY_REASON_SEEK` Android
+ *    emits the raw, unclamped position
+ *    (`android/.../BaseAudioPlayer.kt:114-122`,
+ *    `"currentTime" to (newPosition.positionMs / 1000.0)`). Seek to
+ *    `duration + 10` and `currentTime = duration + 10` lands in the store.
+ *
+ * Rules, in order: non-finite → 0; then, when `duration > 0`, clamp
+ * `currentTime` into `[0, duration]`. When `duration` is 0 the clip is not
+ * reporting a length yet (or is a live stream), so there is no upper bound to
+ * enforce and `currentTime` passes through.
+ */
+export function coerceNativeTimes(
+  currentTime: number,
+  duration: number,
+): { currentTime: number; duration: number } {
+  const safeDuration = Number.isFinite(duration) ? duration : 0;
+  const safeCurrent = Number.isFinite(currentTime) ? currentTime : 0;
+  return {
+    currentTime: safeDuration > 0 ? Math.min(Math.max(safeCurrent, 0), safeDuration) : safeCurrent,
+    duration: safeDuration,
+  };
+}
+
 const INITIAL: Pick<
   PlayerState,
   | 'queue'
@@ -205,6 +328,7 @@ const INITIAL: Pick<
   | 'currentTime'
   | 'duration'
   | 'playingClipId'
+  | 'endedForClipId'
   | 'error'
 > = {
   queue: [],
@@ -215,6 +339,7 @@ const INITIAL: Pick<
   currentTime: 0,
   duration: 0,
   playingClipId: null,
+  endedForClipId: null,
   error: null,
 };
 
@@ -226,17 +351,67 @@ export const usePlayerStore = create<PlayerState>((set) => ({
   toggleHandsFree: () => set((s) => ({ handsFree: !s.handsFree })),
   setCardStatus: (cardStatus, error = null) => set({ cardStatus, error }),
 
-  syncFromPlayer: (next) => {
-    const playback = playbackStateFrom(next);
-    set({
-      playback,
-      currentTime: next.currentTime,
-      duration: next.duration,
-      // A native error is the only thing that writes `error` from this side.
-      // Card-level errors come from `setCardStatus`.
-      error: next.error ?? (playback === 'error' ? 'Playback failed' : null),
-    });
-  },
+  syncFromPlayer: (next) =>
+    set((s) => {
+      // FIX: the two numbers are coerced here, once, for every consumer.
+      const { currentTime, duration } = coerceNativeTimes(next.currentTime, next.duration);
+
+      // FIX 4: iOS reports `isBuffering: true` when there is no current item
+      // (`ios/AudioUtils.swift:197-209` — the `isBuffering` extension returns
+      // a bare `true` when `currentItem == nil`). Our player is constructed
+      // with `source = null` (`getPlayer`), so on iOS that is true for the
+      // entire pre-first-clip life, and because `isBuffering` outranks `playing`
+      // in `playbackStateFrom` the whole app sits on a permanent spinner.
+      // Android disagrees — `isBuffering` is literally
+      // `playbackState == Player.STATE_BUFFERING` (`AudioPlayer.kt:198`), which
+      // `STATE_IDLE` is not — so the same snapshot means different things per
+      // platform.
+      //
+      // The predicate is the STORE's loaded clip, deliberately NOT the native
+      // `isLoaded`. That distinction is load-bearing and was got wrong first
+      // time: `isLoaded` is `currentItem?.status == .readyToPlay` on iOS
+      // (`ios/AudioPlayer.swift:86-88`) but `playbackState == STATE_READY` on
+      // Android (`AudioPlayer.kt:197`, with `STATE_ENDED` also true at :212).
+      // A REAL stall has `isLoaded: true` on iOS and `isLoaded: false` on
+      // Android — so gating buffering on `isLoaded` would hide exactly the
+      // spinner Android needs, while still not being the right question to ask
+      // on either platform. `playingClipId` is the one signal that means the
+      // same thing everywhere: we have loaded a clip, so a buffering flag
+      // refers to real media rather than to the absence of any.
+      //
+      // This is done HERE rather than in `playbackStateFrom` so that function
+      // stays a pure, independently-tested mapping of the snapshot it is
+      // given; sanitising the snapshot keeps the platform quirk out of it.
+      const sanitized: NativeStatusSnapshot = {
+        ...next,
+        currentTime,
+        duration,
+        isBuffering: s.playingClipId !== null && next.isBuffering,
+      };
+      const derived = playbackStateFrom(sanitized);
+
+      // FIX 3: latch `ended` for as long as this clip is the one loaded.
+      // `didJustFinish` is one tick wide (see `PlaybackState`), so without the
+      // latch the 500 ms re-sync in `PlayerHost` turns `ended` into `paused`
+      // and the auto-advance / `progress >= 0.99` pacing rule never fires.
+      // A latch is only meaningful against a clip, so it is not armed unless
+      // something is actually loaded. An error still wins, matching
+      // `playbackStateFrom`'s "error must win outright" rule.
+      const armed = next.didJustFinish && s.playingClipId !== null;
+      const endedForClipId = armed ? s.playingClipId : s.endedForClipId;
+      const latched = endedForClipId !== null && endedForClipId === s.playingClipId;
+      const playback: PlaybackState = latched && derived !== 'error' ? 'ended' : derived;
+
+      return {
+        playback,
+        currentTime,
+        duration,
+        endedForClipId,
+        // A native error is the only thing that writes `error` from this side.
+        // Card-level errors come from `setCardStatus`.
+        error: next.error ?? (playback === 'error' ? 'Playback failed' : null),
+      };
+    }),
 
   reset: () => set({ ...INITIAL }),
 }));
@@ -297,10 +472,15 @@ export async function loadClip(clip: FeedClip, token: string): Promise<LoadResul
     // would assert success for a clip that is silent, and on iOS
     // `currentStatus()` hardcodes `error: nil` so nothing would ever correct
     // it. The card would read "Now playing" for ever with no spinner and no
-    // error.
+    // error. `'idle'` is the same claim in the other direction: the new source
+    // has not reported anything yet.
     usePlayerStore.setState({
       cardStatus: 'idle',
+      playback: 'idle',
       playingClipId: clip.id,
+      // Disarm the `ended` latch, or the previous clip's completion would
+      // follow the user to the next one (see `endedForClipId`).
+      endedForClipId: null,
       error: null,
       currentTime: 0,
       // Duration is only known once the source reports it; `duration_ms` from
@@ -329,7 +509,68 @@ export function resume(): void {
   usePlayerStore.setState({ playback: 'playing' });
 }
 
-/** `seconds` is expo-audio's unit. Callers converting from `duration_ms` use msToSeconds. */
+/**
+ * Clamp a requested seek position into `[0, duration]`, or `null` when there
+ * is nothing to seek within.
+ *
+ * **No platform clamps for us.** iOS builds the `CMTime` from whatever it is
+ * given — `ios/AudioPlayer.swift:179-198`, so a `-10 s` at `t=3` becomes
+ * `CMTime(seconds: -7.0)`. Android is `player.seekTo((seconds * 1000L).toLong())`
+ * (`android/.../Playable.kt:31`). Web assigns `media.currentTime = seconds`
+ * (`src/AudioPlayer.web.ts:169-175`). Worse than an out-of-range position: on
+ * Android a seek issued while the player is still `STATE_IDLE` is *stored* by
+ * ExoPlayer and applied to the NEXT item, so an unclamped skip pressed before
+ * the first clip silently repositions the clip after it.
+ *
+ * `duration === 0` is the "nothing loaded" signal: the store only reports a
+ * duration once the source has (`loadClip` deliberately starts it at 0 rather
+ * than trusting the feed's `duration_ms`). Returning `null` there means
+ * "refuse" rather than "seek to 0", so a skip button pressed on an
+ * un-loaded player does not queue a position for the next clip.
+ *
+ * This is the ONE place the clamp lives — `skipBy` and any future scrubber
+ * must go through it rather than re-deriving the bounds.
+ */
+export function clampSeekTime(
+  requested: number,
+  duration: number,
+): number | null {
+  if (!Number.isFinite(requested) || !Number.isFinite(duration)) return null;
+  if (duration <= 0) return null;
+  return Math.min(Math.max(requested, 0), duration);
+}
+
+/**
+ * `seconds` is expo-audio's unit. Callers converting from `duration_ms` use msToSeconds.
+ *
+ * ## UNCLAMPED — prefer `skipBy`, or `clampSeekTime` for absolute seeks
+ * This passes the value straight to native, which clamps on no platform (see
+ * `clampSeekTime` for the citations). It is kept as the raw primitive because
+ * a scrubber legitimately wants absolute positioning, but it has **no
+ * production callers** as of 2026-09-30 (grepped: `src/`, `app/`), so a new
+ * caller should be `skipBy()` or should clamp first.
+ */
 export function seekToSeconds(seconds: number): void {
   void getPlayerOrNull()?.seekTo(seconds);
+}
+
+/**
+ * Move playback by `deltaSeconds` — the ±10 s skip button.
+ *
+ * Reads the store, clamps through `clampSeekTime`, and only then calls native.
+ * It deliberately does **not** write `currentTime` optimistically: a seek
+ * emits a status update on all three platforms
+ * (`ios/AudioPlayer.swift:189-194`, `BaseAudioPlayer.kt:119-121`), so the next
+ * tick corrects the store within one `updateInterval`. An optimistic write would
+ * be a second source of truth that can disagree with native.
+ *
+ * @returns the position actually seeked to, or `null` if the seek was refused
+ *   (nothing loaded, or a non-finite input).
+ */
+export function skipBy(deltaSeconds: number): number | null {
+  const { currentTime, duration } = usePlayerStore.getState();
+  const target = clampSeekTime(currentTime + deltaSeconds, duration);
+  if (target === null) return null;
+  getPlayerOrNull()?.seekTo(target);
+  return target;
 }

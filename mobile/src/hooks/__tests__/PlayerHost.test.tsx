@@ -37,6 +37,12 @@ jest.mock('expo-audio', () => {
     play: jest.fn(),
     pause: jest.fn(),
     seekTo: jest.fn(),
+    // `releasePlayer()` calls `release()`, NOT `remove()`. On native `remove()`
+    // is only a registry delete (`ios/AudioModule.swift:251-253`) and never
+    // tears the player down, so `release()` is what the store depends on. The
+    // mock has to mirror the real `AudioPlayer` surface — a fake missing a
+    // method the product calls reads as a product crash, not a mock gap.
+    release: jest.fn(),
     remove: jest.fn(),
     setActiveForLockScreen: jest.fn(),
   };
@@ -119,9 +125,26 @@ describe('status mirroring', () => {
   });
 
   it('reports buffering, which a stale playing flag would hide', async () => {
+    // A clip must be loaded first. `syncFromPlayer` gates `isBuffering` on the
+    // store's `playingClipId` rather than the native `isLoaded`, because iOS
+    // reports `isBuffering: true` when there is no current item
+    // (`ios/AudioUtils.swift:197-209`) and the player is constructed with
+    // `source: null` — so an ungated flag means "buffering" on an app that has
+    // never played anything. See the store's `syncFromPlayer` for why the
+    // native flag is the wrong predicate.
+    usePlayerStore.setState({ playingClipId: 'clip-a' });
     mockStatus.mockReturnValue(nativeSnapshot({ isBuffering: true, playing: true }) as never);
     await render(<PlayerHost />);
     expect(usePlayerStore.getState().playback).toBe('buffering');
+  });
+
+  it('does not report buffering before any clip is loaded', async () => {
+    // The iOS idle-spinner regression guard, at the component level. Without a
+    // loaded clip the native `isBuffering` flag is an artefact of `currentItem
+    // == nil`, and reporting it leaves a spinner on screen for ever.
+    mockStatus.mockReturnValue(nativeSnapshot({ isBuffering: true, playing: false }) as never);
+    await render(<PlayerHost />);
+    expect(usePlayerStore.getState().playback).not.toBe('buffering');
   });
 
   it('does not touch the card status', async () => {

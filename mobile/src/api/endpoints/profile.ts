@@ -56,3 +56,18 @@ export async function getPublicProfileClips(
   const page = publicProfileClipsPageSchema.parse(raw);
   return { clips: page.results, next: cursorFromNextUrl(page.next) };
 }
+
+/** Upload a new avatar through the bounded multipart profile endpoint. */
+export async function updateProfilePicture(asset: {
+  uri: string;
+  fileName?: string | null;
+  mimeType?: string | null;
+}): Promise<void> {
+  const form = new FormData();
+  form.append('profile_picture', {
+    uri: asset.uri,
+    name: asset.fileName?.trim() || 'avatar.jpg',
+    type: asset.mimeType?.trim() || 'image/jpeg',
+  } as unknown as Blob);
+  await apiFetch('/profile/me/update/', { method: 'PATCH', body: form });
+}

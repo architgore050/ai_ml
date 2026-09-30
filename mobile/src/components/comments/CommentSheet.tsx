@@ -21,6 +21,7 @@ function CommentThread({ clipId, viewerId, onClose }: Omit<CommentSheetProps, 'v
   const [next, setNext] = useState<string | null>(null);
   const [text, setText] = useState('');
   const [editing, setEditing] = useState<Comment | null>(null);
+  const [replyingTo, setReplyingTo] = useState<Comment | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -40,9 +41,13 @@ function CommentThread({ clipId, viewerId, onClose }: Omit<CommentSheetProps, 'v
   const submit = () => {
     if (saving) return;
     setSaving(true); setError(null);
-    const task = editing ? updateComment(editing.id, text) : createComment(clipId, text);
+    const task = editing
+      ? updateComment(editing.id, text)
+      : replyingTo
+        ? createComment(clipId, text, replyingTo)
+        : createComment(clipId, text);
     void task.then(
-      (saved) => { if (!mounted.current) return; setComments((items) => editing ? items.map((item) => item.id === saved.id ? saved : item) : [saved, ...items]); setText(''); setEditing(null); },
+      (saved) => { if (!mounted.current) return; setComments((items) => editing ? items.map((item) => item.id === saved.id ? saved : item) : [saved, ...items]); setText(''); setEditing(null); setReplyingTo(null); },
       (err: unknown) => { if (mounted.current) setError(err instanceof Error ? err.message : 'Could not save comment.'); },
     ).finally(() => { if (mounted.current) setSaving(false); });
   };
@@ -63,10 +68,11 @@ function CommentThread({ clipId, viewerId, onClose }: Omit<CommentSheetProps, 'v
         <ScrollView refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} tintColor={accent.base} />} contentContainerStyle={styles.list}>
           {loading && comments.length === 0 ? <ActivityIndicator color={accent.base} /> : null}
           {!loading && comments.length === 0 ? <Text style={styles.empty}>Be the first to comment.</Text> : null}
-          {comments.map((comment) => <View key={comment.id} style={styles.comment}><Text style={typography.microLabel}>{comment.author_username}</Text><Text style={styles.commentText}>{comment.text}</Text>{comment.author_id === viewerId ? <View style={styles.row}><Pressable accessibilityRole="button" accessibilityLabel={`Edit comment by ${comment.author_username}`} onPress={() => { setEditing(comment); setText(comment.text); }}><Text style={styles.link}>Edit</Text></Pressable><Pressable accessibilityRole="button" accessibilityLabel={`Delete comment by ${comment.author_username}`} onPress={() => remove(comment.id)}><Text style={styles.link}>Delete</Text></Pressable></View> : null}</View>)}
+          {comments.map((comment) => <View key={comment.id} style={[styles.comment, comment.parent ? styles.reply : null]}><Text style={typography.microLabel}>{comment.author_username}</Text><Text style={styles.commentText}>{comment.text}</Text><View style={styles.row}><Pressable accessibilityRole="button" accessibilityLabel={`Reply to comment by ${comment.author_username}`} onPress={() => { setEditing(null); setReplyingTo(comment); setText(''); }}><Text style={styles.link}>Reply</Text></Pressable>{comment.author_id === viewerId ? <><Pressable accessibilityRole="button" accessibilityLabel={`Edit comment by ${comment.author_username}`} onPress={() => { setReplyingTo(null); setEditing(comment); setText(comment.text); }}><Text style={styles.link}>Edit</Text></Pressable><Pressable accessibilityRole="button" accessibilityLabel={`Delete comment by ${comment.author_username}`} onPress={() => remove(comment.id)}><Text style={styles.link}>Delete</Text></Pressable></> : null}</View></View>)}
           {next ? <Pressable accessibilityRole="button" accessibilityLabel="Load more comments" onPress={loadMore}><Text style={styles.link}>Load more</Text></Pressable> : null}
         </ScrollView>
-        <View style={styles.composer}><TextInput value={text} onChangeText={setText} placeholder={editing ? 'Edit comment' : 'Add a comment'} placeholderTextColor={content.tertiary} multiline maxLength={500} style={styles.input} /><Pressable accessibilityRole="button" accessibilityLabel={editing ? 'Save comment' : 'Post comment'} disabled={saving || !text.trim()} onPress={submit} style={[styles.post, (saving || !text.trim()) && styles.disabled]}>{saving ? <ActivityIndicator color={surface.base} /> : <Text style={styles.postText}>{editing ? 'Save' : 'Post'}</Text>}</Pressable></View>
+        {replyingTo ? <View style={styles.replying}><Text style={styles.replyingText}>Replying to {replyingTo.author_username}</Text><Pressable accessibilityRole="button" accessibilityLabel="Cancel reply" onPress={() => setReplyingTo(null)}><Text style={styles.link}>Cancel</Text></Pressable></View> : null}
+        <View style={styles.composer}><TextInput value={text} onChangeText={setText} placeholder={editing ? 'Edit comment' : replyingTo ? `Reply to ${replyingTo.author_username}` : 'Add a comment'} placeholderTextColor={content.tertiary} multiline maxLength={500} style={styles.input} /><Pressable accessibilityRole="button" accessibilityLabel={editing ? 'Save comment' : 'Post comment'} disabled={saving || !text.trim()} onPress={submit} style={[styles.post, (saving || !text.trim()) && styles.disabled]}>{saving ? <ActivityIndicator color={surface.base} /> : <Text style={styles.postText}>{editing ? 'Save' : 'Post'}</Text>}</Pressable></View>
       </View>
     </View>
   </Modal>;
@@ -74,5 +80,5 @@ function CommentThread({ clipId, viewerId, onClose }: Omit<CommentSheetProps, 'v
 
 const statusColor = '#ffb4ab';
 const styles = StyleSheet.create({
-  scrim: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.55)', zIndex: zIndex.sheet }, sheet: { maxHeight: '78%', minHeight: 300, padding: spacing.stack, gap: spacing.gutter, backgroundColor: surface.container, borderTopLeftRadius: 24, borderTopRightRadius: 24 }, header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }, title: { ...typography.title, color: content.primary }, list: { gap: spacing.gutter, paddingBottom: spacing.stack }, comment: { borderWidth: 1, borderColor: border.default, borderRadius: 12, padding: spacing.gutter, gap: 4 }, commentText: { ...typography.body, color: content.primary }, row: { flexDirection: 'row', gap: spacing.stack }, link: { ...typography.microLabel, color: accent.base, paddingVertical: 4 }, empty: { ...typography.bodySecondary, color: content.tertiary, textAlign: 'center', padding: spacing.stack }, error: { ...typography.bodySecondary, color: statusColor }, composer: { flexDirection: 'row', gap: spacing.gutter, alignItems: 'flex-end' }, input: { flex: 1, minHeight: 48, maxHeight: 100, borderWidth: 1, borderColor: border.default, borderRadius: 12, padding: spacing.gutter, color: content.primary }, post: { minHeight: 48, justifyContent: 'center', paddingHorizontal: spacing.stack, borderRadius: 999, backgroundColor: accent.base }, postText: { ...typography.label, color: surface.base }, disabled: { opacity: 0.45 },
+  scrim: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.55)', zIndex: zIndex.sheet }, sheet: { maxHeight: '78%', minHeight: 300, padding: spacing.stack, gap: spacing.gutter, backgroundColor: surface.container, borderTopLeftRadius: 24, borderTopRightRadius: 24 }, header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }, title: { ...typography.title, color: content.primary }, list: { gap: spacing.gutter, paddingBottom: spacing.stack }, comment: { borderWidth: 1, borderColor: border.default, borderRadius: 12, padding: spacing.gutter, gap: 4 }, reply: { marginLeft: spacing.stack, borderLeftWidth: 3, borderLeftColor: accent.base }, commentText: { ...typography.body, color: content.primary }, row: { flexDirection: 'row', gap: spacing.stack }, link: { ...typography.microLabel, color: accent.base, paddingVertical: 4 }, empty: { ...typography.bodySecondary, color: content.tertiary, textAlign: 'center', padding: spacing.stack }, error: { ...typography.bodySecondary, color: statusColor }, replying: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }, replyingText: { ...typography.microLabel, color: content.secondary }, composer: { flexDirection: 'row', gap: spacing.gutter, alignItems: 'flex-end' }, input: { flex: 1, minHeight: 48, maxHeight: 100, borderWidth: 1, borderColor: border.default, borderRadius: 12, padding: spacing.gutter, color: content.primary }, post: { minHeight: 48, justifyContent: 'center', paddingHorizontal: spacing.stack, borderRadius: 999, backgroundColor: accent.base }, postText: { ...typography.label, color: surface.base }, disabled: { opacity: 0.45 },
 });

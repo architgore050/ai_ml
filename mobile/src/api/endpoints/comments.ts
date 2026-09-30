@@ -20,9 +20,24 @@ export async function getComments(
 }
 
 /** POST uses a clip UUID from the reel, never a creator User id. */
-export async function createComment(clipId: string, text: string): Promise<Comment> {
+/**
+ * Create a top-level comment or reply. `parent` is accepted only when the
+ * caller already holds a comment from this clip; the API repeats that
+ * invariant and rejects a cross-clip parent as a 400.
+ */
+export async function createComment(
+  clipId: string,
+  text: string,
+  parent?: Comment | null,
+): Promise<Comment> {
   assertCommentText(text);
-  const raw = await apiFetch('/comments/', { method: 'POST', body: { clip: clipId, text: text.trim() } });
+  if (parent && parent.clip !== clipId) {
+    throw new Error('A reply parent must belong to the selected clip.');
+  }
+  const body = parent
+    ? { clip: clipId, text: text.trim(), parent: parent.id }
+    : { clip: clipId, text: text.trim() };
+  const raw = await apiFetch('/comments/', { method: 'POST', body });
   return commentSchema.parse(raw);
 }
 

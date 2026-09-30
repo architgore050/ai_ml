@@ -144,8 +144,10 @@ describe('subscription limits are ALL strings', () => {
     // DictField(child=CharField) — the value arrives as a string. A truthiness
     // check works, but arithmetic on it concatenates.
     const parsed = subscriptionStatusSchema.parse({
+      app_user_id: '123e4567-e89b-12d3-a456-426614174000',
       is_pro: false,
       expires_at: null,
+      last_synced: '2026-10-01T00:00:00Z',
       limits: { max_clip_duration_seconds: '60', daily_upload_limit: '5' },
     });
 

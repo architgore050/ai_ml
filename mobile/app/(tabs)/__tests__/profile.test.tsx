@@ -3,6 +3,12 @@ import { fireEvent, render } from '@testing-library/react-native';
 import Screen from '../profile';
 import { getMyProfile } from '../../../src/api/endpoints/auth';
 
+jest.mock('expo-image-picker', () => ({
+  requestMediaLibraryPermissionsAsync: jest.fn(),
+  launchImageLibraryAsync: jest.fn(),
+}));
+jest.mock('expo-router', () => ({ router: { push: jest.fn() } }));
+
 jest.mock('../../../src/hooks/useBackendStatus', () => ({ useBackendStatus: () => 'ok' }));
 jest.mock('../../../src/api/endpoints/auth', () => ({ getMyProfile: jest.fn() }));
 const mockProfile = getMyProfile as jest.MockedFunction<typeof getMyProfile>;

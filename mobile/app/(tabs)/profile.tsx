@@ -1,5 +1,7 @@
-import React from 'react';
-import { ActivityIndicator, FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
+import React, { useState } from 'react';
+import { ActivityIndicator, Alert, FlatList, Image, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
+import * as ImagePicker from 'expo-image-picker';
+import { router } from 'expo-router';
 
 import type { FeedClip } from '../../src/api/schema';
 import { NetworkBanner } from '../../src/components/NetworkBanner';
@@ -12,6 +14,37 @@ import { useOwnProfile } from '../../src/hooks/useOwnProfile';
 export default function Screen() {
   const backend = useBackendStatus();
   const state = useOwnProfile();
+  const [avatarBusy, setAvatarBusy] = useState(false);
+
+  const chooseAvatar = async () => {
+    if (avatarBusy) return;
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert('Photo permission needed', 'Allow photo access to choose a profile picture.');
+      return;
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      quality: 0.9,
+      allowsEditing: true,
+      aspect: [1, 1],
+    });
+    if (result.canceled) return;
+    const asset = result.assets[0];
+    if (!asset) return;
+    if ((asset.fileSize ?? 0) > 5 * 1024 * 1024) {
+      Alert.alert('Image is too large', 'Choose an image smaller than 5 MB.');
+      return;
+    }
+    setAvatarBusy(true);
+    try {
+      await state.updateAvatar(asset);
+    } catch (cause) {
+      Alert.alert('Could not update picture', cause instanceof Error ? cause.message : 'Try again.');
+    } finally {
+      setAvatarBusy(false);
+    }
+  };
 
   if (state.loading) {
     return <View style={styles.screen}><NetworkBanner status={backend} /><View style={styles.center}><ActivityIndicator color={accent.base} /></View></View>;
@@ -41,6 +74,10 @@ export default function Screen() {
         refreshControl={<RefreshControl refreshing={state.refreshing} onRefresh={state.refresh} tintColor={accent.base} />}
         ListHeaderComponent={
           <View style={styles.header}>
+            <Pressable accessibilityRole="button" accessibilityLabel="Change profile picture" accessibilityState={{ busy: avatarBusy }} onPress={() => void chooseAvatar()} disabled={avatarBusy} style={styles.avatarButton}>
+              {profile.profile_picture ? <Image source={{ uri: profile.profile_picture }} style={styles.avatar} /> : <View style={styles.avatarFallback}><Text style={styles.avatarText}>{profile.username.slice(0, 1).toUpperCase()}</Text></View>}
+              <Text style={styles.avatarAction}>{avatarBusy ? 'Uploading…' : 'Change picture'}</Text>
+            </Pressable>
             <Text style={styles.username}>{profile.username}</Text>
             <View style={styles.stats}>
               <Stat label="Followers" value={profile.followers_count} />
@@ -48,6 +85,7 @@ export default function Screen() {
               <Stat label="Uploads" value={profile.uploads_count} />
             </View>
             <Text style={styles.section}>Liked clips</Text>
+            <Pressable accessibilityRole="button" accessibilityLabel="Open settings" onPress={() => router.push('/settings' as never)} style={styles.settings}><Text style={typography.label}>Settings</Text></Pressable>
           </View>
         }
         ListEmptyComponent={<Text style={styles.body}>No liked clips yet.</Text>}
@@ -71,6 +109,11 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: spacing.stack },
   list: { padding: spacing.stack, gap: spacing.gutter },
   header: { gap: spacing.stack, paddingBottom: spacing.stack },
+  avatarButton: { alignSelf: 'flex-start', gap: 6, minHeight: 48, justifyContent: 'center' },
+  avatar: { width: 80, height: 80, borderRadius: 40 },
+  avatarFallback: { width: 80, height: 80, borderRadius: 40, alignItems: 'center', justifyContent: 'center', backgroundColor: accent.base },
+  avatarText: { ...typography.title, color: surface.base },
+  avatarAction: { ...typography.microLabel, color: accent.base },
   username: { ...typography.page, color: content.primary },
   stats: { flexDirection: 'row', gap: spacing.stack },
   statValue: { ...typography.label, color: content.primary },
@@ -79,4 +122,5 @@ const styles = StyleSheet.create({
   clip: { borderWidth: 1, borderColor: border.default, borderRadius: 12, padding: spacing.stack, gap: 4 },
   clipTitle: { ...typography.label, color: content.primary },
   retry: { marginTop: spacing.stack, borderWidth: 1, borderColor: accent.base, borderRadius: 999, paddingHorizontal: spacing.stack, paddingVertical: spacing.gutter },
+  settings: { alignSelf: 'flex-start', minHeight: 48, justifyContent: 'center', borderWidth: 1, borderColor: accent.base, borderRadius: 999, paddingHorizontal: spacing.stack },
 });

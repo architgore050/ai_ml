@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { getMyProfile } from '../api/endpoints/auth';
+import { updateProfilePicture } from '../api/endpoints/profile';
 import type { OwnProfile } from '../api/schema';
 
 export type OwnProfileState = {
@@ -9,6 +10,7 @@ export type OwnProfileState = {
   refreshing: boolean;
   error: string | null;
   refresh: () => void;
+  updateAvatar: (asset: { uri: string; fileName?: string | null; mimeType?: string | null }) => Promise<void>;
 };
 
 /** A refreshable own-profile read. `/profile/me/` also supplies liked clips. */
@@ -45,5 +47,12 @@ export function useOwnProfile(): OwnProfileState {
     return () => { mounted.current = false; };
   }, [refresh]);
 
-  return { profile, loading, refreshing, error, refresh };
+  const updateAvatar = useCallback(async (asset: { uri: string; fileName?: string | null; mimeType?: string | null }) => {
+    setError(null);
+    await updateProfilePicture(asset);
+    const next = await getMyProfile();
+    if (mounted.current) setProfile(next);
+  }, []);
+
+  return { profile, loading, refreshing, error, refresh, updateAvatar };
 }

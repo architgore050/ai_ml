@@ -1,4 +1,4 @@
-import { fireEvent, render } from '@testing-library/react-native';
+import { fireEvent, render, waitFor } from '@testing-library/react-native';
 
 import { CommentSheet } from '../CommentSheet';
 import { createComment, getComments } from '../../../api/endpoints/comments';
@@ -27,5 +27,16 @@ describe('CommentSheet', () => {
     await fireEvent.press(screen.getByRole('button', { name: 'Post comment' }));
     await screen.findByText('new comment');
     expect(mockCreate).toHaveBeenCalledWith(CLIP, 'new comment');
+  });
+
+  it('posts a reply with the selected same-clip parent', async () => {
+    mockCreate.mockResolvedValue({ ...comment, id: 'reply', parent: comment.id, text: 'a reply' });
+    const screen = await render(<CommentSheet visible clipId={CLIP} viewerId={1} onClose={jest.fn()} />);
+    await screen.findByText('hello');
+    await fireEvent.press(screen.getByRole('button', { name: 'Reply to comment by alice' }));
+    fireEvent.changeText(screen.getByPlaceholderText('Reply to alice'), 'a reply');
+    await screen.findByDisplayValue('a reply');
+    await fireEvent.press(screen.getByRole('button', { name: 'Post comment' }));
+    await waitFor(() => expect(mockCreate).toHaveBeenCalledWith(CLIP, 'a reply', comment));
   });
 });

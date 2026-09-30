@@ -1,4 +1,4 @@
-import { getPublicProfile, getPublicProfileClips } from '../endpoints/profile';
+import { getPublicProfile, getPublicProfileClips, updateProfilePicture } from '../endpoints/profile';
 import { apiFetch } from '../client';
 
 jest.mock('../client', () => ({ apiFetch: jest.fn() }));
@@ -51,5 +51,13 @@ describe('public profile endpoints', () => {
   it('rejects a paginated profile clip response that does not have the cursor envelope', async () => {
     mockApiFetch.mockResolvedValue({ count: 1, next: null, previous: null, results: [clip] });
     await expect(getPublicProfileClips(42)).rejects.toThrow();
+  });
+
+  it('sends avatar changes as multipart PATCH without setting a JSON content type', async () => {
+    mockApiFetch.mockResolvedValue({ username: 'alice', profile_picture: 'https://cdn.example.test/avatar.jpg' });
+    await updateProfilePicture({ uri: 'file:///avatar.jpg', fileName: 'avatar.jpg', mimeType: 'image/jpeg' });
+    expect(mockApiFetch).toHaveBeenCalledWith('/profile/me/update/', expect.objectContaining({
+      method: 'PATCH', body: expect.any(FormData),
+    }));
   });
 });

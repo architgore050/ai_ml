@@ -386,6 +386,56 @@ class TestNginxConfig:
 # ---------------------------------------------------------------------------
 # 3. DJANGO SETTINGS (DEBUG=False, the production mode the terminator runs)
 # ---------------------------------------------------------------------------
+def _not_debug_term(test):
+    """Return the `not DEBUG` sub-term of `test`, or None.
+
+    Accepts both the bare form (`not DEBUG`) and an AND-ed form
+    (`not DEBUG and not _SOMETHING`), because the prod block legitimately
+    carries a test-only opt-out alongside the DEBUG check. Anything that is not
+    a top-level conjunction is rejected: a guard nested inside another
+    condition is a different shape and should not satisfy this check.
+    """
+    import ast
+
+    if (
+        isinstance(test, ast.UnaryOp)
+        and isinstance(test.op, ast.Not)
+        and isinstance(test.operand, ast.Name)
+        and test.operand.id == 'DEBUG'
+    ):
+        return test
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        for value in test.values:
+            if (
+                isinstance(value, ast.UnaryOp)
+                and isinstance(value.op, ast.Not)
+                and isinstance(value.operand, ast.Name)
+                and value.operand.id == 'DEBUG'
+            ):
+                return value
+    return None
+
+
+def _gated_on_not_debug(test) -> bool:
+    return _not_debug_term(test) is not None
+
+
+def _extra_conditions(test):
+    """Names gated alongside `not DEBUG`, i.e. everything else in the AND."""
+    import ast
+
+    if not isinstance(test, ast.BoolOp):
+        return []
+    return [
+        v.operand.id
+        for v in test.values
+        if isinstance(v, ast.UnaryOp)
+        and isinstance(v.op, ast.Not)
+        and isinstance(v.operand, ast.Name)
+        and v.operand.id != 'DEBUG'
+    ]
+
+
 class TestProductionSslSettings:
     """The Django settings module's `if not DEBUG:` block is the
     production-mode contract that nginx depends on. These tests read
@@ -421,21 +471,35 @@ class TestProductionSslSettings:
         # is the literal `DEBUG`. The test value is `not <NAME>` —
         # Python's ast is `UnaryOp(Not, Name('DEBUG'))`.
         for node in tree.body:
-            if (
-                isinstance(node, ast.If)
-                and isinstance(node.test, ast.UnaryOp)
-                and isinstance(node.test.op, ast.Not)
-                and isinstance(node.test.operand, ast.Name)
-                and node.test.operand.id == 'DEBUG'
-            ):
-                # Reconstruct the source span of the body lines.
-                lines = text.splitlines(keepends=True)
-                start_line = node.body[0].lineno - 1
-                # The body is all lines strictly inside the if's
-                # indent. We use end_lineno of the last stmt + 1.
-                end_line = node.body[-1].end_lineno
-                return ''.join(lines[start_line:end_line])
-        pytest.fail('`if not DEBUG:` block not found at module level in settings.py')
+            if not (isinstance(node, ast.If) and _gated_on_not_debug(node.test)):
+                continue
+
+            # The block may now carry extra AND-ed conditions beyond
+            # `not DEBUG` (it does: a test-only opt-out, so the suite can run
+            # against a DEBUG=False container without every request 301-ing).
+            # That is legitimate ONLY while those extras can never be true in a
+            # deployed environment. A guard that widens production hardening
+            # would be worse than no guard, so assert the extras are named like
+            # a testing switch rather than accepting any condition at all.
+            extras = _extra_conditions(node.test)
+            assert all(
+                re.search(r'TEST', name) for name in extras
+            ), (
+                'the `if not DEBUG:` block carries extra conditions that are not '
+                f'clearly test-only: {extras}. Production hardening must not be '
+                'gated behind anything a deployment could set.'
+            )
+
+            # Reconstruct the source span of the body lines.
+            lines = text.splitlines(keepends=True)
+            start_line = node.body[0].lineno - 1
+            # The body is all lines strictly inside the if's
+            # indent. We use end_lineno of the last stmt + 1.
+            end_line = node.body[-1].end_lineno
+            return ''.join(lines[start_line:end_line])
+        pytest.fail(
+            'a module-level block gated on `not DEBUG:` not found in settings.py'
+        )
 
     def test_secure_ssl_redirect_enabled(self, prod_block):
         assert 'SECURE_SSL_REDIRECT' in prod_block, (

@@ -32,69 +32,26 @@ import time
 
 from django.conf import settings
 
-COOKIE_NAME = "ef_hls_token"
-TOKEN_VERSION = 1
-
-# Literal values that ship in .env.example / .env.vps.example / .env.laptop.example.
-# A guard that only rejects the empty string is not a guard: an operator who
-# copies an example file to .env and deploys without editing it gets a
-# repository-committed HMAC key, and the entire token scheme is bypassable by
-# anyone who has read this file. Keep this list in sync when an example changes.
-_PLACEHOLDER_SECRETS = {
-    "change-me-to-a-long-random-string",
-    "change-me-strong-password",
-    "changeme",
-    "change-me",
-    "secret",
-    "your-secret-here",
-    "please-change-me",
-    "replace-me",
-    "insecure",
-}
-
-# Lower-cased substrings that mark a value as documentation, not a real secret.
-_PLACEHOLDER_SUBSTRINGS = (
-    "change-me",
-    "changeme",
-    "change_me",
-    "your-",
-    "your_",
-    "replace-me",
-    "replace_me",
-    "example",
-    "placeholder",
-    "not-for-prod",
-    "not_for_prod",
-    "todo",
+# The placeholder vocabulary and the guard that uses it live in
+# `EchoFlow/secrets.py`, which now also guards DJANGO_SECRET_KEY and both
+# Redis passwords at settings-import time. They used to live here, and this
+# file was their only consumer — which is why the two far more damaging
+# secrets had no guard at all.
+#
+# `is_placeholder_secret` is re-exported (not merely imported) because
+# `backend/app/tests/test_hls_token.py` imports it from this module path.
+# Behaviour is unchanged: same predicate, same vocabulary, same fail-closed
+# direction. The docstring there carries the trade-off — the substring list
+# includes "example" and "todo", so a real secret containing those words is
+# rejected on purpose.
+from backend.EchoFlow.secrets import (
+    _PLACEHOLDER_SECRETS,  # noqa: F401  kept importable from this module
+    _PLACEHOLDER_SUBSTRINGS,  # noqa: F401  kept importable from this module
+    is_placeholder_secret,  # noqa: F401  re-exported for existing callers
 )
 
-
-def is_placeholder_secret(value: str) -> bool:
-    """True if `value` is obviously a documentation placeholder.
-
-    Kept tolerant on purpose: a strict allow-list of exact example strings
-    would miss a renamed or reworded placeholder, whereas a substring test
-    catches the whole family. The only cost is a false positive on an
-    unusual-but-real secret, which is the safe direction — it fails closed.
-    """
-    if not value:
-        return True
-    stripped = value.strip()
-    # Whitespace-only is as weak as empty. It is also truthy, so it would sail
-    # past an `if not secret:` guard above and be used as a real HMAC key.
-    if not stripped:
-        return True
-    # Angle brackets are the conventional template marker and never appear in
-    # real key material. This catches placeholders whose wording the substring
-    # list below does not anticipate — e.g. .env.laptop.example ships
-    # `MEDIA_TOKEN_SECRET=<same-as-vps>`, which is a placeholder in intent but
-    # contains none of the listed words.
-    if '<' in stripped or '>' in stripped:
-        return True
-    if stripped.lower() in _PLACEHOLDER_SECRETS:
-        return True
-    lowered = stripped.lower()
-    return any(token in lowered for token in _PLACEHOLDER_SUBSTRINGS)
+COOKIE_NAME = "ef_hls_token"
+TOKEN_VERSION = 1
 
 
 def _get_secret() -> bytes:

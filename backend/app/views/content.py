@@ -6,6 +6,7 @@ dispatch into Celery is owned by services.uploads.finalize_upload.
 import logging
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.http import HttpResponse
 from django.utils.html import escape
 from rest_framework import viewsets, permissions, parsers, status
@@ -154,6 +155,13 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
             'report_clip': 'clip_report',
             'retrieve': 'clip_read',
             'list': 'clip_read',
+            # A share deep link's `GET /clips/{id}/resolve/`. Same rate as
+            # `retrieve` because it is the same kind of work — one clip's
+            # metadata — and a deep link is opened once per click, not in a
+            # loop. Deliberately NOT in SCOPED_ONLY_ACTIONS, for the same
+            # reason `retrieve` is not: the 1000/hour user bucket stays as a
+            # backstop beneath `clip_read`.
+            'resolve_clip': 'clip_read',
             # create / update / partial_update / destroy fall through to
             # 'upload' by omission: they are owner-scoped writes over the
             # same objects, so sharing the storage-abuse cap is correct.
@@ -227,6 +235,10 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
     #: See `update()` for the policy and the argument.
     POST_APPROVAL_IMMUTABLE_FIELDS = ('license_type', 'copyright_owner_name')
 
+    #: (A1) Rights fields frozen at CREATE, for every clip, approved or not.
+    #: `license_type` only — see `_refuse_licence_relabel`.
+    CREATE_TIME_IMMUTABLE_FIELDS = ('license_type',)
+
     def update(self, request, *args, **kwargs):
         # N8 fix: PATCH/PUT on a clip must NOT replace original_file.
         # The previous approach (read_only_fields at serializer level)
@@ -249,11 +261,110 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
         # before the serializer sees the payload. get_object() is idempotent,
         # so super().update() calling it again costs one extra SELECT.
         clip = self.get_object()
+
+        # (A1) before the post-approval guard: the licence freeze applies to
+        # unapproved clips too, so it cannot live inside the method that
+        # returns early for them.
+        refusal = self._refuse_licence_relabel(clip, data)
+        if refusal is not None:
+            return refusal
+
         refusal = self._refuse_post_approval_rights_change(clip, data)
         if refusal is not None:
             return refusal
 
         return super().update(request, *args, **kwargs)
+
+    def _refuse_licence_relabel(self, clip, data):
+        """(A1) Refuse to change ``license_type`` on an existing clip. Ever.
+
+        Same 409 shape and the same "value, not key presence" comparison as
+        ``_refuse_post_approval_rights_change`` below; what differs is the
+        SCOPE, and that difference is the point of a separate method rather
+        than a widened one.
+
+        Why the post-approval guard is not enough any more
+        ---------------------------------------------------
+        It only runs when ``clip.moderation_approved`` is true, and its premise
+        — "nothing has been moderated, so there is no approved rights record to
+        contradict" — was written when ``license_type`` was advisory. That is no
+        longer true. ``AudioUploadSerializer.create`` now DERIVES
+        ``is_noncommercial`` / ``requires_share_alike`` from the validated
+        ``license_type`` and freezes them there, because
+        ``services.entitlements.is_license_restricted`` is a two-boolean
+        predicate and those two columns are the only rights gate in the
+        platform. So ``license_type`` is load-bearing from the moment the row
+        exists, and the window between upload and approval is now exactly
+        where the divergence opens:
+
+            POST /clips/  license_type="CC-BY-NC"   -> (True, False)
+            PATCH /clips/{id}/  license_type="Owned" -> row now SAYS Owned
+            POST /clips/{id}/approve-moderation/     -> (True, False) held
+                -> served as commercial, from a record that declares it owned
+
+        That is worse than the pre-fix state, not better: previously the
+        declared licence and the enforced flags were *consistently* empty; now
+        they can actively contradict each other in a moderation-approved row,
+        and the declared value is what any downstream rights check, operator
+        screen or legal disclosure would read. Freezing the label closes it.
+
+        409, not a silent strip
+        ----------------------
+        The N8 ``original_file`` treatment drops the field and returns 200. That
+        is the wrong register here: a client rendering a licence dropdown would
+        display the value it just sent and have no way to know the server threw
+        it away, so the UI would assert a licence the database does not hold.
+        The remedy is in the response body — delete and re-upload — the same
+        remedy ``original_file`` already has, and the one the field-level error
+        can actually name.
+
+        Atomic, and deliberately so
+        --------------------------
+        A title edit sent in the same request is refused too. A partial apply
+        leaves the client unable to tell which half landed, and the half that
+        landed is the dangerous one — same rule, same reason, same shape as
+        ``_refuse_post_approval_rights_change``.
+
+        Not frozen, on purpose
+        ---------------------
+        ``copyright_owner_name`` stays editable pre-approval. It is attribution
+        metadata rather than a gate input — nothing reads it — so freezing it
+        would block the ordinary "I mistyped the credit" fix on a clip that is
+        not published yet, for no enforcement gain. It is still frozen
+        post-approval, by the guard below.
+
+        (A3) SCOPE OF THIS GUARD, stated plainly: it makes the *declaration*
+        immutable. It does not and cannot make a false declaration detectable.
+        A user who uploads NonCommercial audio while declaring ``"Owned"`` is
+        unaffected by this and by the derivation alike — there is no audio
+        classifier on the upload path, and the one classifier in the repo reads
+        a licence string, not audio. See the note above
+        ``LICENSE_RESTRICTION_FEATURES`` in ``serializers.py``.
+        """
+        changed = [
+            field
+            for field in self.CREATE_TIME_IMMUTABLE_FIELDS
+            if field in data and data.get(field) != getattr(clip, field)
+        ]
+        if not changed:
+            return None
+
+        logger.warning(
+            "licence relabel refused: clip=%s creator=%s fields=%s",
+            clip.id, clip.creator_id, changed,
+        )
+        return Response(
+            {
+                "detail": (
+                    "A clip's licence cannot be changed after it is uploaded, "
+                    "because the restrictions that licence imposes are "
+                    "decided once, at upload time. Delete the clip and upload "
+                    "it again to publish it under a different licence."
+                ),
+                "immutable_fields": changed,
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
 
     def _refuse_post_approval_rights_change(self, clip, data):
         """Refuse to rewrite the rights record of already-moderated content.
@@ -294,8 +405,8 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
         Refusing is inert: a 409 changes no field, so the clip stays exactly
         as servable as it was.
 
-        Premise correction
-        -----------------
+        Premise correction, and a later one
+        -----------------------------------
         The finding this answers described ``license_type`` as the thing that
         makes a clip NonCommercial. It does not. ``is_noncommercial`` and
         ``requires_share_alike`` are separate columns, absent from
@@ -307,6 +418,18 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
         attribution of an upload a moderator already ruled on, with no audit
         event. That is an audit-integrity defect, not a redistribution
         bypass, and the severity claimed for it should be read down to match.
+
+        LATER, AND IT INVALIDATED PART OF THE ABOVE. ``create()`` now derives
+        the two flags from the validated ``license_type`` (DEFECT A), so the
+        licence became load-bearing for the gate and the "nothing has been
+        moderated yet, so there is no reason to refuse" early-return below is
+        no longer sound for it. ``license_type`` is therefore frozen at create
+        by ``_refuse_licence_relabel``, which runs first and unconditionally.
+        By the time this method runs, ``license_type`` can only ever appear in
+        ``changed`` as an unchanged echo, so the field that is still doing work
+        here is ``copyright_owner_name`` — attribution metadata that was never
+        a gate input and is not frozen pre-approval, precisely so a mistyped
+        credit can be corrected on a clip that is not published yet.
 
         Two deliberate exclusions
         ------------------------
@@ -523,6 +646,85 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
             "report_id": report.id,
             "duplicate": not created,
         }, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['get'], url_path='resolve', permission_classes=[permissions.IsAuthenticated])
+    def resolve_clip(self, request, pk=None):
+        """Resolve ONE clip by id for a deep link, as JSON.
+
+        Why this exists
+        ---------------
+        The share feature copies ``${origin}/?clip=<id>`` and the backend
+        already mints a 30-day, per-clip-scoped share token. Nothing read the
+        parameter, so every shared link opened the generic feed.
+
+        The obvious way to resolve the id client-side is ``GET /clips/{id}/``,
+        and that **cannot work**. ``get_queryset`` is
+        ``filter(creator=self.request.user)`` (:117-120), so ``retrieve``
+        answers 404 for every clip the requester did not upload — which is
+        every real share. The deep link would have reported "not available on
+        your account" for a clip that is perfectly available, on the one
+        screen whose entire job is to open what somebody sent you.
+
+        So this is a read that is gated on ``resolve_clip_access`` rather
+        than on ownership. That is deliberate: the entitlement rule already
+        lives in exactly one place (``services/entitlements.py:70``) and
+        re-deriving it here is how "what is servable" ended up with two
+        drifting implementations in the first place.
+
+        Deliberate properties:
+
+        * **404 for both "does not exist" and "not yours"**, so this is not
+          an existence oracle. Same shape as ``retrieve``, for the same
+          reason.
+        * **No playback credential is granted.** Authorisation to *play* is
+          still ``POST /media/playback-token/{id}/`` (:677), which mints a
+          600 s token and does its own access check. This endpoint answers a
+          question about metadata only.
+        * **``status`` is not gated here.** A clip that is approved but still
+          encoding comes back with its real status so the client can say
+          "still processing" and let the playback probe's 409 stand as the
+          authoritative answer. Filtering it out here would collapse two
+          distinct, honest states into one 404.
+        * ``clip_read`` scope, same as ``retrieve``/``list`` — a resolve is a
+          read, and it deliberately keeps the inherited 1000/hour user bucket
+          as a backstop (see ``SCOPED_ONLY_ACTIONS``).
+        """
+        from ..services.entitlements import resolve_clip_access
+
+        # SECURITY: Unscoped on purpose — ownership is the wrong gate here.
+        # `resolve_clip_access` decides, and it is the same rule the playback
+        # token uses, so metadata and playback can never disagree about who
+        # may see a clip.
+        try:
+            clip = AudioClip.objects.get(pk=pk)
+        except (AudioClip.DoesNotExist, ValidationError, ValueError, TypeError):
+            # A non-UUID pk raises ValidationError, not DoesNotExist, and it
+            # must not become a 500 on a URL anybody can type.
+            return Response({'error': 'Clip not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        allowed, _reason = resolve_clip_access(request.user, clip)
+        if not allowed:
+            # 404, not 403: see the docstring. A 403 would confirm the clip
+            # exists, and the denial reason is not the caller's business.
+            return Response({'error': 'Clip not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        data = dict(FeedClipSerializer(clip, context={'request': request}).data)
+        # `status` is not in `FeedClipSerializer.Meta.fields`, and its absence
+        # is correct there: both feed halves are built from
+        # `AudioClip.objects.filter(status='ready')` (services/feed_pool.py), so
+        # on that surface the field would be the constant 'ready'.
+        #
+        # It is exactly the wrong omission for a deep link, whose whole purpose
+        # is to answer honestly about a clip the caller did *not* just pull
+        # from the feed. An approved clip mid-encode is a legitimately
+        # answerable request with the answer 'not yet', and a 200 that omits
+        # `status` is indistinguishable from a 200 for a ready clip — the same
+        # lie the 404 would have been, one layer down. So it is added here,
+        # per-action, rather than to the shared serializer: that would widen
+        # the signed-in feed contract to cover `PublicClipSerializer`'s
+        # unauthenticated surface too.
+        data['status'] = clip.status
+        return Response(data)
 
     @action(detail=True, methods=['get'], url_path='public', permission_classes=[permissions.AllowAny])
     def public_view(self, request, pk=None):

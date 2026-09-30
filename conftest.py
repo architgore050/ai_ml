@@ -17,10 +17,31 @@ from pathlib import Path
 
 # Set required env vars BEFORE django.setup() — settings.py reads them.
 os.environ.setdefault('DJANGO_SECRET_KEY', 'test-secret-key-not-for-prod')
-os.environ.setdefault('DJANGO_DEBUG', 'True')
 os.environ.setdefault('AWS_STORAGE_BUCKET_NAME', 'test-bucket')
 os.environ.setdefault('AWS_ACCESS_KEY_ID', 'test')
 os.environ.setdefault('AWS_SECRET_ACCESS_KEY', 'test')
+
+# ECHOFLOW_TESTING — the suite's opt-out from the production transport block in
+# settings.py (SECURE_SSL_REDIRECT, secure cookies, HSTS). Django's test client
+# drives the app over http://testserver/ with no X-Forwarded-Proto, so with
+# that block active every single request 301s.
+#
+# This used to be expressed as `os.environ.setdefault('DJANGO_DEBUG', 'True')`.
+# That stopped working the moment the container exported its own value:
+# setdefault() is a no-op when the key already exists, and
+# docker-compose.local.yml hardcoded DJANGO_DEBUG=True as an unoverridable
+# literal. The suite therefore only ran because of a literal in a compose file,
+# and it would have broken the next time that container was recreated. An
+# explicit flag cannot be set by accident and does not depend on which compose
+# invocation built the image.
+os.environ.setdefault('ECHOFLOW_TESTING', '1')
+
+# The narrow, documented placeholder-secret bypass (see EchoFlow/secrets.py).
+# The suite runs on the literal placeholder key above, so the startup guard
+# needs a reason to let it through. Using the dedicated flag rather than
+# DJANGO_DEBUG=true keeps the guard's blast radius explicit, and leaves
+# DJANGO_DEBUG reporting the container's real value.
+os.environ.setdefault('ECHOFLOW_ALLOW_PLACEHOLDER_SECRETS', '1')
 
 # RevenueCat test defaults (no real API calls in unit tests).
 os.environ.setdefault('REVENUECAT_SECRET_KEY', '')

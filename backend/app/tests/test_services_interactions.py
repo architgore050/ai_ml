@@ -464,11 +464,29 @@ class TestCompletionRateIsNotClientControlled:
         assert rate == pytest.approx(5_000 / 60_000)
 
     def test_listening_longer_than_the_clip_is_capped(self, user, ready_clip):
+        """A *small* over-run is still 1.0; a gross one is not a measurement.
+
+        Was: `listen_duration_ms=10_000_000` against a 60s clip asserted
+        1.0, because the old clamp was `min(listen, clip.duration_ms)` — so
+        the maximum of the 30% term was one oversized integer away. The
+        clamp is still right for a genuine over-run, which is what the first
+        half pins; the second half is the forged case now rejected outright
+        (see `test_ranking_exploit_cap.py::TestOverLongListenDurationIsRejected`
+        for the tolerance and the reasoning).
+        """
         rate = self._rate(
             user, ready_clip,
-            listen_duration_ms=10_000_000, reel_position_ms=10_000_000,
+            listen_duration_ms=60_000 + 5_000, reel_position_ms=60_000,
         )
-        assert rate == 1.0, "Watching past the end is legitimately 1.0, not more."
+        assert rate == 1.0, "Watching a few seconds past the end is 1.0, not more."
+
+        from backend.app.services.interactions import _completion_rate
+
+        assert _completion_rate(10_000_000, ready_clip) is None, (
+            "10,000,000ms of watch time on a 60s clip is a forged sample, not "
+            "a capped one; the clamp turned it into the best possible input "
+            "to the term"
+        )
 
     def test_the_divisor_is_the_clip_duration_not_the_request(self, user, ready_clip):
         """Directly: the same listen value scores differently on clips of

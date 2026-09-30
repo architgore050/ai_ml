@@ -55,15 +55,143 @@ The remaining IP-keyed limits on `/legal/`, `/grievance/` and
 `/data-subject/` are intentionally left alone: they are user-initiated,
 low-frequency, and low-volume, so sharing a bucket across a cell is correct
 behaviour there rather than a bug.
+
+
+THE SECOND, LARGER BUG: THE IDENTITY ITSELF WAS CALLER-CONTROLLED
+================================================================
+
+Everything above treats "the caller's IP" as a known quantity. It was not.
+
+`REST_FRAMEWORK['NUM_PROXIES']` was unset, so DRF's
+`BaseThrottle.get_ident` fell through to its documented default::
+
+    return ''.join(xff.split()) if xff else remote_addr
+
+— the *entire* client-supplied `X-Forwarded-For` header, whitespace
+stripped, verbatim, as the throttle identity. nginx does not overwrite that
+header, it appends::
+
+    proxy_set_header X-Real-IP       $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+so a client sending `X-Forwarded-For: 9.9.9.9` reaches DRF as the string
+`9.9.9.9,203.0.113.7`, and every distinct header value is a distinct,
+never-before-seen bucket. One header defeats every IP-keyed limit in the
+project — `login` (10/min, the credential-stuffing gate), `anon`
+(100/hour), `register` (200/hour), `clip_public` (120/min) — with no
+concurrency, no volume and no infrastructure pressure at all.
+
+The asymmetry that made this a security defect rather than an annoyance:
+`EchoFlow/client_ip.py` already resolved the caller *correctly* for the
+audit trail — DPDP §5(1) notice evidence and CERT-In identity retention —
+by preferring `X-Real-IP`, which nginx **overwrites** from `$remote_addr` and
+which therefore cannot be spoofed through the terminator. Evidence was
+attributed to the user while the limits protecting those same endpoints were
+keyed on a string the attacker picked.
+
+Two layers fix it, and both are needed:
+
+  1. `NUM_PROXIES = 1` in settings. There is exactly one nginx in front, so
+     DRF takes the `addrs[-1]` branch — the hop nginx appended. This is the
+     guaranteed backstop: it covers the views that declare a bare
+     `ScopedRateThrottle` or rely on the inherited `DEFAULT_THROTTLE_CLASSES`,
+     including the login view in `backend/app/urls.py`, which this file does
+     not control. It is one line and it is easy to delete by accident.
+
+  2. `TrustedProxyRateThrottle` below. It reuses the resolution the repo
+     already trusts, and — unlike layer 1 — validates each candidate through
+     `ipaddress.ip_address`, so a garbage `X-Real-IP` degrades to
+     `REMOTE_ADDR` instead of becoming a throttle key. Layer 1 alone would
+     happily key on `1.2.3.4; DROP TABLE`.
+
+The third fix here is fail-closed behaviour: a dead cache must produce 503,
+not 500. See `TrustedProxyRateThrottle.allow_request` and
+`backend/EchoFlow/exception_handlers.py`.
 """
 
+from django_redis.exceptions import ConnectionInterrupted
+from rest_framework import status
 from rest_framework.exceptions import APIException
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from backend.EchoFlow.client_ip import get_client_ip
 
-class RefreshTokenRateThrottle(ScopedRateThrottle):
+
+class ThrottleBackendUnavailable(APIException):
+    """503 raised when the throttle counter cannot be read.
+
+    A rate limiter that cannot read its counter has two honest options:
+    allow (fail-open, which silently deletes the limit for exactly as long as
+    the cache is down — the one window an attacker would pick) or reject
+    (fail-closed). This is fail-closed.
+
+    Deliberately *not* `Throttled`. A 429 tells the caller that they did
+    something wrong and that waiting will help; this says the server is
+    broken and the request is retryable. Conflating them pushes well-behaved
+    clients into giving up.
+    """
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    default_detail = (
+        "Service temporarily unavailable: the cache backend backing the rate "
+        "limiter is not reachable. This is a server-side fault — retry "
+        "shortly."
+    )
+    default_code = "throttle_backend_unavailable"
+
+
+class TrustedProxyRateThrottle(ScopedRateThrottle):
+    """`ScopedRateThrottle` whose identity comes from a trusted header.
+
+    The only override is `get_ident`, and it delegates to
+    `EchoFlow.client_ip.get_client_ip` — the *same* function the audit trail
+    uses. One resolver, one set of precedence rules, one thing to keep
+    correct. Do not re-derive the precedence here; `client_ip.py` carries the
+    reasoning about which of `X-Real-IP` / `REMOTE_ADDR` /
+    `X-Forwarded-For` can be trusted and why.
+
+    Subclass this rather than `ScopedRateThrottle` for any throttle that keys
+    on the caller. `NUM_PROXIES` in settings is the backstop, not the fix:
+    it is a count that silently re-breaks the moment a second proxy is added
+    in front, it validates nothing, and it only reads `X-Forwarded-For`.
+    """
+
+    def get_ident(self, request):
+        """Return the caller's address, or '' when it cannot be resolved.
+
+        '' rather than `None` because DRF interpolates the result straight
+        into `cache_format % {...}`; `None` would raise `TypeError` from
+        inside the throttle and turn a request into a 500.
+        """
+        return get_client_ip(request) or ""
+
+    def allow_request(self, request, view):
+        """Fail closed with 503 when the throttle counter is unreadable.
+
+        `SimpleRateThrottle.allow_request` reads `self.cache.get(self.key,
+        [])`. A stale `django-redis` connection raises
+        `ConnectionInterrupted` there, which subclasses bare `Exception` —
+        so DRF's `exception_handler` returns `None`, the exception is
+        re-raised and the client sees a 500.
+
+        This override is the version that does not depend on
+        `REST_FRAMEWORK['EXCEPTION_HANDLER']` being installed, so the two
+        custom throttles stay correct on their own. The global handler covers
+        the views that declare a bare `ScopedRateThrottle`; together they
+        leave no unprotected path. `ConnectionInterrupted` is the exact class
+        django-redis raises (it re-raises it around every command in
+        `django_redis/client/default.py`), so catching it catches all of
+        them without also swallowing genuine bugs.
+        """
+        try:
+            return super().allow_request(request, view)
+        except ConnectionInterrupted:
+            raise ThrottleBackendUnavailable() from None
+
+
+class RefreshTokenRateThrottle(TrustedProxyRateThrottle):
     """Scope-addressed throttle that prefers the token's subject over the IP.
 
     Registered as scope `token_refresh`; the rate lives in
@@ -82,9 +210,15 @@ class RefreshTokenRateThrottle(ScopedRateThrottle):
         """Bucket by verified user id, falling back to the caller's IP.
 
         `ScopedRateThrottle.cache_format` is
-        `'throttle_{scope}_{ident}'`, and `get_ident()` resolves the client
-        address the same way `AnonRateThrottle` does, so the fallback path
-        is byte-identical to the behaviour it replaces.
+        `'throttle_{scope}_{ident}'`. The fallback identity comes from
+        `TrustedProxyRateThrottle.get_ident`, i.e.
+        `EchoFlow.client_ip.get_client_ip` — NOT from DRF's default, which
+        would return the client-supplied `X-Forwarded-For` header verbatim and
+        let the caller rotate their own bucket one header per request.
+
+        The per-subject key is unchanged and is the whole point of this class:
+        it is what keeps ~4 refreshes/hour/subscriber off a single carrier
+        NAT bucket. Do not "simplify" this into an IP key.
         """
         user_id = self._resolve_user_id(request)
         if user_id is not None:
@@ -148,7 +282,7 @@ class RefreshTokenRateThrottle(ScopedRateThrottle):
         return None
 
 
-class RegisterUsernameRateThrottle(ScopedRateThrottle):
+class RegisterUsernameRateThrottle(TrustedProxyRateThrottle):
     """Scope-addressed throttle keyed on the username being registered.
 
     Runs alongside the per-IP `register` limit rather than replacing it.

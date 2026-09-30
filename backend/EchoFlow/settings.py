@@ -15,11 +15,35 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # key per process would silently break session/CSRF/signature
 # verification across the gunicorn + Celery fleet — every worker would
 # have a different key.
+#
+# DECISION (placeholder guard): also fail on a *documentation* placeholder.
+# `if not SECRET_KEY` only catches the empty string, and every tracked env
+# template ships `DJANGO_SECRET_KEY=change-me-to-a-long-random-string`
+# (.env.example, .env.vps.example) or `<same-as-vps>` (.env.laptop.example).
+# An operator who copies an example and deploys it unchanged gets a key that
+# is public knowledge in this repository, which breaks session and CSRF
+# signing, password-reset tokens, and every `django.core.signing.Signer` use.
+#
+# The predicate and the escape hatch live in `EchoFlow/secrets.py` so that
+# `app/services/hls_token.py` and this module share one vocabulary instead of
+# one importing the other. See that module's docstring for the two documented
+# bypasses (`ECHOFLOW_ALLOW_PLACEHOLDER_SECRETS=1` and `DJANGO_DEBUG=true`)
+# and for the false positives the substring rule accepts on purpose.
+from backend.EchoFlow.secrets import require_real_secret, testing_enabled
+
 SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY')
 if not SECRET_KEY:
     raise ImproperlyConfigured(
         "DJANGO_SECRET_KEY is not set. Application cannot start without it."
     )
+SECRET_KEY = require_real_secret(
+    "DJANGO_SECRET_KEY",
+    SECRET_KEY,
+    purpose="Django's signing key (sessions, CSRF, password resets)",
+    generate=(
+        'python -c "import secrets; print(secrets.token_urlsafe(64))"'
+    ),
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DJANGO_DEBUG', 'False').lower() == 'true'
@@ -271,13 +295,69 @@ REDIS_URL = os.getenv("REDIS_URL", REDIS_URL_DEFAULT)
 
 # Build Redis URL from components if full URL not provided
 def build_redis_url(prefix: str) -> str:
-    """Build Redis URL from individual components."""
+    """Build Redis URL from individual components.
+
+    Components exist at all because Redis passwords in this repo are base64
+    and contain `+`, `/` and `=`, which break Kombo's URL parsing. So
+    `{prefix}_HOST` / `_PORT` / `_PASSWORD` are the compose-managed form and
+    the URL is assembled (and password-encoded) here.
+
+    DECISION (fail closed on a missing credential): the old code was
+
+        if host and password:
+            return f"redis://:{quote(password)}@{host}:{port}/0"
+        return REDIS_URL
+
+    so `HOST` set with a blank `PASSWORD` silently returned `REDIS_URL` —
+    whose default is the *unauthenticated* `redis://localhost:6379/1`. That
+    is a fail-open on a credential: no log, no warning, and it lands on a
+    different server than the one that was configured. A known password is
+    better than no password and an operator error, so this now raises.
+
+    The legitimate password-less case — neither `HOST` nor `PASSWORD` set,
+    which is bare-metal `redis-server` on localhost — is untouched and still
+    falls back to `REDIS_URL`.
+    """
+    from urllib.parse import quote
+
     host = os.getenv(f"{prefix}_HOST")
     port = os.getenv(f"{prefix}_PORT", "6379")
-    password = os.getenv(f"{prefix}_PASSWORD")
+    # `not password` misses whitespace-only, which is truthy and would produce
+    # a URL with an empty credential — a silent fail-open again.
+    password = (os.getenv(f"{prefix}_PASSWORD") or "").strip()
+    if host and not password:
+        raise ImproperlyConfigured(
+            f"{prefix}_HOST is set to {host!r} but {prefix}_PASSWORD is empty. "
+            f"Refusing to fall back to REDIS_URL ({REDIS_URL!r}), which is "
+            f"usually an unauthenticated local Redis: that would be a "
+            f"fail-open on a credential — silent, and pointed at a different "
+            f"server than the one you configured. Either set {prefix}_PASSWORD "
+            f"to the value in the Redis service's config, or unset "
+            f"{prefix}_HOST as well to use the single-Redis REDIS_URL form "
+            f"for non-Docker development."
+        )
     if host and password:
+        # DECISION (placeholder guard): a non-empty password is not
+        # automatically a real one. `.env.vps.example` ships
+        # `REDIS_BROKER_PASSWORD=change-me-strong-password` and
+        # `.env.laptop.example` ships `<same-as-vps>` for both, so a copied
+        # template would otherwise give anyone who has read this repository
+        # full access to the broker (arbitrary task injection) and the cache.
+        # Reusing `require_real_secret` keeps one vocabulary across
+        # DJANGO_SECRET_KEY, MEDIA_TOKEN_SECRET and these two.
+        password = require_real_secret(
+            f"{prefix}_PASSWORD",
+            password,
+            purpose=(
+                f"the {prefix.lower()} Redis service (task injection and "
+                f"cache/session contents)"
+            ),
+            generate=(
+                f"python -c \"import secrets; "
+                f"print(secrets.token_urlsafe(32))\""
+            ),
+        )
         # URL-encode the password to handle special characters
-        from urllib.parse import quote
         encoded_password = quote(password, safe='')
         return f"redis://:{encoded_password}@{host}:{port}/0"
     return REDIS_URL
@@ -739,6 +819,52 @@ AUTH_USER_MODEL = 'app.User' # for Custom user model
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 REST_FRAMEWORK = {
+    # SECURITY (identity, not rate): how many proxies sit in front of Django.
+    #
+    # Unset (None) makes `BaseThrottle.get_ident` fall through to
+    # `''.join(xff.split()) if xff else remote_addr` — the *whole*
+    # client-supplied X-Forwarded-For header as the throttle identity. nginx
+    # APPENDS to that header (`$proxy_add_x_forwarded_for`), so a client
+    # sending `X-Forwarded-For: 9.9.9.9` reaches DRF as `9.9.9.9,<real-ip>`
+    # and every distinct value is a brand-new, never-before-seen bucket. One
+    # header defeated every IP-keyed limit here (login 10/min, anon
+    # 100/hour, register 200/hour, clip_public 120/min) with no volume and no
+    # infrastructure pressure. Measured, not theorised: the pre-fix key for
+    # the login endpoint was literally `throttle_login_9.9.9.9,203.0.113.7`.
+    #
+    # 1 is correct: there is exactly one nginx in front
+    # (docs/EXPLAIN/docker/05-https-tls-termination.md), and with
+    # `num_proxies == 1` DRF takes the `addrs[-min(1, len(addrs))]` branch,
+    # i.e. the LAST hop — the one nginx appended from `$remote_addr`. The
+    # earlier entries are whatever the client sent and are never consulted.
+    #
+    # This is the *backstop*, not the complete fix. It only reads
+    # X-Forwarded-For, it validates nothing, and it silently re-breaks if a
+    # second proxy is ever placed in front. `backend.app.throttling.
+    # TrustedProxyRateThrottle` resolves the identity through
+    # `EchoFlow.client_ip.get_client_ip` instead (X-Real-IP first, which nginx
+    # overwrites and which therefore cannot be spoofed through the
+    # terminator, each candidate validated as a real IP). Prefer it for any
+    # new throttle.
+    #
+    # If a second proxy is added, this must become 2. Nothing errors if it
+    # does not — the bypass just quietly returns.
+    'NUM_PROXIES': 1,
+    # SECURITY: a dead cache must not be a 500.
+    #
+    # `django_redis` raises `ConnectionInterrupted`, which subclasses bare
+    # `Exception` and not `APIException`, so DRF's default handler returns
+    # None, the exception is re-raised, and every throttled endpoint (and
+    # anything else that reads the cache) answers 500 — a full traceback page
+    # when DJANGO_DEBUG=True. 503 is honest and retryable; 500 tells the
+    # client the request is broken, and fail-*open* (allow) would delete the
+    # rate limit for exactly as long as the outage lasts. The handler
+    # delegates every non-Redis exception to DRF's own, unchanged.
+    #
+    # `backend.app.throttling.TrustedProxyRateThrottle.allow_request` raises
+    # the same 503 independently, so the two custom throttles do not depend on
+    # this key being present.
+    'EXCEPTION_HANDLER': 'backend.EchoFlow.exception_handlers.cache_unavailable_handler',
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ],
@@ -894,7 +1020,30 @@ LOGGING = {
 # Wrapped in `if not DEBUG:` so the dev server (HTTP) keeps working.
 # In any environment that terminates TLS (Traefik / nginx / CloudFront),
 # SECURE_PROXY_SSL_HEADER is required or SECURE_SSL_REDIRECT will loop.
-if not DEBUG:
+#
+# ECHOFLOW_TESTING is a THIRD, independent reason to skip this block, and it
+# exists because relying on `DJANGO_DEBUG=True` here stopped being reliable.
+# `docker-compose.local.yml` used to hardcode `DJANGO_DEBUG=True` as a
+# literal, and `conftest.py` sets it with `os.environ.setdefault` — which is a
+# no-op the moment the container already exports a value. So the suite's
+# ability to run depended on an unoverridable literal in a compose file. That
+# literal is now `${DJANGO_DEBUG:-False}`, and once the container is recreated
+# the suite would come up with DEBUG=False and `SECURE_SSL_REDIRECT=True`,
+# 301-ing every request Django's test client makes to `http://testserver/`
+# (the client sends no `X-Forwarded-Proto`).
+#
+# Gating on an explicit flag rather than on DEBUG also stops the suite from
+# lying about the environment: DEBUG now reflects the real container value, so
+# the settings in this block are exercised where they are meant to be.
+#
+# The test detection is `EchoFlow.secrets.testing_enabled`, not a bare env-var
+# read here, for a timing reason that is easy to get wrong: pytest-django calls
+# django.setup() while loading initial conftests, which is BEFORE the rootdir
+# conftest.py module body runs. So an env var that conftest.py sets is not yet
+# in os.environ at the moment this line executes. `testing_enabled()` also
+# recognises pytest itself, which is imported strictly earlier.
+_ECHOfLOW_TESTING = testing_enabled()
+if not DEBUG and not _ECHOfLOW_TESTING:
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
     SESSION_COOKIE_SAMESITE = 'Lax'

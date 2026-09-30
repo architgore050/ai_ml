@@ -43,16 +43,31 @@ Finding 2 — post-approval PATCH could rewrite the rights record
 already `moderation_approved=True` and `status='ready'`, and the update resets
 neither flag nor re-runs moderation.
 
-`license_type` is the sharp edge, but **not for the reason the finding
-assumed**: it does *not* drive `is_noncommercial` / `requires_share_alike`.
-Those are separate columns that only the scraper writes and that
-`AudioUploadSerializer` does not even expose — pinned by
-`TestPostApprovalPatch::test_the_rights_flags_are_not_writable_through_the_api`.
-So a PATCH cannot open the redistribution gate at all. What it *can* do is
-silently rewrite the declared licence and attribution of content a moderator
-already ruled on, which is an audit-integrity problem, not a
-redistribution bypass. The policy and the argument are in
-`AudioUploadViewSet.update`; the tests pin the behaviour.
+`license_type` was originally believed to be the harmless one — it did *not*
+drive `is_noncommercial` / `requires_share_alike`, which were separate columns
+only the scraper wrote, and a PATCH therefore could not open the
+redistribution gate at all. What it *could* do was silently rewrite the
+declared licence and attribution of content a moderator had already ruled on:
+an audit-integrity problem, not a bypass.
+
+**That premise is now void.** `AudioUploadSerializer.create` derives both
+flags from the validated `license_type` and freezes them there
+(`serializers.py:538-543`), because `services.entitlements.is_license_restricted`
+is a two-boolean predicate and those two columns are the only rights gate in
+the platform. So the declaration is load-bearing from the moment the row
+exists, and "freeze the rights record after approval" is no longer sufficient:
+the window between upload and approval is exactly where a relabel would make
+the declared licence contradict the frozen flags.
+
+The label is therefore refused on **every** clip now, approved or not
+(`CREATE_TIME_IMMUTABLE_FIELDS`, `content.py:240`, called at `:268` ahead of
+the post-approval guard precisely so it covers both). The inversion is worth
+stating: a PATCH still cannot open the redistribution gate, but not because
+the label is inert — because the label is immutable, and that immutability is
+the only thing keeping it in agreement with the flags it decided.
+`TestLicenseDerivationAtCreate` pins the derivation this rests on. The policy
+and the argument are in `AudioUploadViewSet.update`; the tests pin the
+behaviour.
 
 Finding 3 — `POST /clips/{id}/report/` was an unscoped existence oracle
 -----------------------------------------------------------------------
@@ -506,17 +521,40 @@ class TestPostApprovalPatch:
         clip.refresh_from_db()
         assert clip.title == "Rain on a window"
 
-    def test_a_licence_change_on_an_unapproved_clip_still_works(self, owner):
-        """Nothing has been moderated yet, so there is no approved rights
-        record to contradict and no reason to refuse."""
+    def test_a_licence_change_on_an_unapproved_clip_is_refused(self, owner):
+        """The pre-approval window is not an escape hatch.
+
+        This is the assertion that had to change, so it is worth saying what
+        it used to require and why that was wrong. The previous version
+        demanded 200, on the premise that "nothing has been moderated yet, so
+        there is no approved rights record to contradict". But
+        `AudioUploadSerializer.create` derives `is_noncommercial` /
+        `requires_share_alike` from the declared licence and freezes them
+        (`serializers.py:538-543`), so an *unapproved* row already carries an
+        enforced rights record. Relabel in this window and the two diverge
+        before the clip has been moderated even once:
+
+            upload  license_type="CC-BY-NC"  -> (True, False)
+            PATCH   license_type="Owned"     -> record says Owned, flags say NC
+
+        `is_license_restricted` reads the flags, so that divergence is
+        invisible to the gate and visible to every human check, operator screen
+        and legal disclosure that reads the declaration. Freezing at create
+        (`content.py:240`) is what closes it — and it is why
+        `_refuse_licence_relabel` runs *before* the post-approval guard rather
+        than inside it.
+        """
         clip = make_clip(
             owner, moderation_approved=False, license_type="Unknown"
         )
-        assert patch_clip(
-            owner, clip, license_type="Owned"
-        ).status_code == 200
+        response = patch_clip(owner, clip, license_type="Owned")
+        assert response.status_code == 409, (
+            "a licence relabeled before approval leaves the declared licence "
+            "contradicting the flags create() froze from the old one"
+        )
+        assert "license_type" in response.json()["immutable_fields"]
         clip.refresh_from_db()
-        assert clip.license_type == "Owned"
+        assert clip.license_type == "Unknown"
 
     def test_an_unapproved_clip_can_still_be_edited_and_titled(self, owner):
         clip = make_clip(owner, moderation_approved=False)
@@ -525,13 +563,25 @@ class TestPostApprovalPatch:
         assert clip.title == "Pre-approval edit"
 
     def test_the_rights_flags_are_not_writable_through_the_api(self, owner):
-        """The finding assumed `license_type` drives `is_noncommercial`. It
-        does not. `is_noncommercial` / `requires_share_alike` are separate
-        columns, absent from `AudioUploadSerializer.Meta.fields`, written only
-        by the scraper uploader. So PATCH cannot open the redistribution gate
-        at all — which is the real protection, and it is worth pinning,
-        because a future 'helpful' addition of these two to the serializer
-        would be the actual vulnerability."""
+        """Still the protection it was written to pin, but it no longer
+        holds for the reason originally given.
+
+        The old docstring asserted these flags were "written only by the
+        scraper uploader" and therefore inert for API clients. That premise is
+        void: `AudioUploadSerializer.create` derives both from `license_type`
+        (`serializers.py:538-543`), so an API-created clip does carry a real
+        rights record. What the assertion is actually pinning is the part that
+        survived — `AudioUploadSerializer.Meta.fields` still does not list
+        either flag, so a client cannot write them, and the derivation is
+        *assigned* rather than `setdefault`ed, so it cannot be overridden even
+        if a field appeared.
+
+        Worth keeping for that reason: `create()` now touches both columns, so
+        adding them to `Meta.fields` is more tempting than it was, and the
+        damage would be invisible — a `setdefault` anywhere in that path would
+        let a client clear a real restriction. `TestLicenseDerivationAtCreate`
+        covers the derivation this test's silence depends on.
+        """
         clip = make_clip(owner, license_type="CC-BY")
         response = authed(owner).patch(
             f"/clips/{clip.id}/",
@@ -611,6 +661,91 @@ class TestPostApprovalPatch:
             f"/clips/{clip.id}/"
         ).status_code == 404
         assert authed(owner).get(f"/clips/{clip.id}/").status_code == 200
+
+
+class TestLicenseDerivationAtCreate:
+    """The premise Finding 2's licence freeze now rests on.
+
+    `TestPostApprovalPatch` asserts a PATCH cannot move the rights flags. That
+    assertion only means something if something *set* them, and the something
+    is `AudioUploadSerializer.create` deriving them from `license_type`. Every
+    other clip in this file is built by `make_clip`, which writes the ORM
+    directly and so never exercises the derivation — this class is the only
+    place here that goes through `POST /clips/`.
+
+    One case on purpose: the one that contradicts what this file used to
+    assume. The old premise was that an API-created clip's flags were always
+    False, and `test_the_rights_flags_are_not_writable_through_the_api` was
+    written to demonstrate it. A client-declared `CC-BY-NC` is
+    non-commercial **from row one**. Full per-licence coverage lives in
+    `test_upload_license_derivation.py`; what is load-bearing here is that the
+    two facts this file tests — frozen flags, immutable label — describe the
+    same row and agree about it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_object_storage(self, settings):
+        """`POST /clips/` writes the original file. Keep it in memory so this
+        test cannot fail on a MinIO outage, which would be a failure in a file
+        that is otherwise storage-free and would read as a policy regression.
+        Overriding `STORAGES` (rather than patching a `default_storage` name)
+        is what covers the save: Django's `storages_changed` receiver clears
+        `default_storage._wrapped`, so `super().create()` lands here.
+        """
+        settings.STORAGES = {
+            **settings.STORAGES,
+            "default": {"BACKEND": "django.core.files.storage.InMemoryStorage"},
+        }
+
+    def test_a_declared_nc_upload_is_restricted_before_any_moderation(
+        self, owner
+    ):
+        import io
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        from pydub import AudioSegment
+
+        # A genuinely decodable 1-second WAV. A hand-rolled RIFF header would
+        # make the serializer's duration probe behave for a reason unrelated
+        # to the licence under test.
+        buf = io.BytesIO()
+        AudioSegment.silent(duration=1000, frame_rate=44100).export(
+            buf, format="wav"
+        )
+        response = authed(owner).post(
+            "/clips/",
+            {
+                "title": "A declared NonCommercial clip",
+                "category": "music",
+                "license_type": "CC-BY-NC",
+                "original_file": SimpleUploadedFile(
+                    "tone.wav", buf.getvalue(), content_type="audio/wav"
+                ),
+                "copyright_acknowledgement": "true",
+            },
+            format="multipart",
+        )
+        assert response.status_code == 202, response.content
+        clip = AudioClip.objects.get(id=response.json()["clip_id"])
+        assert (clip.is_noncommercial, clip.requires_share_alike) == (
+            True,
+            False,
+        ), "the declared licence did not become the enforced one"
+
+        # Unapproved at create — `finalize_upload` forces
+        # `moderation_approved=False` — so these flags are the *only* rights
+        # record the row has. There is no approved declaration to fall back
+        # on, which is exactly why the label has to be frozen here too.
+        assert clip.moderation_approved is False
+
+        # And the two stay in agreement: the label cannot be swapped out from
+        # under the flags it produced. Without this the row would read
+        # "Owned" to every human check while `is_license_restricted` still
+        # withheld it from the feed.
+        assert patch_clip(owner, clip, license_type="Owned").status_code == 409
+        clip.refresh_from_db()
+        assert clip.license_type == "CC-BY-NC"
+        assert clip.is_noncommercial is True
 
 
 # ---------------------------------------------------------------------------

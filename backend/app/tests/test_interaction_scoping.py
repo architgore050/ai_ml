@@ -170,10 +170,25 @@ def sa_clip(author):
 # Request payloads
 # ---------------------------------------------------------------------------
 def _skip_payload(**overrides):
-    """The finding's payload: a completion-rate-maxing listen claim."""
+    """A completion-rate-maxing listen claim that is still *credible*.
+
+    `servable_clip` is 30s (`_make_clip`), so "listened to the whole clip"
+    is `listen_duration_ms == reel_position_ms == 30_000`, which
+    `_completion_rate` scores 1.0 — the maximum the 30% term can take.
+
+    The payload used to be `listen_duration_ms=99_999, reel_position_ms=1`,
+    i.e. 3.3 minutes of watch time on a 30-second clip, and it scored 1.0
+    only because the old clamp was `min(listen, clip.duration_ms)`.
+    `_completion_rate` now rejects a claim that overshoots the clip by more
+    than a small tolerance band, so that payload no longer records a
+    completion sample at all. The value 1.0 is unchanged, so the damage
+    arithmetic in the positive control below is untouched — only the
+    plausibility of the input is. See
+    `test_ranking_exploit_cap.py::TestOverLongListenDurationIsRejected`.
+    """
     body = {
-        "listen_duration_ms": 99_999,
-        "reel_position_ms": 1,
+        "listen_duration_ms": 30_000,
+        "reel_position_ms": 30_000,
         "reel_id": str(uuid.uuid4()),
     }
     body.update(overrides)
@@ -380,8 +395,9 @@ class TestServableClipStaysInteractable:
         assert state["skips"] == 1
         # One sample of 1.0, blended against the stored prior with weight 10
         # (tasks.py:_COMPLETION_PRIOR_WEIGHT): (0.0 * 10 + 1.0) / 11.
-        # The sample is 1.0 and not 99999/1 because `_completion_rate` divides
-        # by the server-side clip.duration_ms (commit 20f6e7e).
+        # The sample is 1.0 because `_skip_payload()` claims a full listen of
+        # a 30s clip and `_completion_rate` divides by the server-side
+        # clip.duration_ms (commit 20f6e7e), not by the request.
         assert state["avg_completion_rate"] == pytest.approx(1.0 / 11)
         assert UserInteraction.objects.filter(
             user=attacker, clip=servable_clip, interaction_type="view",

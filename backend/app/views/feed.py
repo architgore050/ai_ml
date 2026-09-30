@@ -103,15 +103,59 @@ class FastFeedViewSet(viewsets.ViewSet):
             queue_length = redis_client.llen(redis_key)
 
             preserved_order = Case(*[When(pk=pk, then=pos) for pos, pk in enumerate(clip_ids)])
+            # SECURITY: `is_active=True` is load-bearing, not decoration.
+            # `record_like_toggle` (services/interactions.py:144-149) does NOT
+            # delete the row on un-like — it flips `is_active=False` in place.
+            # A subquery without that clause therefore matches the very row
+            # that records the un-like, and `/feed/` rendered a filled heart
+            # for every clip the user had explicitly un-liked. The same user
+            # got the correct answer from `/profile/{id}/clips/`
+            # (profile.py:64, which had the clause), so the two screens
+            # contradicted each other on the main screen of the app.
+            #
+            # `FeedClipSerializer.get_is_liked` returns the annotation
+            # verbatim when it is present, so this subquery — not the
+            # serializer's own correct fallback query — is what the user sees.
             user_like_subquery = UserInteraction.objects.filter(
-                clip=OuterRef('pk'), user=request.user, interaction_type='like'
+                clip=OuterRef('pk'), user=request.user,
+                interaction_type='like', is_active=True,
             )
             clips = (
                 AudioClip.objects
                 .filter(id__in=clip_ids, moderation_approved=True)
+                # `status='ready'` — the primary path was the only clip-
+                # listing query in the codebase without it (the degraded
+                # fallback below, `/suggestions/`, `/profile/{id}/clips/`
+                # and `send_share` all had it), so a clip id still in the
+                # Redis queue was served while it was still encoding.
+                #
+                # Defence in depth, honestly labelled: no production path
+                # moves a clip off 'ready' once it is ready
+                # (`cleanup_stuck_processing` only goes processing->failed)
+                # and moderation revocation is filtered separately. But a
+                # clip with `status='ready'` and an empty
+                # `hls_playlist_url` IS constructible
+                # (test_content_moderation.py:204), and the feed is the
+                # only place a caller learns a clip id is in the queue.
+                #
+                # NOT A SUBSTITUTE, EITHER WAY: `status='ready'` is not a
+                # substitute for `moderation_approved=True`, and
+                # `moderation_approved=True` is not a substitute for
+                # `status='ready'` — `process_audio_to_hls` sets
+                # status='ready' *after* the worker-side moderation check,
+                # so a task retry can leave a clip ready while
+                # moderation_approved reads False. The two flags are
+                # independent; both are required. (views/profile.py:76-79
+                # carries the same reasoning; read it before touching this.)
+                #
+                # The clause is ADDED to the existing chain, not swapped into
+                # it: `moderation_approved=True` above and the NC/SA filter
+                # below are unchanged.
+                #
                 # SECURITY: Exclude NC + SA items from user feeds. NC items
                 # are filtered at runtime via SCRAPER_ALLOW_NC; SA items are
                 # operator-gated via /clips/{id}/approve-moderation/.
+                .filter(status='ready')
                 .filter(is_noncommercial=False, requires_share_alike=False)
                 .annotate(user_has_liked=Exists(user_like_subquery))
                 # B2: one annotation for the whole page instead of one
@@ -136,8 +180,13 @@ class FastFeedViewSet(viewsets.ViewSet):
                 # SECURITY: Same NC + SA exclusion as primary feed path.
                 .filter(is_noncommercial=False, requires_share_alike=False)
                 .annotate(user_has_liked=Exists(
+                    # Same `is_active=True` requirement as the primary path
+                    # above — see the reasoning there. Copying the omission
+                    # into the fallback is how the two halves of one screen
+                    # came to disagree.
                     UserInteraction.objects.filter(
-                        clip=OuterRef('pk'), user=request.user, interaction_type='like'
+                        clip=OuterRef('pk'), user=request.user,
+                        interaction_type='like', is_active=True,
                     )
                 ))
                 # B2, same annotation as the primary path.
@@ -221,8 +270,13 @@ class SuggestionViewSet(viewsets.ReadOnlyModelViewSet):
                 timer.set_outcome('fallback')
                 queryset = queryset.order_by('-engagement_velocity', '-created_at')
 
+        # `is_active=True` is required for the same reason as in
+        # FastFeedViewSet: un-like flips the flag rather than deleting the
+        # row, so without the clause every un-liked clip reads as liked on
+        # the Explore page too.
         user_like_subquery = UserInteraction.objects.filter(
-            clip=OuterRef('pk'), user=user, interaction_type='like'
+            clip=OuterRef('pk'), user=user,
+            interaction_type='like', is_active=True,
         )
         return queryset.annotate(
             user_has_liked=Exists(user_like_subquery),

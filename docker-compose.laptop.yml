@@ -11,6 +11,13 @@
 #
 # Usage:
 #   docker compose -f docker-compose.laptop.yml up -d
+#
+# DATABASE_URL is BUILT from DB_USER/DB_PASSWORD/DB_HOST/DB_PORT/DB_NAME, not
+# passed through from .env.laptop. It used to be `- DATABASE_URL=${DATABASE_URL}`,
+# which required the operator to hand-maintain a full URL containing the VPS
+# database password *in addition to* the DB_PASSWORD value — two copies that
+# could diverge silently. docker compose does not expand ${...} inside an env
+# file, so the URL must be assembled here, in `environment:`.
 # =============================================================================
 
 services:
@@ -37,7 +44,7 @@ services:
           cpus: '2'
           memory: 2G
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_BROKER_URL=${REDIS_BROKER_URL}
       - REDIS_CACHE_URL=${REDIS_CACHE_URL}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}

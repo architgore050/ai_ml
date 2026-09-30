@@ -10,6 +10,14 @@
 # Key changes from docker-compose.yml:
 #   - Removed: pgbouncer, minio, minio-init, celery_media, prometheus, grafana
 #   - DATABASE_URL points directly to db:5432 (no pgbouncer)
+#   - DATABASE_URL is BUILT from DB_USER/DB_PASSWORD/DB_HOST/DB_PORT/DB_NAME,
+#     not passed through from the env file. It used to be
+#     `- DATABASE_URL=${DATABASE_URL}`, which required the operator to
+#     hand-maintain a full URL in .env *in addition to* the four DB_* values
+#     the db/redis services already read — two copies of the password that
+#     could diverge silently. docker compose does not expand ${...} inside an
+#     env file, so the URL has to be assembled here, in `environment:`, exactly
+#     as docker-compose.yml and docker-compose.local.yml already do.
 #   - AWS_S3_ENDPOINT_URL points to Cloudflare R2 (not MinIO)
 #   - nginx ports: only :80 and :443 (no :9443)
 #   - Custom docker network with fixed IPs for Tailscale subnet router
@@ -121,7 +129,7 @@ services:
     env_file:
       - .env
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_BROKER_URL=${REDIS_BROKER_URL:-redis://redis_broker:6379/0}
       - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis_cache:6379/0}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
@@ -219,7 +227,7 @@ services:
       start_period: 30s
       retries: 3
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_BROKER_URL=${REDIS_BROKER_URL:-redis://redis_broker:6379/0}
       - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis_cache:6379/0}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
@@ -271,7 +279,7 @@ services:
       start_period: 30s
       retries: 3
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_BROKER_URL=${REDIS_BROKER_URL:-redis://redis_broker:6379/0}
       - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis_cache:6379/0}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
@@ -321,7 +329,7 @@ services:
     env_file:
       - .env
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_BROKER_URL=${REDIS_BROKER_URL:-redis://redis_broker:6379/0}
       - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis_cache:6379/0}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}

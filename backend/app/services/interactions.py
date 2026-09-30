@@ -164,27 +164,64 @@ def record_like_toggle(user, clip: AudioClip) -> tuple[UserInteraction, bool]:
     return interaction, created
 
 
-def _completion_rate(listen_duration_ms: int, clip: AudioClip) -> float:
-    """Fraction of the clip actually listened to, in [0, 1].
+#: Over-report tolerance, as a fixed number of milliseconds plus a fraction of
+#: the clip's own duration, applied to `listen_duration_ms` / `watch_time_ms`.
+#:
+#: A claim that exceeds the clip's recorded duration by more than this is not
+#: a rounding artefact. `duration_ms` is written by `process_audio_to_hls` from
+#: the probed media and floored to whole milliseconds, so it can be a few ms
+#: short of the real asset, and a client reporting `currentTime * 1000` at
+#: end-of-clip can land a frame or two past it. Nothing credible produces a
+#: multiple of the clip's own length.
+_OVERCLAIM_TOLERANCE_MS = 2_000
+_OVERCLAIM_TOLERANCE_RATIO = 0.10
+
+#: Divisor used when the clip has no server-side duration. `AudioClip.duration_ms`
+#: is `IntegerField(default=0)` and is 0 between upload and HLS processing, and
+#: permanently 0 for any clip that did not come from `process_audio_to_hls`.
+#: Both interaction paths use this, so a zero-duration clip scores on the same
+#: scale as any other — see `_completion_rate`.
+_ZERO_DURATION_FALLBACK_MS = 60_000
+
+
+def _completion_rate(listen_duration_ms: int, clip: AudioClip) -> float | None:
+    """Fraction of the clip actually listened to, in [0, 1], or None.
+
+    `None` means *do not record a completion sample for this request*: the
+    client claimed to have listened for longer than the clip exists, by more
+    than the tolerance above, so the claim is not a measurement. See the
+    "SECURITY" block in `record_skip` for why the honest response to that is
+    to drop the sample rather than score it.
 
     The denominator is `clip.duration_ms` — server state. The numerator is
     still client-supplied, because the only true measure of watch time lives
     in the player; the client-side fix (measure elapsed playback, not media
-    position) is tracked separately. Clamping the numerator to the clip
-    duration means a client that reports listening longer than the clip is
-    long is capped at 1.0 rather than producing a rate the `min()` would
-    have produced anyway.
+    position) is tracked separately.
 
-    Falls back to the reported position when `duration_ms` is unset. That is
-    weaker than the clip duration but strictly better than a constant, and a
-    clip with no recorded duration has no server-side answer available.
+    The one caller-visible change from the previous implementation is that an
+    *unbounded* numerator is no longer silently turned into a perfect score.
+    Clamping to the clip duration is still right for a small over-run (a real
+    client that watched to the end is 1.0), but
+    `listen_duration_ms=10_000_000` against a 60s clip is not an over-run, it
+    is a forged 1.0 — and 1.0 is the best possible input to the 30% term.
+
+    Falls back to `60_000` when `duration_ms` is unset. That is weaker than
+    the clip duration but strictly better than a constant, and a clip with no
+    recorded duration has no server-side answer available. It is deliberately
+    the *same* fallback on both interaction paths: `record_telemetry` used to
+    do its own `max(clip.duration_ms, 1)` arithmetic, under which 1ms of
+    reported watch time on a zero-duration clip scored a perfect 1.0.
     """
     expected_duration = clip.duration_ms or 0
     if expected_duration <= 0:
-        # No server-side duration to divide by. `reel_position_ms` is not
-        # passed in here; callers that have a real duration use it.
-        expected_duration = 60_000
-    listened = max(0, min(int(listen_duration_ms or 0), expected_duration))
+        expected_duration = _ZERO_DURATION_FALLBACK_MS
+    listened = max(0, int(listen_duration_ms or 0))
+    tolerance = max(
+        _OVERCLAIM_TOLERANCE_MS,
+        int(expected_duration * _OVERCLAIM_TOLERANCE_RATIO),
+    )
+    if listened > expected_duration + tolerance:
+        return None
     return min(listened / expected_duration, 1.0)
 
 
@@ -229,13 +266,37 @@ def record_skip(
     (`feed_pool.py:152`, `:225`), so this was a ranking-integrity hole and
     not a metrics nit. The divisor is now `clip.duration_ms`, which the
     client cannot influence.
+
+    SECURITY: a rate that is 1.0 is worth as much as any other, and the
+    numerator is still client-supplied, so a second bound is needed. The
+    clamp `min(listened, clip.duration_ms)` turned an arbitrarily large
+    claim into exactly 1.0 — the best possible input to the term — so a
+    client only had to send one oversized integer. `_completion_rate` now
+    returns None for a claim beyond the over-report tolerance and the
+    sample is dropped (see `completion_sample_recorded` in the return
+    value). The `skips` counter still increments: a skip did happen, and
+    `skips` is a display counter that no ranking term reads
+    (`engagement_velocity` is `(likes + 2*shares)`), so suppressing it
+    would hide real behaviour without closing anything.
+
+    `SkipActionSerializer.listen_duration_ms` has no `max_value`
+    (`serializers.py:745`), which is why the bound has to live here: the
+    serializer has no access to `clip.duration_ms`, so it cannot express
+    "not longer than this clip". Adding a `max_value` there is still worth
+    doing as defence in depth, but it can only be a static ceiling, and this
+    is the check that knows the actual per-clip bound.
     """
     from . import counter_store
 
     completion_rate = _completion_rate(listen_duration_ms, clip)
+    # A None rate is a forged claim, not a zero-length listen: recording it
+    # as 0.0 would feed a real sample into the mean and hand the attacker
+    # the ability to *lower* a clip's score as well as raise it.
+    recorded = completion_rate is not None
 
     try:
-        counter_store.add_completion(str(clip.id), str(user.id), completion_rate)
+        if recorded:
+            counter_store.add_completion(str(clip.id), str(user.id), completion_rate)
         counter_store.increment(str(clip.id), 'skips', 1)
     except Exception as exc:
         # SECURITY: never let a metrics/counter hook break the
@@ -252,7 +313,8 @@ def record_skip(
     return {
         'clip_id': str(clip.id),
         'user_id': str(user.id),
-        'completion_rate': completion_rate,
+        'completion_rate': completion_rate if recorded else 0.0,
+        'completion_sample_recorded': recorded,
     }
 
 
@@ -278,9 +340,41 @@ def record_telemetry(
     and the action counter directly to the Redis counter store. The
     flusher materializes the UserInteraction row from the next batch
     of drained values.
+
+    `completion_rate` comes from the same `_completion_rate` helper
+    `record_skip` uses, which is the point: this path used to do its
+    own `min(watch_time_ms / max(clip.duration_ms, 1), 1.0)`, so on a
+    zero-duration clip — `duration_ms` is `default=0` and is 0 between
+    upload and HLS processing, permanently 0 for clips not produced by
+    `process_audio_to_hls` — 1ms of reported watch time scored a perfect
+    1.0, while the same claim on the skip path scored 1/60000. One
+    column, two semantics, and the consumer writes it straight into
+    `UserInteraction.completion_rate`. Sharing the helper makes the
+    zero-duration case score 1/60000 here too.
+
+    A claim beyond the helper's over-report tolerance becomes 0.0
+    rather than being omitted, because `UserInteraction.completion_rate`
+    is `FloatField(default=0.0)` and NOT NULL: the stream consumer
+    bulk-creates one row per event, and there is no "no sample" the
+    column can represent. Zero is the only non-crediting value
+    available. The asymmetry with the skip path is deliberate and is
+    not free: on the tier-3 `add_completion` fallback below a forged
+    claim therefore lands as a real 0.0 sample, which nudges
+    `avg_completion_rate` *down*. That fallback only runs when both
+    Redis enqueue paths have already failed, i.e. during the same
+    outage that would make the counter-store write itself fail (and it
+    is caught if it does), so the exposure is close to nil — but it is
+    not zero, and the honest statement is that this path bounds the
+    *upward* forgery, not both directions.
     """
-    clip_duration = max(clip.duration_ms, 1)
-    completion_rate = min(watch_time_ms / clip_duration, 1.0)
+    completion_rate = _completion_rate(watch_time_ms, clip)
+    if completion_rate is None:
+        logger.info(
+            "telemetry: watch_time_ms=%s exceeds the clip duration for "
+            "clip=%s; recording zero completion",
+            watch_time_ms, clip.id,
+        )
+        completion_rate = 0.0
     event = {
         'event_id': str(uuid.uuid4()),
         'user_id': str(user.id),

@@ -14,6 +14,11 @@ from rest_framework.validators import UniqueValidator
 
 User = get_user_model()
 
+# Module-level so the audit warning emitted from `AudioUploadSerializer.create`
+# can name the clip it is about. `validate()` uses a local `getLogger` because
+# it runs before the row exists; see the comment there.
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Pure-Python magic-byte allowlist.
@@ -182,6 +187,103 @@ def _has_blocked_magic_signature(head: bytes) -> str | None:
                 return 'Mach-O 32-bit binary'
             return 'non-audio content'
     return None
+
+#: WHAT THIS DOES *NOT* CLOSE — read this before calling it "mitigated".
+#:
+#: Derivation trusts the DECLARATION. A user who uploads audio that is really
+#: CC-BY-NC while declaring ``"Owned"`` still gets ``(False, False)`` and is
+#: still served commercially. Nothing on the upload path can catch that: there
+#: is no audio fingerprint that determines a licence, the server has no access
+#: to the source, and the only classifier in this repository
+#: (``ai_ml.scrapers.base.license_features``) reads a *licence string*, not
+#: audio. So the honest statement of what this table buys is:
+#:
+#:   It makes an HONEST declaration binding. It does not make a DISHONEST one
+#:   detectable.
+#:
+#: That is still the whole difference between a rights gate that works and one
+#: that is theatre — before this, even a truthful declaration was discarded — but
+#: the lying uploader remains open and closing it needs operator review
+#: (ISSUE-04's moderation queue), not a serializer. Nothing in the code below
+#: should be read as claiming otherwise.
+#:
+#: The residual on ``"Unknown"`` is separate and smaller: see that row.
+#:
+#: ``license_type`` -> ``(is_noncommercial, requires_share_alike)``.
+#:
+#: THE AUTHORITY is ``ai_ml.scrapers.base.license_features``, which
+#: ``ai_ml/scrapers/uploader.py`` calls to populate these exact two columns on
+#: the scraper path, and which ``AudioClip``'s own field comment names. For the
+#: seven values in ``AudioUploadSerializer.LICENSE_CHOICES`` it reduces to this
+#: table, transcribed rather than computed: ``license_features`` is a regex over
+#: a normalised licence *family* string (the scraper's vocabulary — "Freesound
+#: Attribution NonCommercial", "CC-BY-NC-ND", ...), which is not the same
+#: domain as the seven fixed choices a user can pick here.
+#:
+#: WHY TRANSCRIBED INSTEAD OF IMPORTED
+#: -----------------------------------
+#: ``serializers.py`` is imported by every request this platform serves:
+#: authentication, the feed, playback token issuance, the public share page.
+#: ``ai_ml/scrapers/`` is an OPTIONAL ingestion subsystem, disabled by default
+#: (``SCRAPER_ENABLED=False``), and this repository has deleted it outright
+#: twice — ``5c9c2d6`` and then ``aacd759``, the latter also adding it to
+#: ``.gitignore`` and ``.dockerignore``. A top-level ``from ai_ml.scrapers.base
+#: import license_features`` here would therefore turn a missing optional
+#: package into an ``ImportError`` on every single request, taking down the
+#: rights gate along with the site. The trade is a second copy of a table that
+#: can drift, and ``test_upload_license_derivation::
+#: test_parity_with_the_scraper_classifier`` re-derives both and fails on any
+#: divergence — so the drift is caught by a test rather than trusted.
+LICENSE_RESTRICTION_FEATURES = {
+    # Owned work. No third-party obligation, so nothing to enforce.
+    "Owned": (False, False),
+    # Public-domain dedications. Same.
+    "CC0": (False, False),
+    "Public_Domain": (False, False),
+    # Attribution only. Commercially usable, no share-alike condition —
+    # the attribution obligation is carried by `copyright_owner_name`.
+    "CC-BY": (False, False),
+    # ShareAlike: commercial use is permitted, but redistribution must carry
+    # the same licence. That is a DISTRIBUTION CONDITION, and
+    # `is_license_restricted` treats it as a gate, so it must be flagged.
+    "CC-BY-SA": (False, True),
+    # NonCommercial: the case with real Copyright Act 1957 s.30 exposure.
+    "CC-BY-NC": (True, False),
+    # (A2) The uploader did not say. `license_features('UNKNOWN')` also
+    # returns (False, False), and this mirrors it deliberately: a licence we
+    # do not know carries no obligation we are able to enforce, and refusing
+    # it would mean hiding every upload whose author left the dropdown alone.
+    # Nothing in mobile/ or frontend/ sends `license_type` at all today, so
+    # quarantining this value would quarantine 100% of uploads and brick the
+    # upload flow — `docs/EXPLAIN/compliance/01-license-type-unknown-gap.md`
+    # parks that as "Option 2" and it is an owner decision, not an agent's.
+    #
+    # What keeps this honest is that `Unknown` is not servable for free:
+    # `AudioUploadSerializer.create()` forces `moderation_approved=False`, so
+    # such a clip needs an explicit approval before any surface serves it. The
+    # residual is real and is stated in the audit trail: owner self-approval is
+    # permitted, so an `Unknown` upload becomes servable after one further
+    # request. See `test_upload_license_derivation::TestUnknown`-equivalent
+    # tests, which pin both halves.
+    "Unknown": (False, False),
+}
+
+
+def license_restriction_features(license_type):
+    """Return ``(is_noncommercial, requires_share_alike)`` for a licence.
+
+    Unknown or unrecognised values fall through to ``(False, False)``, which is
+    the same fail-open-on-unknown answer the scraper classifier gives. That is a
+    deliberate, bounded choice and not a general default: the input here is
+    already constrained to ``LICENSE_CHOICES`` by a ``ChoiceField``, so an
+    unrecognised value can only arrive from a row written outside this
+    serializer (the scraper, a fixture, a management command) — and those
+    writers own their own flags.
+    """
+    if not license_type:
+        return (False, False)
+    return LICENSE_RESTRICTION_FEATURES.get(license_type, (False, False))
+
 
 class UserProfileSerializer(serializers.ModelSerializer):
     class Meta:
@@ -403,8 +505,114 @@ class AudioUploadSerializer(serializers.ModelSerializer):
         validated_data['creator'] = self.context['request'].user
         validated_data.setdefault('moderation_approved', False)
         validated_data.setdefault('copyright_acknowledgement', validated_data.get('copyright_acknowledgement', False))
+
+        # DEFECT A — the declared licence is now load-bearing.
+        #
+        # `license_type` was writable and `ChoiceField`-validated, and its only
+        # reader in the entire tree was the `logger.warning` in `validate()`
+        # above. `is_noncommercial` / `requires_share_alike` are absent from
+        # `Meta.fields`, so a client could not set them, and they are
+        # `BooleanField(default=False)` — so they held False for every user
+        # upload. `services/entitlements.is_license_restricted` is a
+        # two-boolean predicate, and it is the ONLY rights gate. So an uploader
+        # who correctly declared "CC-BY-NC", then self-approved (the v1 flow in
+        # `AudioUploadViewSet.approve_moderation`), was served commercially
+        # from /feed/, /suggestions/, the playback token, the share link and
+        # the public page. Two requests, no privileges, deterministic.
+        #
+        # The fix is to make the columns carry the truth rather than to add a
+        # second rule that duplicates `is_license_restricted`: every existing
+        # consumer starts working with no edit to any of them, and the feed
+        # query stays an index-friendly two-predicate filter.
+        #
+        # Assigned, not `setdefault`. `setdefault` would be a no-op for any
+        # value already present, and the fields are not in `Meta.fields` so
+        # nothing can pre-populate them — but the point is that the derivation
+        # is unconditional, so a future "helpful" addition of these two to
+        # `Meta.fields` (much more tempting now that this method touches them)
+        # cannot be used to clear a real restriction.
+        #
+        # `license_type` has `default="Unknown"`, so it is always present in
+        # `validated_data` by now; the `or` only guards a row written through
+        # a serializer instance that skipped the field default.
+        license_type = validated_data.get('license_type') or 'Unknown'
+        is_noncommercial, requires_share_alike = license_restriction_features(
+            license_type
+        )
+        validated_data['is_noncommercial'] = is_noncommercial
+        validated_data['requires_share_alike'] = requires_share_alike
+
         clip = super().create(validated_data)
+
+        # (A2) `Unknown` derives to (False, False) — the same answer
+        # `license_features('UNKNOWN')` gives the scraper — and that is a
+        # deliberate product decision, not an oversight. Reasoning is on the
+        # `LICENSE_RESTRICTION_FEATURES["Unknown"]` row: the value is what
+        # every upload gets by default, so quarantining it here would
+        # quarantine 100% of uploads. What keeps it from being free is the
+        # `moderation_approved=False` above, which pins "an `Unknown` upload is
+        # not servable until somebody approves it".
+        #
+        # (A3) This warning is the audit trail for that decision, and it is
+        # emitted HERE rather than only in `validate()` because the row exists
+        # here, so the record can name the clip. `validate()` runs first and
+        # can only say "an upload declared Unknown" — which is unactionable
+        # when an operator is asked to review the queue.
+        if license_type == 'Unknown':
+            logger.warning(
+                "Upload with Unknown license type — audit trail required. "
+                "clip=%s creator=%s nc=%s sa=%s moderation_approved=%s",
+                clip.id, clip.creator_id, clip.is_noncommercial,
+                clip.requires_share_alike, clip.moderation_approved,
+            )
         return clip
+
+def _cover_image_url(clip):
+    """Return a browser-reachable, presigned URL for a clip's cover art.
+
+    DEFECT B. This used to be, in two places::
+
+        request.build_absolute_uri(obj.cover_image.url)
+
+    ``FieldFile.url`` reaches django-storages' ``S3Storage.url()``, and with
+    ``"querystring_auth": True`` that presigns against
+    ``"endpoint_url": AWS_S3_ENDPOINT_URL`` — the *container-internal* MinIO
+    endpoint (``http://minio:9000``), a Docker-network-only DNS name.
+    ``build_absolute_uri()`` returns an already-absolute URL verbatim, so it
+    does not repair the host: the client received a **validly-signed**
+    ~1-hour URL pointing at an internal hostname, disclosing the storage engine
+    and the in-network DNS. That is precisely the "ENDPOINT MISMATCH" that
+    ``media_urls.py:1-11`` exists to document, and ``get_signed_media_url()``
+    (media_urls.py:87) already solves it. These two call sites bypassed it and
+    called ``default_storage`` directly — a straight copy of the bug the module
+    was written to prevent.
+
+    Severity was higher than the feed case: this is duplicated on the
+    **unauthenticated** ``GET /clips/{id}/public/`` (``AllowAny``) and the value
+    is interpolated into the ``og:image`` tag of the public share card by
+    ``_render_share_card`` in ``views/content.py``, so any link unfurler
+    received the internal URL. Latent only because ``cover_image`` is not in
+    any serializer's ``Meta.fields``, so it is ``NULL`` on every row today — it
+    goes live silently the moment cover upload is added.
+
+    Why the signed helper and not the HLS one: a cover image is a single
+    object, not a multi-file stream, and it lives under ``covers/`` on the
+    origin that actually serves objects. ``get_hls_playback_url`` produces a
+    bucket-less edge URL for ``/hls/*`` only; used here it would 404. That
+    distinction is the whole reason ``media_urls.py`` keeps two helpers.
+
+    Neither the request nor its host is consulted: the signature is computed
+    over a canonical request against the storage endpoint, so re-hosting it
+    yields a URL the origin rejects. The old code let the request's ``Host:``
+    header decide, which was both wrong and attacker-influenced.
+
+    Returns None when the clip has no cover, which is the field's contract for
+    "no image" and is what both call sites and the clients expect.
+    """
+    if not clip.cover_image or not clip.cover_image.name:
+        return None
+    return get_signed_media_url(clip.cover_image.name)
+
 
 class FeedClipSerializer(serializers.ModelSerializer):
     # Fixed from owner.username to creator.username
@@ -452,11 +660,10 @@ class FeedClipSerializer(serializers.ModelSerializer):
         return get_hls_playback_url(obj.hls_playlist_url)
 
     def get_cover_image(self, obj):
-        if obj.cover_image:
-            request = self.context.get('request')
-            if request:
-                return request.build_absolute_uri(obj.cover_image.url)
-        return None
+        # DEFECT B — see `_cover_image_url`. This field stays in
+        # `Meta.fields`: it is already part of the shipped feed contract and
+        # the RN client tolerates it. Only the URL construction changed.
+        return _cover_image_url(obj)
 
     def get_is_liked(self, obj):
         if hasattr(obj, 'user_has_liked'):
@@ -522,18 +729,35 @@ class PublicClipSerializer(serializers.ModelSerializer):
 
     creator_name = serializers.CharField(source="creator.username", read_only=True)
 
+    # DEFECT B, and this DECLARATION is the whole bug — the `get_cover_image`
+    # below was dead code and never ran. DRF only calls a `get_<field>` hook for
+    # a field declared as a `SerializerMethodField`. Without this line, `Model-
+    # Serializer` auto-builds an `ImageField` for `cover_image` straight from
+    # the model column, and rendering it calls `value.url` on the `FieldFile` —
+    # i.e. `S3Storage.url()` with `querystring_auth: True`, which presigns
+    # against `AWS_S3_ENDPOINT_URL`, the container-internal `http://minio:9000`.
+    # So the leak was NOT caused by `get_cover_image` returning a bad URL; that
+    # method was never consulted at all. `FeedClipSerializer` declares the field
+    # (which is why the feed path was the one that already worked), and the two
+    # calling the *same* helper is not evidence they behave the same — sharing a
+    # helper only matters once the caller actually reaches it.
+    #
+    # Read-only either way, so declaring it here opens no writable surface:
+    # `read_only_fields` below already listed `cover_image`, and a
+    # `SerializerMethodField` is inherently read-only.
+    cover_image = serializers.SerializerMethodField()
+
     class Meta:
         model = AudioClip
         fields = ["id", "title", "creator_name", "category", "duration_ms", "tags", "cover_image"]
         read_only_fields = fields
 
     def get_cover_image(self, obj):
-        if not obj.cover_image:
-            return None
-        request = self.context.get("request")
-        if request:
-            return request.build_absolute_uri(obj.cover_image.url)
-        return None
+        # DEFECT B — the unauthenticated copy of the same bug, and the one that
+        # actually reached an anonymous caller and a link unfurler. Same helper,
+        # deliberately, so the two cannot drift apart again. Note this hook is
+        # only live because of the `SerializerMethodField` declaration above.
+        return _cover_image_url(obj)
 
 
 class SkipActionSerializer(serializers.Serializer):

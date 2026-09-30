@@ -367,9 +367,12 @@ export type Comment = z.infer<typeof commentSchema>;
  * arithmetic on it silently concatenates.
  */
 export const subscriptionStatusSchema = z.object({
+  /** Stable RevenueCat customer id provisioned by the API. */
+  app_user_id: z.string().uuid(),
   is_pro: z.boolean(),
   expires_at: z.string().nullable().optional(),
   grace_until: z.string().nullable().optional(),
+  last_synced: z.string(),
   limits: z.record(z.string(), z.string()).optional(),
 });
 export type SubscriptionStatus = z.infer<typeof subscriptionStatusSchema>;

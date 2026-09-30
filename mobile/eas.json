@@ -11,7 +11,8 @@
       "channel": "development",
       "env": {
         "EXPO_PUBLIC_RELEASE_CHANNEL": "development",
-        "EXPO_PUBLIC_RUNTIME_VERSION": "1.0.0-development"
+        "EXPO_PUBLIC_RUNTIME_VERSION": "1.0.0-development",
+        "EXPO_PUBLIC_REVENUECAT_ENTITLEMENT_ID": "pro"
       }
     },
     "preview": {
@@ -21,7 +22,8 @@
       "android": { "buildType": "apk" },
       "env": {
         "EXPO_PUBLIC_RELEASE_CHANNEL": "preview",
-        "EXPO_PUBLIC_RUNTIME_VERSION": "1.0.0-preview"
+        "EXPO_PUBLIC_RUNTIME_VERSION": "1.0.0-preview",
+        "EXPO_PUBLIC_REVENUECAT_ENTITLEMENT_ID": "pro"
       }
     },
     "production": {
@@ -31,7 +33,8 @@
       "autoIncrement": true,
       "env": {
         "EXPO_PUBLIC_RELEASE_CHANNEL": "production",
-        "EXPO_PUBLIC_RUNTIME_VERSION": "1.0.0"
+        "EXPO_PUBLIC_RUNTIME_VERSION": "1.0.0",
+        "EXPO_PUBLIC_REVENUECAT_ENTITLEMENT_ID": "pro"
       }
     }
   },

@@ -24,6 +24,7 @@ import { applyPlaybackAudioMode } from '../src/lib/audioMode';
 import { releasePlayer } from '../src/store/player';
 import { PlayerHost } from '../src/hooks/PlayerHost';
 import { TelemetryHost } from '../src/components/TelemetryHost';
+import { RevenueCatHost } from '../src/components/RevenueCatHost';
 
 /**
  * Root layout. Providers only — no navigation decisions, no data fetching.
@@ -122,6 +123,7 @@ export default function RootLayout() {
                 independent so an auth-status flip cannot unmount either.
                 Renders null. */}
             <TelemetryHost />
+            <RevenueCatHost />
             <ErrorBoundary>
               <Stack
                 screenOptions={{

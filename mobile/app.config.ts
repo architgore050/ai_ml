@@ -150,6 +150,7 @@ export default (_context: ConfigContext): ExpoConfig => {
       ],
       'expo-font',
       'expo-web-browser',
+      '@sentry/react-native',
       // SDK 57 moved the native splash out of the top-level `splash` key (which
       // is now PWA-only per @expo/config-types) and into this plugin. The old
       // app.json's `splash` block would have been silently ignored on iOS and

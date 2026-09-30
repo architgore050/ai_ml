@@ -25,6 +25,7 @@ import { releasePlayer } from '../src/store/player';
 import { PlayerHost } from '../src/hooks/PlayerHost';
 import { TelemetryHost } from '../src/components/TelemetryHost';
 import { RevenueCatHost } from '../src/components/RevenueCatHost';
+import { initMobileSentry } from '../src/lib/sentry';
 
 /**
  * Root layout. Providers only — no navigation decisions, no data fetching.
@@ -53,6 +54,8 @@ const queryClient = new QueryClient({
     },
   },
 });
+
+initMobileSentry();
 
 export default function RootLayout() {
   const [fontsLoaded, fontError] = useFonts({

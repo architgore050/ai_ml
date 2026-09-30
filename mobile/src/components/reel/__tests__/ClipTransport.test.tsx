@@ -199,12 +199,34 @@ function styleOf(element: { props: Record<string, unknown> }): Record<string, un
   return StyleSheet.flatten(resolved as never) as Record<string, unknown>;
 }
 
+const ROOT = 'clip-transport';
 const TIMECODE = 'clip-transport-timecode';
 const REWIND = 'clip-transport-rewind';
 const ADVANCE = 'clip-transport-advance';
 const TOGGLE = 'clip-transport-hands-free';
 const PILL = 'clip-transport-hands-free-pill';
 const DOT = 'clip-transport-hands-free-dot';
+
+/**
+ * Every `onPress` on this instance or above it, walking the real ancestor chain.
+ *
+ * RNTL resolves a press from the node the touch hit, walking UP to the nearest
+ * handler (`dist/fire-event.js`, `findEventHandler`), which is the platform's
+ * rule as well: the hit view names the target, and the responder is found among
+ * its ancestors. That last hop is why the missing ancestor hop is not a no-op —
+ * without it, `fireEvent.press(advanceButton)` would find nothing, and the press
+ * would silently go nowhere.
+ *
+ * Used to prove there is NOTHING above the transport's root to handle a press
+ * that lands on its own box — see the "not being a touch target itself" block.
+ */
+function pressHandlersAtOrAbove(node: TestElement): string[] {
+  const found: string[] = [];
+  for (let n: TestElement | null = node; n !== null; n = n.parent) {
+    if (typeof n.props?.onPress === 'function') found.push(String(n.type));
+  }
+  return found;
+}
 
 const renderTransport = (props: { clipId?: string; title?: string } = {}) =>
   render(<ClipTransport clipId={props.clipId ?? CLIP_ID} title={props.title} />);
@@ -843,6 +865,134 @@ describe('ClipTransport', () => {
       expect(expanded).toBeGreaterThanOrEqual(accessibility.minTouchTargetAndroid);
       // Half of each expansion is 8, and the gap is 16: touching, not overlapping.
       expect(8 * 2).toBeLessThanOrEqual(16);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // The container must not be a touch target
+  // -------------------------------------------------------------------------
+
+  /**
+   * THE DEAD ZONE, and what this harness can and cannot prove about it.
+   *
+   * `ClipTransport`'s root is a full-width band (every ancestor is a column
+   * flex container, so the default `alignItems: 'stretch'` stretches it) that
+   * mounts at `LAYER.transport = 21`, ABOVE `PlayOverlay`'s full-bleed
+   * `Pressable` at `LAYER.overlay = OVERLAY_Z = 10`. The gap between that band
+   * and the overlay's handler is the whole bug; `ReelCard.test.tsx` owns the
+   * `LAYER` ordering and the `box-none` wrappers, and this file owns the one
+   * thing the caller cannot fix from outside.
+   *
+   * A COORDINATE-LEVEL TAP TEST IS NOT FEASIBLE HERE, and the reason is worth
+   * stating rather than papering over. Hit-testing is native-only and has no JS
+   * implementation to drive — iOS `RCTViewComponentView.hitTest:`
+   * (`:772-785`) and Android `TouchTargetHelper.findTargetTagForTouch(x, y, …)`
+   * — and the RN test renderer runs NO LAYOUT ENGINE, so there are no frames
+   * and no `onLayout` numbers to resolve "a point inside this band" against.
+   * Any such test would have to invent the geometry it claims to measure, and
+   * would then prove its own arithmetic. What IS measurable here is the tree:
+   * which node a press resolves to, and which `pointerEvents` values the
+   * harness gates a press on. The three tests below stay inside that.
+   */
+  describe('not being a touch target itself', () => {
+    it('is `box-none`, the only one of the four values that is not a different bug', async () => {
+      // THE REGRESSION GUARD. With no `pointerEvents` prop the container is
+      // `AUTO`, i.e. it IS the hit test wherever the point lands — so the 16 px
+      // gaps, the margins, and the full width either side of the centred
+      // controls swallowed taps meant for play/pause and produced nothing at
+      // all. `ReelCard`'s wrappers cannot cover for that: a parent's
+      // `pointerEvents` removes only the PARENT from the hit test, and both
+      // implementations still descend into this view and take it.
+      //
+      // The four values, from the installed source rather than from memory, so
+      // the choice is auditable and not a habit:
+      //  - `auto` (i.e. no prop)  — the dead zone above. iOS `:775-776` runs
+      //    `betterHitTest` and returns `self` when nothing below it hits.
+      //  - `none` — returns `nil` for the whole subtree, so it would kill the
+      //    three controls this file exists for. `RCTViewComponentView.mm:777`;
+      //    `TouchTargetHelper.kt:347-349` "This view and its children can't be
+      //    the target".
+      //  - `box-only` — offers SELF and never descends, so the container becomes
+      //    the target and the controls below become unreachable.
+      //    `RCTViewComponentView.mm:779-780`; `TouchTargetHelper.kt:351-352`
+      //    passes `EnumSet.of(SELF)` only.
+      //  - `box-none` — `RCTViewComponentView.mm:781-783` runs `betterHitTest`
+      //    and returns `view != self ? view : nil`, i.e. the deepest descendant
+      //    wins and "only the container would have hit" answers `nil`, which
+      //    lets the search continue to whatever is behind it. Android agrees
+      //    (`TouchTargetHelper.kt:363-365`, `EnumSet.of(CHILD)`, SELF not even
+      //    offered). Documented equivalently in `ViewPropTypes.d.ts:181-198`.
+      seedStore({ currentTime: MIDPOINT, duration: DURATION });
+      const { getByTestId } = await renderTransport();
+
+      expect(getByTestId(ROOT).props.pointerEvents).toBe('box-none');
+    });
+
+    it('all three controls still answer a press through the now-transparent container', async () => {
+      // THE BEHAVIOURAL HALF, and the one that DISCRIMINATES between the four
+      // values above. `box-none` has two jobs — stop the container answering,
+      // keep its children answering — and only the second is observable as
+      // behaviour. It is observable here because the harness gates `press` /
+      // `onPress` on `isPointerEventEnabled`
+      // (`@testing-library/react-native/dist/helpers/pointer-events.js:15-26`),
+      // which walks the instance's own ancestors and implements the same rule as
+      // both platforms: a `none` or `box-only` ANCESTOR makes the child
+      // unreachable, a `box-none` one does not.
+      //
+      // So this test FAILS if the value on the root is ever changed to `none`
+      // or `box-only` — the outcome a "just make it non-interactive" fix ships,
+      // verified here rather than assumed. It passes both before and after the
+      // `box-none` change: it guards the VALUE, not the prop. The prop is the
+      // test above.
+      seedStore({ currentTime: MIDPOINT, duration: DURATION });
+      const { getByTestId } = await renderTransport();
+
+      await fireEvent.press(getByTestId(ADVANCE));
+      expect(fakePlayer.seekTo).toHaveBeenCalledTimes(1);
+
+      await fireEvent.press(getByTestId(REWIND));
+      expect(fakePlayer.seekTo).toHaveBeenCalledTimes(2);
+
+      // ...and the control that does not touch the player at all, so "the press
+      // got through" is not just "the press reached `skipBy`".
+      const handsFreeBefore = usePlayerStore.getState().handsFree;
+      await fireEvent.press(getByTestId(TOGGLE));
+      expect(usePlayerStore.getState().handsFree).toBe(!handsFreeBefore);
+    });
+
+    it('a tap on its own box reaches no handler at all, so being a target loses the tap', async () => {
+      // WHY `box-none` RATHER THAN `AUTO` — the consequence, demonstrated. In
+      // this harness a press is resolved from the addressed node upwards
+      // (`findEventHandler` in `dist/fire-event.js`), which is the platform's
+      // rule too: the hit view names the target, and the responder is found
+      // among its ancestors. Addressing a press to the container IS therefore
+      // the dead-zone case, and it resolves to nothing.
+      //
+      // This is NOT the regression guard, and deliberately so: it passes with no
+      // `pointerEvents` prop at all, because the harness does no hit-testing and
+      // a missing prop is invisible to it. It pins the half the prop assertion
+      // cannot state — that there is NO rescue handler above the container. The
+      // overlay is a SIBLING of this column's wrapper, not an ancestor, so it is
+      // never consulted either; "add a handler" is not a repair, and
+      // transparency is the only one left.
+      seedStore({ currentTime: MIDPOINT, duration: DURATION });
+      const { getByTestId } = await renderTransport();
+      const root = getByTestId(ROOT);
+
+      expect(pressHandlersAtOrAbove(root)).toEqual([]);
+
+      const before = usePlayerStore.getState();
+      await fireEvent.press(root);
+
+      // Every mutating path this subtree could have taken, all unmoved.
+      expect(fakePlayer.seekTo).not.toHaveBeenCalled();
+      expect(fakePlayer.play).not.toHaveBeenCalled();
+      expect(fakePlayer.pause).not.toHaveBeenCalled();
+      expect(fakePlayer.replace).not.toHaveBeenCalled();
+      const after = usePlayerStore.getState();
+      expect(after.handsFree).toBe(before.handsFree);
+      expect(after.playback).toBe(before.playback);
+      expect(after.currentTime).toBe(before.currentTime);
     });
   });
 

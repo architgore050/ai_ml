@@ -551,19 +551,35 @@ const tapPendingRef = useRef(false);
    * thumb position in a full-screen feed, about 8% of screen height — was
    * swallowed.
    *
-   * WHY THAT WAS NOT FIXABLE FROM WHERE THE BAR STOOD. Once JS is the
-   * responder, iOS takes the paging ScrollView's own pan recognizer out of the
-   * picture, and that is driven by the responder itself, not by anything the
-   * bar can revoke:
-   *  - `RCTScrollView.m::_shouldDisableScrollInteraction` returns YES when the
-   *    `RCTUIManager JSResponder` is a DESCENDANT of the scroll view, and
-   *    `handleCustomPan:` then does `panGestureRecognizer.enabled = NO; ... = YES`
-   *    to restart it disabled. The bar is a descendant, so any claim at all
-   *    kills the pager.
-   *  - `scrollView:touchesShouldCancelInContentView:` is written the same way —
-   *    it skips `[super touchesShouldCancelInContentView:view]` exactly when
-   *    `shouldDisableScrollInteraction`, so the pager explicitly refuses to
-   *    cancel a touch inside this bar's subtree while JS holds it.
+   * WHY THAT WAS NOT FIXABLE FROM WHERE THE BAR STOOD. The bar cannot revoke a
+   * claim once JS is the responder, so the decision has to be made before it.
+   * What iOS actually does with a claim — and it is NOT what the previous
+   * version of this comment said, which had `_shouldDisableScrollInteraction`'s
+   * direction backwards:
+   *  - `_shouldDisableScrollInteraction` is about an ANCESTOR responder, on both
+   *    architectures. Paper, `RCTScrollView.m:67-76`:
+   *    `BOOL superviewHasResponder = [self isDescendantOfView:JSResponder];` —
+   *    "is the scroll view a descendant of the JS responder", so YES requires
+   *    the responder to be ABOVE the scroll view (and `:71` skips the immediate
+   *    superview). Fabric, `RCTScrollViewComponentView.mm:566-582`, reads the
+   *    same thing from the other direction: `ancestorView = self.superview`, then
+   *    `ancestorView = ancestorView.superview` in a loop testing `isJSResponder`.
+   *    A responder INSIDE this cell is neither an ancestor nor the scroll view
+   *    itself, so `handleCustomPan:`'s `panGestureRecognizer.enabled = NO; ... =
+   *    YES` restart never fires for this bar, and "any claim at all kills the
+   *    pager" is false.
+   *  - What does happen is `touchesShouldCancelInContentView:`, which returns
+   *    `![self _shouldDisableScrollInteraction]`
+   *    (`RCTScrollViewComponentView.mm:730-735`, `RCTScrollView.m:154-161`).
+   *    With no ancestor responder that is YES — the ordinary answer — so the
+   *    scroll view cancels the touch in its content view, `RCTTouchHandler`
+   *    reports `touchCancel`, and the pager keeps the gesture. Its practical
+   *    outcome for a vertical flick is the same as the (incorrect) claim above,
+   *    by a different route, which is why the bug was easy to write down wrongly:
+   *    the same failure, attributed to the wrong line of native code. The
+   *    bar's tap arm is disarmed by that same `touchCancel`
+   *    (`RCTTouchHandler.m`'s `touchesCancelled:`, which dispatches
+   *    `eventName:@"touchCancel"`), per point 2 of THE TAP STILL WORKS below.
    *  - `onShouldBlockNativeResponder` cannot rescue it, and PanResponder's own
    *    doc comment in the installed `PanResponder.js:102` says why: "Is
    *    currently only supported on android." It is not consulted on iOS at all.

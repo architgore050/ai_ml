@@ -329,7 +329,59 @@ export function ClipTransport({ clipId, title }: ClipTransportProps) {
   const inClip = title ? ` in ${title}` : '';
 
   return (
-    <View testID="clip-transport" style={styles.column}>
+    // `box-none` on THIS view, and it has to be here rather than on a wrapper.
+    //
+    // THE BOX THIS FIXES. `column` has no width, and every ancestor of it is a
+    // plain column flex container — `reel-layer-transport` is
+    // `footerSlot: {alignSelf: 'stretch'}` (`ReelCard.tsx:401`) inside
+    // `reel-layer-footer` (`gap`, also a column) inside `reel-card` — so the
+    // default `alignItems: 'stretch'` makes this column FULL BLEED. It is not
+    // sized to its contents: the three controls are `alignItems: 'center'`ed
+    // inside a box that spans the whole reel. Its height is `marginTop: 8` +
+    // the timecode line + two 16 px gaps + two 44 px targets, so roughly 140 px
+    // of full-width band across the bottom of the reel.
+    //
+    // And it mounts ABOVE the play/pause target: `ReelCard`'s `LAYER` puts this
+    // at `transport: 21` and `PlayOverlay`'s full-bleed `Pressable` at
+    // `overlay: OVERLAY_Z` = 10 (`ReelCard.tsx:66-83`). With no `pointerEvents`
+    // prop the container is `AUTO`, i.e. it IS the hit test wherever the point
+    // lands, so the 16 px gaps, the margins, and the whole width beside the
+    // centred controls swallowed taps meant for play/pause and produced NOTHING.
+    // Nothing could rescue them: `PlayOverlay` is a SIBLING of this column's
+    // wrapper, so the platform's walk from the hit view to the nearest JS
+    // responder never reaches it.
+    //
+    // WHY A WRAPPER CANNOT DO IT. A parent's `pointerEvents` removes only the
+    // PARENT from the hit test; both implementations still descend into this
+    // view and accept it as the hit view. iOS `betterHitTest` walks
+    // `currentContainerView.subviews` in `reverseObjectEnumerator`
+    // (`RCTViewComponentView.mm:762` — zIndex order) and returns the first hit,
+    // so the footer's own `box-none` (`ReelCard.tsx:275`) is consulted, returns
+    // this view, and passes it up. Android's DFS does the same, preferring CHILD
+    // and iterating children topmost-first (`TouchTargetHelper.kt`). So the
+    // component has to make ITSELF transparent; the caller cannot.
+    //
+    // WHAT `box-none` IS, from the installed source rather than from memory.
+    // iOS, `RCTViewComponentView.mm:772-785`:
+    //   `case PointerEventsMode::BoxNone:` runs `betterHitTest` and then
+    //   `return view != self ? view : nil` — the deepest descendant wins, and if
+    //   the only thing that would have hit is the container itself the answer is
+    //   `nil`, which lets the search continue to whatever is behind. Android
+    //   agrees: `TouchTargetHelper.kt:363-365`, `PointerEvents.BOX_NONE ->
+    //   findTouchTargetView(eventCoords, view, EnumSet.of(CHILD))` — SELF is not
+    //   even offered, and a null result returns to the parent's search.
+    //
+    // The other three values would each be a different bug:
+    //  - `none` returns `nil` for the whole subtree (`RCTViewComponentView.mm:777`
+    //    / `TouchTargetHelper.kt:347-349`, "This view and its children can't be
+    //    the target"), which would kill the three controls this file exists for.
+    //  - `box-only` offers SELF and never descends (`:779-780` /
+    //    `EnumSet.of(SELF)`), so the container becomes the target and the
+    //    controls below it become unreachable.
+    //  - `auto` (i.e. no prop) is the dead zone above.
+    // Exactly one of the four values keeps the children live while letting the
+    // empty space through, which is why this is asserted rather than assumed.
+    <View testID="clip-transport" style={styles.column} pointerEvents="box-none">
       {/*
         WaveformBar.tsx:57-60 — `fontSize: 11`, `color: var(--outline)`,
         `fontVariantNumeric: 'tabular-nums'`, `letterSpacing: '0.03em'`, and the

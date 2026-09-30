@@ -358,11 +358,19 @@ type Claim = { claimed: boolean; claimedAt: 'start' | 'move' | null };
  * looked like proof of the fix.
  *
  * What actually differs between the two is whether a GRANT EVER HAPPENED. That
- * is not a detail: on iOS, `RCTScrollView` disables its own pan recognizer as
- * soon as a descendant is the JS responder
- * (`_shouldDisableScrollInteraction` → `handleCustomPan:`), and nothing in JS
- * can undo it. So "did the bar become the responder" IS "does the feed still
- * scroll", and that is what this reports.
+ * is not a detail: `onStartShouldSetResponder` is consulted exactly once and
+ * there is no JS API to hand a responder back mid-gesture, so a start-time
+ * claim is unconditional. So "did the bar become the responder" is the property
+ * this reports, and it is what the platform arbitration downstream is read from.
+ *
+ * (The previous version of this note justified that by claiming iOS disables
+ * `RCTScrollView`'s own pan recognizer as soon as a DESCENDANT is the JS
+ * responder. That is backwards — `_shouldDisableScrollInteraction` tests for an
+ * ANCESTOR responder, on Paper (`RCTScrollView.m:67-76`) and Fabric
+ * (`RCTScrollViewComponentView.mm:566-582`) alike — so it was never evidence for
+ * this helper. `SeekProgressBar.tsx`'s `WHY THAT WAS NOT FIXABLE FROM WHERE THE
+ * BAR STOOD` carries the corrected account. What this file asserts is unchanged:
+ * the arbitration itself, which is JS and is testable here.)
  *
  * The platform's contract, as modelled here: `onStartShouldSetResponder` is
  * consulted ONCE, on touch-down, before any movement exists. If it declines,
@@ -790,10 +798,9 @@ describe('SeekProgressBar', () => {
       // THE load-bearing assertion. Read from the prop because the prop IS the
       // contract: `onStartShouldSetResponder` is consulted exactly once, on
       // touch-down, before any movement exists, so a `true` here is
-      // unconditional and no later event can undo it. On iOS that is fatal for
-      // a vertical feed — `RCTScrollView._shouldDisableScrollInteraction`
-      // disables the pager's own pan recognizer as soon as a DESCENDANT is the
-      // JS responder, and there is no JS API to give the responder back.
+      // unconditional and no later event can undo it. There is no JS API to
+      // give a responder back, so the only correct place to decide is before
+      // the claim.
       expect(bar.props.onStartShouldSetResponder()).toBe(false);
 
       // ...and the bar is genuinely interactive, so this is the directional rule
@@ -808,8 +815,7 @@ describe('SeekProgressBar', () => {
 
       // THE assertion that actually discriminates. Under the old arbitration
       // this returns `{ claimed: true, claimedAt: 'start' }` — the bar took the
-      // touch on touch-down, which is the bug, and which on iOS is what turns
-      // off the feed's own pan recognizer for that gesture.
+      // touch on touch-down, which is the bug: a claim that cannot be revoked.
       expect(negotiate(bar, flickDeltas())).toEqual({ claimed: false, claimedAt: null });
 
       // Same answer with x held still, with a much larger first jump, and with

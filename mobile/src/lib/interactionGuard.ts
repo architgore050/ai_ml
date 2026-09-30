@@ -475,6 +475,10 @@ export function shouldRegisterSkip(input: {
   if (durationMs <= 0) return { kind: 'none', reason: 'unknown-duration' };
 
   const watched = positiveMs(input.watchTimeMs);
+  // The raw zero check runs FIRST, before the progress comparison, so a dead
+  // accumulator at 99 % is reported as `too-short` and never mislabelled as a
+  // finish. `positiveMs` also absorbs a NaN/infinite watch time, so those land
+  // here too rather than producing a nonsense ratio.
   if (watched <= 0) return { kind: 'none', reason: 'too-short' };
 
   const positionMs = positiveMs(input.positionMs);
@@ -498,6 +502,16 @@ export function shouldRegisterSkip(input: {
     { clipId: input.clipId, watchedMs: watched, lastPositionMs: positionMs, lastTickAt: null },
     { elementDurationMs: durationMs, clipDurationMs: clipMs },
   );
+
+  // The SECOND zero guard runs on the ROUNDED, CAPPED value — the exact integer
+  // that leaves this function — and is not redundant with the check above. The
+  // first sees 0.4 ms as positive; `reportableWatchedMs` then rounds it to 0 on
+  // the way out. The server has no lower bound on `listen_duration_ms`, so that
+  // 0 was recorded as a real 0.0 completion sample: exactly the downward
+  // deflation this function exists to prevent, reachable by any caller that
+  // hand-builds an accumulator instead of going through `observe`. Guarding the
+  // emitted value makes the two impossible to disagree.
+  if (listenDurationMs <= 0) return { kind: 'none', reason: 'too-short' };
 
   return { kind: 'skip', listenDurationMs, reelPositionMs: Math.round(positionMs) };
 }

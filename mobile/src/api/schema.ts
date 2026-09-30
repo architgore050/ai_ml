@@ -108,6 +108,22 @@ export const feedClipSchema = z.object({
   skips: z.number(),
   comment_count: z.number(),
   is_liked: z.boolean(),
+  /**
+   * Phase 3 (2026-09-30): `FeedClipSerializer.get_is_following` has sent this
+   * since c9405ae (serializers.py:626, :641, :656, :678-702) and the web client
+   * reads it — but zod STRIPS undeclared keys, so every mobile call site was
+   * receiving `undefined` and the follow button had no server value to hydrate
+   * from. That is the original defect in a new place: a button initialised to
+   * `false` on someone already followed silently UNFOLLOWS them on the first
+   * press, a real FK mutation with no confirmation and no error.
+   *
+   * Optional, and it must stay optional: `GET /suggestions/` and the
+   * `feedClipSchema` reuse across older payloads do not guarantee it, and a
+   * required field would reject a whole page over a follow button. `null` means
+   * "the server did not say", which the follow state machine treats as
+   * unpressable rather than as false.
+   */
+  is_following: z.boolean().nullish(),
   /** B5 (2026-09-29): added to FeedClipSerializer; makes the scrubber exact
    *  instead of derived from the player. */
   duration_ms: z.number().optional(),

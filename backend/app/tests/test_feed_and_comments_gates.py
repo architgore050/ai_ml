@@ -738,31 +738,35 @@ class TestCommentsGateDoesNotOverFilter:
 
 
 # ---------------------------------------------------------------------------
-# Cross-clip `parent` — found, NOT fixed here (out of ownership)
+# Cross-clip `parent` — fixed in services/comments.create_comment
 # ---------------------------------------------------------------------------
 class TestCrossClipParentIsUnenforced:
-    """`parent` is client-supplied on create and nothing checks it belongs to
+    """`parent` is client-supplied on create and nothing checked it belonged to
     the same clip as the comment.
 
-    ``services/comments.create_comment`` writes ``Comment.objects.create(
+    ``services/comments.create_comment`` wrote ``Comment.objects.create(
     author=..., clip=clip, ..., parent=parent)`` with no cross-check, and
-    ``CommentSerializer`` has no ``validate`` that compares
-    ``parent.clip_id`` to ``clip.id``. So a reply can be filed under clip A
-    while pointing at a parent that lives on clip B, after which
-    ``?clip=A`` returns the reply and ``?clip=B`` returns its parent.
+    ``CommentSerializer`` had no ``validate`` comparing ``parent.clip_id`` to
+    ``clip.id``. So a reply could be filed under clip A while pointing at a
+    parent on clip B, after which ``?clip=A`` returns the reply and
+    ``?clip=B`` returns its parent. The row itself is *valid* — both FKs
+    resolve — so no database constraint catches it either, which is why this
+    is a reference-integrity failure rather than a 500.
 
-    This is *not* fixed in this change: the check belongs in
-    ``services/comments.create_comment`` (or the serializer's ``validate``),
-    neither of which is in this change's ownership, and the brief scopes this
-    file to reporting it. ``xfail(strict=True)`` rather than a passing
-    assertion, so the test fails loudly the moment someone fixes it and
-    forces the marker to be removed instead of rotting into a false
-    guarantee. ``raises=True`` because a fix could legitimately land as a
-    400 in ``perform_create`` (this file) or as a ``ValidationError`` in the
-    serializer — both are 400 to the caller.
+    Fixed in the service rather than the serializer; the reasoning is on
+    ``create_comment``. The class name is deliberately unchanged: these tests
+    are named for the defect they pin, and they have to keep pinning it now
+    that it is fixed. The realistic regression is a well-meaning
+    "simplification" that drops the check as redundant, since the model
+    still accepts the row.
+
+    ``test_reply_to_a_parent_on_another_clip_is_refused`` was an
+    ``xfail(strict=True)`` for the duration of the defect. The strict marker
+    was load-bearing — it would have failed the moment the check landed
+    rather than rotting into a false guarantee — and it is now a real
+    assertion.
     """
 
-    @pytest.mark.xfail(strict=True, raises=AssertionError)
     def test_reply_to_a_parent_on_another_clip_is_refused(
         self, api_client, viewer, make_clip,
     ):
@@ -785,3 +789,49 @@ class TestCrossClipParentIsUnenforced:
             f"({r.status_code} {r.data!r}); the thread is now split across "
             "two clips"
         )
+        # Keyed on `parent`, not `detail`: the offending input is the parent
+        # reference, and a `detail` string would not tell the client which
+        # field to drop.
+        assert 'parent' in r.data, r.data
+        assert not Comment.objects.filter(
+            clip=clip_a, text='reply filed under the wrong clip',
+        ).exists(), 'the refused reply was persisted anyway'
+
+    def test_a_top_level_comment_is_still_accepted(
+        self, api_client, viewer, make_clip,
+    ):
+        """`parent=None` is the overwhelmingly common case; a check written
+        as `parent.clip_id != clip.id` without the None guard would 400 every
+        comment on the app."""
+        from backend.app.models import Comment
+
+        clip = make_clip('top-level')
+        api_client.force_authenticate(user=viewer)
+
+        r = api_client.post('/comments/', {
+            'clip': str(clip.id),
+            'text': 'a plain comment',
+        }, format='json')
+        assert r.status_code == 201, r.data
+        row = Comment.objects.get(pk=r.data['id'])
+        assert row.clip_id == clip.id
+        assert row.parent_id is None
+
+    def test_a_reply_whose_parent_is_on_the_same_clip_is_still_accepted(
+        self, api_client, viewer, make_clip, make_comment,
+    ):
+        from backend.app.models import Comment
+
+        clip = make_clip('same-clip-reply')
+        parent = make_comment(clip, text='parent')
+        api_client.force_authenticate(user=viewer)
+
+        r = api_client.post('/comments/', {
+            'clip': str(clip.id),
+            'parent': str(parent.id),
+            'text': 'a reply on the same clip',
+        }, format='json')
+        assert r.status_code == 201, r.data
+        row = Comment.objects.get(pk=r.data['id'])
+        assert row.parent_id == parent.id
+        assert row.clip_id == clip.id

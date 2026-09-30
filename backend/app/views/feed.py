@@ -7,7 +7,7 @@ a single module. ~270 lines.
 import logging
 import numpy as np
 from django.core.cache import cache
-from django.db.models import Exists, OuterRef, Case, When
+from django.db.models import Exists, OuterRef, Case, When, Count, Func, F, JSONField
 from pgvector.django import CosineDistance
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
@@ -297,18 +297,75 @@ class SuggestionViewSet(viewsets.ReadOnlyModelViewSet):
 # construction in the request thread *before* Postgres is reached, plus 2.1 s
 # of query. Note the Python half is NOT bounded by statement_timeout=30s
 # (settings.py:225) — only the SQL half is.
-# 20 is ~2.5x what the product actually sends: the onboarding UI offers 8
-# vibes (frontend/src/components/feed/OnboardingModal.tsx:11-20), leaving
-# room for a larger picker while keeping the worst case trivial.
+# 20 is ~1.6x what the product actually sends: `available_tags` caps its
+# offer at _MAX_OFFERED_TAGS (12) and the picker can select at most that
+# many, leaving headroom while keeping the worst case trivial. This bound
+# is deliberately independent of that cap — it is the *server's* ceiling on
+# work per request, and must stay enforced even if a client ignores it.
 _MAX_SELECTED_TAGS = 20
 #
 # _MAX_TAG_LENGTH: `AudioClip.tags` is written from KeyBERT with
-# keyphrase_ngram_range=(1, 1) and top_n=3 (tasks.py:284-292), i.e. single
-# words, plus the literal "instrumental" for instrumental-only tracks
-# (tasks.py:296). The longest id the current UI offers is "instrumental"
-# (12 chars), so 64 is already far above any real keyword while keeping each
-# clause small.
+# keyphrase_ngram_range=(1, 1) and top_n=3 (backend/app/tasks.py:284-292),
+# i.e. single words, plus the literal "instrumental" for instrumental-only
+# tracks (backend/app/tasks.py:364 — the old citation said 296, which is
+# wrong). A single KeyBERT unigram is far below 64 chars, so 64 is already
+# generous while keeping each clause small. Note the offered tags are no
+# longer a hardcoded UI list: they come from the catalogue, so this has to
+# hold for any tag the corpus happens to contain.
 _MAX_TAG_LENGTH = 64
+
+
+# ---------------------------------------------------------------------------
+# Bounds for GET /tags/available/ (see TagsViewSet.available_tags).
+#
+# _MIN_CLIPS_PER_OFFERED_TAG: a tag that appears on exactly one clip is a row,
+# not a preference. Offering it means the user can pick it, watch one clip,
+# and have a baseline computed from a single vector — while the UI implies the
+# tag characterises a group. 2 is the smallest threshold that says "more than
+# an accident"; it is a HAVING clause on the aggregate, not a post-filter, so
+# it cannot be inflated by tags that failed the other checks below.
+_MIN_CLIPS_PER_OFFERED_TAG = 2
+#
+# _MAX_OFFERED_TAGS: the picker is a modal, not a taxonomy browser. A corpus
+# with a very wide vocabulary must not turn "open onboarding" into a response
+# of thousands of rows. 12 is ~1.5x what the current modal offers, so the UI
+# can grow without a second round trip.
+_MAX_OFFERED_TAGS = 12
+
+
+def _baseline_population():
+    """The clips `initialize_vectors` can actually build a baseline from.
+
+    This is `initialize_vectors`' own three non-tag conditions, verbatim, MINUS
+    the `tags @> ...` containment. That is the whole design: the endpoint
+    advertises a tag only when that tag matches at least one clip *in exactly
+    the population the matcher will query*, so the offer cannot drift from the
+    match. If you add `status='ready'` or an NC/SA exclusion here and not in
+    the matcher, the two disagree again and the invariant this endpoint exists
+    to guarantee is gone.
+
+    WHY DUPLICATED RATHER THAN SHARED. The obvious refactor is one helper both
+    actions call. It was not done because `initialize_vectors` is contract-pinned
+    by `test_tags_initialize_bounds.py` (it asserts on the exact SQL that
+    reaches Postgres — the number of `@>` clauses for a given input), so
+    touching its body is a larger blast radius than this endpoint warrants.
+    The duplication is three clauses and is flagged here and in the test file;
+    it is the smaller risk of the two, and the invariant test fails loudly the
+    moment the two copies diverge.
+
+    NOT IN THIS POPULATION, DELIBERATELY: `status='ready'` and the NC/SA
+    exclusion. `initialize_vectors` filters on neither, so a tag whose only
+    eligible clips are NC or not-yet-ready WOULD be offered here and WOULD build
+    a baseline. That looseness is the matcher's, it predates this endpoint, and
+    it is tracked separately (it is also why `A3`'s rights gate does not cover
+    this action). Tightening it in one of the two places — rather than both —
+    is precisely the drift this helper's docstring is warning about.
+    """
+    return AudioClip.objects.filter(
+        semantic_vector__isnull=False,
+        acoustic_vector__isnull=False,
+        moderation_approved=True,
+    )
 
 
 class TagsViewSet(viewsets.ViewSet):
@@ -316,8 +373,160 @@ class TagsViewSet(viewsets.ViewSet):
     Cold-start onboarding: Initialize user preferences from tag selection.
 
     ENDPOINT: POST /tags/initialize/
+    ENDPOINT: GET  /tags/available/
     """
     permission_classes = [permissions.IsAuthenticated]
+
+    @property
+    def throttle_scope(self):
+        """Route each action to the rate it deserves.
+
+        SECURITY: this viewset previously declared no `throttle_scope` at all,
+        and `ScopedRateThrottle.allow_request` returns True — no accounting,
+        no counter — when the view it is asked about has no scope. Both actions
+        therefore ran on nothing but the shared `user` (1000/hour) bucket.
+        `initialize_vectors` is not a cheap action to leave unbounded: it runs
+        one JSONB containment clause per selected tag (up to
+        `_MAX_SELECTED_TAGS` = 20) over `app_audioclip`, and publishes a
+        `refill_user_feed` task on every success.
+
+        Keys are **method names**, because DRF's `self.action` is the method
+        name (`ViewSetMixin.initialize_request`) and `url_path` is only where
+        the handler is mounted. Keying on `url_path` is what silently killed
+        all five A4 clip scopes and then all seven ContentViewSet scopes in this
+        codebase — twice, in this same file family — and a wrong key does not
+        raise, it just leaves the endpoint unthrottled.
+
+        The fallback is the WRITE scope, not the read one. An action added here
+        without a mapping is, by default, something that writes and publishes;
+        if it turns out to be a read, a too-tight rate is a visible 429 and one
+        line of fix, whereas the reverse is invisible.
+
+        The inherited throttle classes are kept (no `get_throttles` override,
+        unlike `AudioUploadViewSet.SCOPED_ONLY_ACTIONS`) so the 1000/hour
+        `user` bucket stays as a backstop beneath the scope. Note the two
+        failure directions are different, and neither is graceful: if this
+        property ever returned None the action would be accounted only by that
+        generic bucket, whereas a scope *name* with no entry in
+        `DEFAULT_THROTTLE_RATES` raises `ImproperlyConfigured` and 500s on
+        every request. So the mapping above and the two rate keys in settings
+        have to move together; `test_tags_available_endpoint.py` asserts both.
+        """
+        return {
+            'available_tags': 'tags_available',
+            'initialize_vectors': 'tags_initialize',
+        }.get(self.action, 'tags_initialize')
+
+    @action(detail=False, methods=['get'], url_path='available')
+    def available_tags(self, request):
+        """The tags this catalogue actually has, with the clip count of each.
+
+        WHY THIS EXISTS. The onboarding modal used to offer eight hardcoded ids
+        (comedy, science, motivation, music, quotes, instrumental, tech,
+        mindset) and preselect two. Those are `AudioClip.category` values being
+        passed as `tags`; `initialize_vectors` matches with exact JSONB
+        containment, `tags @> '["comedy"]'::jsonb`, which no clip in the corpus
+        satisfies. So not one of the eight could ever match, every cold start
+        returned 400 "Not enough data to build baseline.", and
+        `select count(*) from app_user where long_term_semantic is not null`
+        was 0 — the feature had never once succeeded. This endpoint is what
+        makes it possible to succeed: the client renders whatever is really
+        there instead of a list of guesses.
+
+        WHAT THE VOCABULARY IS — read this before "improving" the endpoint.
+        `AudioClip.tags` is written by `process_audio_to_hls` from the Whisper
+        transcript using KeyBERT **unigrams** — `tags = [kw[0] for kw in
+        keywords]`, `keyphrase_ngram_range=(1, 1)`, `top_n=3`
+        (backend/app/tasks.py:360) — plus the literal "instrumental" for
+        instrumental-only tracks (tasks.py:364). A tag is therefore a *word
+        lifted out of a lyric*, not a curated genre label: on this repo's local
+        catalogue (13 clips, 12 of them eligible) there are 34 distinct tags, of
+        which exactly two ("feel", "listen") appear on more than one clip. It is
+        expected — not a bug to be smoothed over — that this list is short and
+        slightly odd.
+
+        SO: do not hardcode moods here, and do not union this with a curated
+        list. The instant the response stops being derived from the corpus, the
+        vocabulary drifts from the data again and we are back to offering tags
+        that return 400. If the catalogue's tagging needs improving, improve
+        `tasks.py`; this endpoint is only the honest view of whatever it
+        produces.
+
+        Empty catalogue is a VALID answer, not an error: the response is
+        `{"tags": []}` with a 200, and the client renders an honest "not enough
+        audio to personalise yet" state from it. It is deliberately not a 404
+        (nothing is missing), not a 400 (the request was fine) and not a single
+        consolation tag (offering one clip's tag is what `_MIN_CLIPS_PER_
+        OFFERED_TAG` exists to prevent).
+        """
+        # `jsonb_array_elements` rather than the `_text` variant: the grouping
+        # key is then the jsonb element itself, and jsonb equality is exactly
+        # what the `@>` containment the matcher uses tests. With `_text` a
+        # numeric element `5` would be counted and offered as the string "5",
+        # which the matcher can never match — `'["5"]'::jsonb @> '[5]'::jsonb`
+        # is false. Non-string elements are dropped below instead. (`tags` is
+        # not writable through `AudioUploadSerializer`, so no API writer can
+        # produce one today; the check is here because "not constructible
+        # today" is not a property of the data, it is a property of today's
+        # writers.)
+        element = Func(
+            F('tags'),
+            function='jsonb_array_elements',
+            output_field=JSONField(),
+        )
+        # No SQL LIMIT. The checks below (`isinstance`, emptiness, padding,
+        # length) are Python-side because a set-returning function cannot appear
+        # in WHERE — Django's `filter()` on the annotated alias emits
+        # `... AND jsonb_array_elements(tags) IS NOT NULL` and Postgres rejects
+        # that with "set-returning functions are not allowed in WHERE" — so a
+        # LIMIT here would be applied *before* the rejections and could hide a
+        # real tag behind junk. The fetch is a grouped aggregate: its size is
+        # the number of distinct tags, not the number of clips.
+        #
+        # `Count('pk', distinct=True)`, NOT `Count('*')`: unnesting expands one
+        # row into one row per element, so a clip whose array carries the same
+        # tag twice (`["live", "live"]`) would be counted twice. The matcher
+        # matches *clips*, and `tags @> '["live"]'` is true once for that row
+        # however many copies of the element it holds, so a plain count would
+        # advertise a number the matcher cannot reproduce — the exact
+        # disagreement this endpoint exists to rule out.
+        rows = (
+            _baseline_population()
+            .annotate(tag=element)
+            .values('tag')
+            .annotate(clips=Count('pk', distinct=True))
+            .filter(clips__gte=_MIN_CLIPS_PER_OFFERED_TAG)
+            .order_by('-clips', 'tag')
+        )
+
+        offered = []
+        for row in rows:
+            tag = row['tag']
+            if not isinstance(tag, str):
+                continue
+            # Empty string: `initialize_vectors` strips then refuses an empty
+            # tag with a 400, so offering one would advertise a choice that
+            # cannot be made.
+            if not tag:
+                continue
+            # Whitespace-padded (`" jz"`): *unmatchable*, and subtly so. The
+            # matcher strips the caller's tag before building its containment
+            # clause, so no client input can ever match a padded stored element
+            # — sending " jz" is stripped to "jz", and "jz" does not
+            # containment-match `" jz"`. Offering the stripped form instead
+            # would advertise a count including rows the matcher will never
+            # see, i.e. exactly the lie this endpoint exists to stop telling.
+            if tag != tag.strip():
+                continue
+            # Over-length: `initialize_vectors` 400s on a tag longer than
+            # `_MAX_TAG_LENGTH`, so a tag it cannot accept must not be offered.
+            if len(tag) > _MAX_TAG_LENGTH:
+                continue
+            offered.append({'tag': tag, 'clips': row['clips']})
+            if len(offered) >= _MAX_OFFERED_TAGS:
+                break
+
+        return Response({'tags': offered})
 
     @action(detail=False, methods=['post'], url_path='initialize')
     def initialize_vectors(self, request):

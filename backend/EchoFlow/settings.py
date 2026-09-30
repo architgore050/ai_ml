@@ -950,6 +950,34 @@ REST_FRAMEWORK = {
         # after 20 polls. Reads are cheap and not storage-abuse vectors, so
         # they get their own bucket rather than sharing the upload cap.
         'clip_read':           '120/min',
+        # TagsViewSet (2026-09-30). The viewset declared NO throttle_scope at
+        # all, and ScopedRateThrottle.allow_request returns True — no counter,
+        # no accounting — when the view it is asked about has no scope. Both of
+        # its actions ran on the shared `user` (1000/hour) bucket alone.
+        #
+        # 'tags_initialize' is the one that matters: it OR's one JSONB
+        # containment clause per selected tag (up to _MAX_SELECTED_TAGS = 20)
+        # across app_audioclip — which has no GIN index on `tags`, so every
+        # clause is a sequential-scan containment check — and publishes a
+        # refill_user_feed task on each success. A free account could therefore
+        # loop the one-shot cold-start endpoint as a read amplifier and as a
+        # Celery task-fan-out amplifier. 10/hour: the product flow is one
+        # submit per account for the whole of onboarding, so 10 leaves room for
+        # a double-tap, a retry after a dropped response, and a user
+        # deliberately re-running it, while bounding the fan-out to something
+        # that cannot saturate a worker queue. Analogous existing rates:
+        # register_username 3/hour (per-account spam), clip_approve 20/hour
+        # (triggers a compute-heavy encode).
+        #
+        # 'tags_available' is a read, but not a cheap or a free one: it
+        # aggregates the whole eligible corpus (jsonb_array_elements + GROUP BY)
+        # and it is the only endpoint that discloses the corpus's tag
+        # vocabulary, so it is bounded well below the generic 1000/hour and
+        # well below 'clip_read' (120/min — a single-row lookup). 60/hour is
+        # ~6x what a user needs at one call per modal open, which is the only
+        # thing the frontend does with it.
+        'tags_initialize':     '10/hour',
+        'tags_available':      '60/hour',
     },
 }
 # lets set lifetimes for tokens

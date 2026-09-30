@@ -137,3 +137,91 @@ Both are one-line type changes in a file no agent currently owns.
 - Modals do not close on backdrop click. Deliberate, not a defect.
 - No global `unhandledrejection` handler; Sentry is Python-only, so a browser reporting destination is a decision (see FIX-PLAN §9.4).
 - The HLS cookie is `HttpOnly`, so a web client **cannot** proactively refresh the playback token — `04-hls-token-protection.md:275-278` prescribes something unimplementable. Queued for the doc sweep.
+
+---
+
+## D13 — Onboarding vocabulary is structurally unusable, and the endpoint makes that honest rather than good · PARKED 2026-09-30
+
+`GET /tags/available/` (added with the onboarding fix) returns, on the current
+catalogue:
+
+```json
+{"tags": [{"tag": "feel", "clips": 2}, {"tag": "listen", "clips": 2}]}
+```
+
+That is the **truthful** answer and the modal now renders exactly it. It is not
+a good vocabulary, and the cause is upstream: `AudioClip.tags` is written from
+Whisper transcripts via KeyBERT with `keyphrase_ngram_range=(1, 1)` and
+`top_n=3` (`backend/app/tasks.py:284-292`) — **top-3 single words from the
+lyrics**. Measured: 13 clips, 34 distinct tags, and only two appear on more than
+one clip. Three KeyBERT unigrams off a transcript will never yield a taxonomy.
+
+So the fix made the emptiness *honest*; it did not make the feature *good*. A
+real fix is a decision, not a bug fix: either derive tags from a curated
+vocabulary, or match on `category` instead (which is free text today — see
+D14), or drop `/tags/initialize/` and accept the trending cold start, which is
+what the mobile client already does.
+
+**Worth knowing:** the `400 "Not enough data to build baseline."` was never
+reached by anyone before this change — `select count(*) from app_user where
+long_term_semantic is not null` returned **0**. The modal's 8 ids were
+`category` values passed as `tags`, and none existed as tags.
+
+## D14 — Five divergent vocabularies, and no single source of truth · PARKED 2026-09-30
+
+| # | Location | Values | Field |
+|---|---|---|---|
+| 1 | `mobile/src/design/categories.ts:29-48` | 5 branded + 6 legacy = 11 | `category` |
+| 2 | `frontend/src/pages/Explore.tsx:11-19` | 7 | `category` |
+| 3 | `frontend/src/pages/Upload.tsx:811-819` | free text | `category` |
+| 4 | `frontend/src/pages/Profile.tsx:849-851` | free text | `category` |
+| 5 | `backend/app/serializers.py` | no `choices=`, validated nowhere | `category` |
+
+`#1` is the only owner-approved, internally consistent list
+(`mobile/src/design/categories.ts:1-24`, decision O2, 2026-09-29), and
+`backend/scripts/seed_clips.py:95-99` explicitly pins the seeder to it. **The
+web frontend was never migrated to it.**
+
+**Two live consequences, both left open deliberately:**
+
+1. **`Explore.tsx` omits `funny`**, which **3 of 13 real clips carry** — those
+   clips are unreachable through Explore, with no affordance and no test. It
+   also offers `science` and `quotes` against **zero** rows, because
+   `seed_clips.py:98` deliberately left `news` and `science` empty rather than
+   mislabel them. This is the same defect class as the onboarding fix
+   (a hardcoded vocabulary that has drifted from the data) and is the *more*
+   urgent of the two, because unlike onboarding it cannot be skipped.
+2. `AudioClip.category` is `CharField(max_length=50, blank=True)` with **no
+   `choices=`** and is validated nowhere, so `funny` / `funny ` / `Comedy` are
+   three distinct values and `filter(category=…)` is case-sensitive.
+
+Fixing this properly is a schema + taxonomy decision: formalise the vocabulary,
+add `choices=`, and make one canonical module importable by both frontends.
+
+## D15 — Cold-start queue pollution: candidates the read path then drops · PARKED 2026-09-30
+
+`ai_ml/pipelines/recommendation.py:281-286` (the cold-start branch) and its
+backfill at `:219` filter **only** `status='ready'`. The read path
+(`views/feed.py:125,159`) additionally requires `moderation_approved=True`,
+`is_noncommercial=False` and `requires_share_aliable=False`.
+
+So on a catalogue containing unapproved or NC/SA clips, `refill_user_feed`
+fills the queue with ids that are **all dropped at read time**. The response is
+`200` with `results: []` — and because a 200 carries no `retry_after_ms`,
+`isColdResponse` (`Feed.tsx:128-130`) is false, **no retry fires**, and the user
+lands on "All caught up". That is worse than an error: it is silent,
+unactionable, and tells a recommender's user they have seen everything.
+
+**Reachable now:** `serializers.py:538-543` derives `is_noncommercial` from the
+user-supplied `license_type` in `create()`. Upload with an NC licence → the clip
+encodes → `status='ready'` → poisoned candidate. Harmless on the current
+13-clip local catalogue (all clean); a live defect in production.
+
+**Related, and now visible because the new endpoint shares the predicate:**
+`initialize_vectors` (`views/feed.py:615-622`) filters neither `status='ready'
+nor the NC/SA exclusion either, so a tag whose only clips are NonCommercial is
+genuinely offered **and** genuinely seeds `long_term_semantic` from an NC clip.
+`available_tags` faithfully mirrors that, so its invariant test *guarantees the
+offer is honest* — which means it faithfully advertises the leak. The A3 rights
+gate does not cover this action. **Both predicates must move together**; fixing
+one side alone would break the invariant the new test enforces.

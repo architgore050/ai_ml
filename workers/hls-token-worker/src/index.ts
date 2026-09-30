@@ -32,6 +32,12 @@ const ALLOWED_ORIGINS = new Set([
   "http://127.0.0.1:5173",
   "http://localhost:3000",
   "http://127.0.0.1:3000",
+  // Expo's development bundle is served by Metro on :8081. Native playback
+  // normally has no Origin header and is authenticated by its media-token
+  // header, but allowing Metro's loopback origins keeps browser/dev-client
+  // diagnostics on the same explicit allowlist.
+  "http://localhost:8081",
+  "http://127.0.0.1:8081",
   // Local docker-compose stack: the nginx :9443 / :19443 media listener.
   "https://localhost:9443",
   "https://localhost:19443",

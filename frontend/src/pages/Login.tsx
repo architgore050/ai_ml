@@ -18,23 +18,59 @@ const PASSWORD_ID = "login-password";
 const ERROR_ID = "login-error";
 const TITLE_ID = "login-title";
 
-/** Mirrors the server bound in RegisterSerializer.validate (serializers.py):
- *  a future dob is rejected, as is one over 120 years old. Computed here only
- *  to decide whether the guardian field is required — the server re-validates
- *  and remains the authority. */
-const MAX_DOB = new Date();
-MAX_DOB.setFullYear(MAX_DOB.getFullYear() - 120);
-const MAX_DOB_ISO = MAX_DOB.toISOString().slice(0, 10);
+/**
+ * Mirrors the server bound in `RegisterSerializer.validate` (serializers.py):
+ * a future dob is rejected, as is one over 120 years old. The server re-validates
+ * and remains the authority; this only keeps the native picker honest.
+ *
+ * These are `min`/`max` on an `<input type="date">`, where the browser reads
+ * them as *inclusive bounds on the value*:
+ *
+ *     min = the EARLIEST date you may type   -> 120 years ago
+ *     max = the LATEST date you may type     -> today
+ *
+ * The upper-age bound is therefore a `min`, NOT a `max`. This was previously
+ * written as `max={MAX_DOB_ISO}` with MAX_DOB_ISO set to 120 years ago, which
+ * told the browser "reject any birthdate later than 1906" — i.e. it rejected
+ * every living person and accepted only the implausibly old. Because `min` was
+ * absent, the input also had no lower bound, so the 120-year floor was never
+ * enforced client-side at all. Two attributes, both inverted in effect.
+ *
+ * The floor itself is `today - timedelta(days=120 * 365)` on the server, i.e.
+ * exactly 43800 days. `setFullYear(year - 120)` is a different date (120
+ * calendar years is 43829-43831 days), so derive it from the same day count.
+ * `toISOString()` would also convert to UTC, while the input holds a *local*
+ * calendar date; format from local getters so attribute and value agree.
+ */
+const localIsoDate = (d: Date): string =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+/** Earliest accepted dob: 120 years ago, matching the server's 43800-day bound. */
+const MIN_DOB = new Date();
+MIN_DOB.setDate(MIN_DOB.getDate() - 120 * 365);
+const MIN_DOB_ISO = localIsoDate(MIN_DOB);
+
+/** Latest accepted dob: today. A future birthdate is rejected by the server. */
+const MAX_DOB_ISO = localIsoDate(new Date());
 
 const dobToAge = (iso: string): number | null => {
   const parsed = new Date(iso);
   if (Number.isNaN(parsed.getTime())) return null;
   const now = new Date();
-  return (
-    now.getFullYear() -
-    parsed.getFullYear() -
-    ((now.getMonth(), now.getDate()) < (parsed.getMonth(), parsed.getDate()) ? 1 : 0)
-  );
+  // Compare (month, day) pairs NUMERICALLY. This was previously written as
+  // `((now.getMonth(), now.getDate()) < (parsed.getMonth(), parsed.getDate()))`,
+  // intending a tuple comparison the way the server writes it
+  // (serializers.py:967). JavaScript has no tuples: the comma is the comma
+  // *operator*, so that expression collapsed to
+  // `now.getDate() < parsed.getDate()` -- day-of-month only, with the month
+  // discarded. The age was therefore out by one for every birthdate whose
+  // day-of-month was later than today's, which on the 1st of a month is
+  // everything except the 1st. That misclassified real 17-year-olds as adults
+  // and hid the guardian-email field the server then demanded.
+  const monthDiff = now.getMonth() - parsed.getMonth();
+  const hadBirthdayThisYear =
+    monthDiff > 0 || (monthDiff === 0 && now.getDate() >= parsed.getDate());
+  return now.getFullYear() - parsed.getFullYear() - (hadBirthdayThisYear ? 0 : 1);
 };
 
 type FieldKey = "username" | "email" | "dob" | "parentEmail" | "password";
@@ -312,6 +348,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
                   type="date"
                   autoComplete="bday"
                   value={dob}
+                  min={MIN_DOB_ISO}
                   max={MAX_DOB_ISO}
                   onChange={(e) => setDob(e.target.value)}
                   required

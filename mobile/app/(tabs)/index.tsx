@@ -25,6 +25,16 @@ import {
   itemLayout,
   unambiguousViewableId,
 } from '../../src/lib/feedViewport';
+import {
+  bufferRetryDelayMs,
+  initialBufferWatch,
+  observeBuffer,
+  retryStalledClip,
+  shouldAutoAdvance,
+  type AdvanceLatch,
+  type AdvanceReporter,
+} from '../../src/lib/handsFreeAdvance';
+import { useTelemetrySkip } from '../../src/hooks/useWatchTelemetry';
 import { spacing, surface } from '../../src/design/tokens';
 import { typography } from '../../src/design/typography';
 import type { FeedClip } from '../../src/api/schema';
@@ -32,13 +42,39 @@ import type { FeedClip } from '../../src/api/schema';
 /**
  * The feed: vertical snap reels over ONE app-wide player.
  *
- * ## What this phase deliberately does NOT do
- * No likes, comments, shares, follows, or telemetry. `registerSkip` in
- * particular is Phase 3, and its absence is deliberate rather than an
- * omission: the old app fired a skip when playback reached the end, which
- * corrupted `avg_completion_rate` and therefore the recommender (defect 2).
- * A wrong measurement is worse than no measurement, so nothing is reported
- * until the completion guard lands with it.
+ * ## What this screen does and does not report
+ * Telemetry is Phase 3 and IS reported here, through `useTelemetrySkip()` —
+ * `reportUserSkip()` on a momentum-scroll end (a user leaving a reel) and
+ * `reportAutoAdvance()` on natural completion. Neither call site passes a
+ * number; the handle reads clipId, position and duration from the store itself,
+ * which is what makes "clip A's watch time reported against clip B" unrepresentable.
+ *
+ * That absence was deliberate when it was written: the old app fired a skip when
+ * playback reached the end, which corrupted `avg_completion_rate` and therefore
+ * the recommender (defect 2). A wrong measurement is worse than no measurement,
+ * so nothing was reported until `interactionGuard.shouldRegisterSkip` landed to
+ * gate it — and that is what `reportAutoAdvance`'s `userInitiated: false`
+ * satisfies first, before any duration is read.
+ *
+ * ## Not this screen's job
+ * No likes, comments, shares or follows — those are `ActionCluster`,
+ * `ShareModal` and `followState`, wired in Phase 3 but owned by their own
+ * components.
+ *
+ * ## Hands-free auto-advance — and the skip it must never produce
+ * Auto-advance DOES exist here, because `ClipTransport` has toggled
+ * `handsFree` since it shipped and **nothing read it**. It advances off the
+ * `ended` LATCH (`endedForClipId`), never off `progress >= 0.99` — see
+ * `lib/handsFreeAdvance.ts` for the three ways a progress threshold is
+ * reachable without the clip having finished, and for the seek-to-the-end
+ * false positive this accepts on purpose.
+ *
+ * It reports NO skip, and reports `userInitiated: false` to whoever is
+ * listening: `interactionGuard.shouldRegisterSkip` checks that field first and
+ * refuses on it (`interactionGuard.ts:468`), which is what stops every natural
+ * completion in a session from counting as an abandonment. `onAdvance` is the
+ * seam for `useWatchTelemetry`; it is a prop rather than a module-level emitter
+ * so the hook can supply it in one line when it lands.
  *
  * ## Autoplay
  * A reel plays when it is at least 70% visible, which stops a reel that is
@@ -65,7 +101,22 @@ type ViewabilityInfo = {
  */
 const PROCESSING_RETRY_MS = 5000;
 
-export default function Screen() {
+/**
+ * The feed screen. `onAdvance` remains an optional override for tests, but it is
+ * NOT the production seam: expo-router renders a route with
+ * `{ route, navigation, params }`, so a prop named `onAdvance` is permanently
+ * `undefined` here and an advance report built on it alone would be dead code
+ * that reads as wired. The screen therefore calls `useTelemetrySkip()` itself,
+ * which returns a module-registry handle that is inert when no `TelemetryHost`
+ * is mounted (same pattern as `onSessionExpired` in `api/client.ts:128`).
+ * `userInitiated: false` is the load-bearing field of what is reported.
+ */
+export default function Screen({
+  onAdvance,
+}: {
+  onAdvance?: AdvanceReporter;
+} = {}) {
+  const telemetry = useTelemetrySkip();
   const backend = useBackendStatus();
   const feed = useFeedBuffer();
   // `all` is now honoured server-side as "no category filter"; it used to be
@@ -81,10 +132,44 @@ export default function Screen() {
   // they have different producers and must not overwrite each other, or a
   // "still processing" spinner gets reset to "playing" by the next tick.
   const playback = usePlayerStore((s) => s.playback);
+  /**
+   * The three store facts hands-free auto-advance needs, and nothing else.
+   *
+   * `handsFree` is here because `ClipTransport` has been toggling it since it
+   * shipped and this is the first reader — a preference nothing honours is a
+   * control that lies. The two ids are the `ended` LATCH and the clip NATIVE has
+   * loaded (`store/player.ts:227-236`); `shouldAutoAdvance` needs both because
+   * neither alone identifies the finished clip, and their disagreement is
+   * exactly the mid-swap window a second advance would fire in.
+   */
+  const handsFree = usePlayerStore((s) => s.handsFree);
+  const playingClipId = usePlayerStore((s) => s.playingClipId);
+  const endedForClipId = usePlayerStore((s) => s.endedForClipId);
 
   /** Guards the inter-reel pause. */
   const lastLoadAt = useRef(0);
   const [activeClipId, setActiveClipId] = useState<string | null>(null);
+
+  /**
+   * Mirror of `activeClipId` for use inside `onMomentumScrollEnd`, which must
+   * stay dependency-free (its only dependency is the viewport; re-creating it
+   * on every active-clip change would churn the FlatList's props mid-scroll).
+   * Written on every change so a programmatic scroll, a viewability update and
+   * a momentum end all agree on what "the current clip" is.
+   */
+  const activeClipIdRef = useRef<string | null>(null);
+
+  /**
+   * The once-only advance latch, and the report seam, both in refs.
+   *
+   * A ref rather than state for each, for two different reasons that happen to
+   * agree: neither is render output (writing `setState` here would re-render the
+   * whole screen mid-advance), and both must be readable from INSIDE a timer
+   * callback, where the closure they were created in is stale.
+   */
+  const advanceLatchRef = useRef<AdvanceLatch>(null);
+  const onAdvanceRef = useRef(onAdvance);
+  onAdvanceRef.current = onAdvance;
 
   /**
    * Measured viewport height. NOT `window.height`: the tab bar is
@@ -144,9 +229,32 @@ export default function Screen() {
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
       const index = indexFromOffset(e.nativeEvent.contentOffset.y, viewport);
       const id = clipIdAtIndex(clipIdsRef.current, index);
-      if (id) setActiveClipId((prev) => (prev === id ? prev : id));
+      if (!id) return;
+      // Only a CHANGE OF CLIP is an abandonment. `onMomentumScrollEnd` also
+      // fires when momentum settles back onto the reel the user started from,
+      // and reporting that would hand `register-skip` a clip the user is still
+      // watching — a downward completion sample for a reel nobody left.
+      //
+      // `activeClipIdRef` mirrors the state so this handler stays dependency-free
+      // (the viewport is its only dep, and re-creating it on every active-clip
+      // change would churn the FlatList's props mid-scroll).
+      if (activeClipIdRef.current !== id) {
+        // Fired synchronously, in the same commit that changes the active clip
+        // and BEFORE the deferred `loadClip`, because `loadClip` zeroes
+        // `currentTime` and moves `playingClipId` — after that the outgoing
+        // clip's position is gone and the measurement would be about a clip
+        // nobody was watching.
+        //
+        // `reportUserSkip` takes no arguments on purpose: it reads clipId,
+        // position and duration from the store itself, so a caller cannot pass
+        // a mismatched clip (the bug that once attributed one clip's watch time
+        // to another and scored a perfect 1.0 on a 10 s clip).
+        telemetry.reportUserSkip();
+        activeClipIdRef.current = id;
+      }
+      setActiveClipId((prev) => (prev === id ? prev : id));
     },
-    [viewport],
+    [viewport, telemetry],
   );
 
   const clipIdsRef = useRef<string[]>([]);
@@ -155,7 +263,13 @@ export default function Screen() {
     const id = unambiguousViewableId(
       viewableItems.map((v) => (v.item as FeedClip).id),
     );
-    if (id) setActiveClipId((prev) => (prev === id ? prev : id));
+    if (id) {
+      // Viewability selects the FIRST reel on mount, which is not a user action
+      // and therefore not an abandonment — so no skip is reported here. The ref
+      // is still kept current so `onMomentumScrollEnd` sees the right clip.
+      activeClipIdRef.current = id;
+      setActiveClipId((prev) => (prev === id ? prev : id));
+    }
   }).current;
 
   const viewabilityConfig = useRef({ itemVisiblePercentThreshold: 70 }).current;
@@ -258,6 +372,157 @@ export default function Screen() {
         return;
     }
   }, [token, activeClipId, setCardStatus, pause]);
+
+  /**
+   * Hands-free auto-advance.
+   *
+   * ## The timer, and why its CLEANUP is the whole safety story
+   * `shouldAutoAdvance` is a decision, not a schedule — it returns `waitMs` and
+   * leaves the timer to this effect. That split is deliberate: the decision is
+   * pure and exhaustively unit-tested in `lib/handsFreeAdvance.ts`, and the only
+   * thing this effect adds is the `setTimeout`.
+   *
+   * The bug the cleanup prevents is the one this effect exists to make
+   * impossible: **the pending timer fires after the user has already swiped,
+   * and advances a SECOND reel.** The user swipes from a to b, and a
+   * millisecond later the timer for a's completion pages them on to c — they
+   * never saw b at all. Nothing about the timer is wrong; it is simply acting on
+   * a state that has stopped being true.
+   *
+   * So every state the decision reads is a dependency, and returning
+   * `clearTimeout` is what ties the timer's lifetime to that state. The
+   * invalidating states are enumerated as a table in
+   * `lib/__tests__/handsFreeAdvance.test.ts` ("the invalidation set"), and the
+   * cancellation itself is asserted end-to-end in
+   * `app/(tabs)/__tests__/index.test.tsx` with fake timers.
+   *
+   * ## Why `clips` is NOT a dependency here, either
+   * Same reason as the load effect above: the array identity changes on every
+   * refill, so listing it would cancel and re-schedule a pending advance on
+   * every background refill — silently losing the advance and leaving the feed
+   * stopped on a last frame. The ids are read through `clipIdsRef`, which is
+   * already this screen's mechanism for exactly that (assigned at the end of
+   * this render, `:479`), and `clips.length` covers the one change that
+   * genuinely invalidates the target.
+   */
+  useEffect(() => {
+    const decision = shouldAutoAdvance({
+      playback,
+      endedForClipId,
+      playingClipId,
+      handsFree,
+      activeClipId,
+      activeIndex: activeIndexById,
+      feed: clipIdsRef.current,
+      advancedFromClipId: advanceLatchRef.current,
+    });
+
+    if (decision.kind !== 'advance') return;
+
+    const timer = setTimeout(() => {
+      // The latch is written when the timer FIRES, not when it is scheduled, and
+      // that ordering is the answer to "can two renders in the same window both
+      // schedule one?". They cannot fire twice either way — the second render's
+      // cleanup clears the first timer — but writing the latch here means a
+      // re-render CANCELS and RE-SCHEDULES the advance instead of consuming the
+      // one budget and dropping it. A lost advance freezes the feed; a double
+      // one skips a reel, and the freeze is the worse of the two.
+      advanceLatchRef.current = decision.latch;
+      // Reported BEFORE the scroll, not after: `loadClip` zeroes `currentTime`
+      // and moves `playingClipId`, so the outgoing clip's real position only
+      // exists at this instant. `reportAutoAdvance` reads the store itself, so
+      // passing ids through is optional; `onAdvance` is the test-only override
+      // and gets the full shape.
+      telemetry.reportAutoAdvance();
+      onAdvanceRef.current?.({
+        fromClipId: decision.fromClipId,
+        toClipId: decision.toClipId,
+        userInitiated: false,
+      });
+      // `getItemLayout` is supplied, so `scrollToIndex` works; if the target
+      // cell is not measured yet RN calls `onScrollToIndexFailed`, which the
+      // screen already handles above. There is one handler, not two.
+      listRef.current?.scrollToIndex({ index: decision.toIndex, animated: true });
+    }, decision.waitMs);
+
+    return () => clearTimeout(timer);
+  }, [
+    playback,
+    endedForClipId,
+    playingClipId,
+    handsFree,
+    activeClipId,
+    activeIndexById,
+    clips.length,
+  ]);
+
+  /**
+   * The buffering timeout: evict the token, re-mint, retry the load ONCE.
+   *
+   * An expired or rejected HLS token almost never produces an error — iOS
+   * **stalls** rather than failing the item, so the card shows a spinner for
+   * ever with `error: null` and nothing in the app times it out
+   * (`03-handoff.md` §4). `lib/handsFreeAdvance.ts` holds the whole policy
+   * (the 12 s threshold, the continuous-stall measurement, the once-only latch
+   * and the rights-vs-token classification); this effect only feeds it,
+   * schedules it and performs it.
+   *
+   * ## THE TIMER IS LOAD-BEARING, not decoration
+   * An effect body runs when a dependency CHANGES, and a stall changes nothing:
+   * `playback` is stably `'buffering'` for as long as the item is stalled, and
+   * the 2 Hz `currentTime` tick is a field this screen does not subscribe to. An
+   * effect that merely re-decided per render would therefore re-decide exactly
+   * once, at the moment buffering began, and never again — so the retry would
+   * never fire and the permanent spinner would stay permanent.
+   *
+   * ## `refresh()` IS evict + re-mint + retry, already
+   * `usePlaybackToken`'s existing escape hatch: it evicts the cached token and
+   * bumps a nonce, which re-runs the load effect above and issues a fresh
+   * `loadClip` with the new token. So one call covers all three, and no
+   * eviction path was added next to the one the 409-processing timer already
+   * uses. **`usePlaybackToken.ts` was not modified**; it did not need to be.
+   *
+   * Idempotence comes from `retryStalledClip` writing `retried` into the watch
+   * it hands back: `refresh()` bumps a nonce unconditionally, so without that
+   * latch every re-mint would re-arm the timer — a loop, and the loop is the one
+   * outcome this feature is forbidden to build.
+   */
+  const bufferWatchRef = useRef(initialBufferWatch());
+  useEffect(() => {
+    const nowMs = Date.now();
+    const watch = observeBuffer(bufferWatchRef.current, {
+      clipId: playingClipId,
+      buffering: playback === 'buffering',
+      nowMs,
+    });
+    bufferWatchRef.current = watch;
+
+    const attempt = () => {
+      const outcome = retryStalledClip({
+        watch: bufferWatchRef.current,
+        playback,
+        tokenStatus: token.clipId === activeClipId ? token.status : null,
+        nowMs: Date.now(),
+        refresh: token.refresh,
+      });
+      bufferWatchRef.current = outcome.watch;
+    };
+
+    const delayMs = bufferRetryDelayMs(watch, nowMs);
+    if (delayMs === 0) {
+      // Already past the deadline, or nothing to measure. Decide now rather
+      // than scheduling a `0 ms` timer, so the outcome is observable in the
+      // same commit.
+      attempt();
+      return;
+    }
+
+    // A 403 short-circuits the DECISION, not the timer: scheduling and then
+    // refusing is one wasted timer per clip, which is cheaper than duplicating
+    // the rights classification here and letting the two drift.
+    const timer = setTimeout(attempt, delayMs);
+    return () => clearTimeout(timer);
+  }, [playback, playingClipId, token, activeClipId]);
 
   const renderItem = useCallback(
     ({ item }: { item: FeedClip }) => (

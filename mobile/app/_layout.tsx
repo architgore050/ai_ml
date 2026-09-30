@@ -23,6 +23,7 @@ import { useAuthStore } from '../src/store/auth';
 import { applyPlaybackAudioMode } from '../src/lib/audioMode';
 import { releasePlayer } from '../src/store/player';
 import { PlayerHost } from '../src/hooks/PlayerHost';
+import { TelemetryHost } from '../src/components/TelemetryHost';
 
 /**
  * Root layout. Providers only — no navigation decisions, no data fetching.
@@ -111,6 +112,16 @@ export default function RootLayout() {
                 Inside the providers but outside <Stack> so an auth-status flip
                 cannot unmount it and kill playback. */}
             <PlayerHost />
+            {/* Mounted AFTER <PlayerHost /> as a sibling. The sibling order is
+                what matters, not nesting: React runs parent cleanups before
+                child ones, so the parent's releasePlayer() -> reset() is NOT
+                what sequences this - it has already nulled playingClipId by the
+                time any child cleanup runs, and TelemetryHost's send-time gate
+                correctly refuses the final sample rather than reporting a clip
+                the player no longer holds. Sibling order keeps the two hosts
+                independent so an auth-status flip cannot unmount either.
+                Renders null. */}
+            <TelemetryHost />
             <ErrorBoundary>
               <Stack
                 screenOptions={{

@@ -112,6 +112,20 @@ simulator can exercise playback — see `docs/mobile-rebuild-plan.md` §I9.
 Simulator verification is not device verification and must not be reported as
 such.
 
+## RevenueCat Test Store demo
+
+The development client uses RevenueCat's [Test Store](https://www.revenuecat.com/docs/test-and-launch/test-store) so the paywall can be demonstrated without a Google Play developer account. The configured entitlement is `echoflow_pro`, with `monthly`, `yearly`, and `lifetime` products. A successful Test Store purchase changes `CustomerInfo` immediately and unlocks the entitlement in the same way as a store purchase.
+
+Copy the Test Store SDK key from RevenueCat into the untracked `mobile/.env.local`:
+
+```dotenv
+EXPO_PUBLIC_RELEASE_CHANNEL=development
+EXPO_PUBLIC_REVENUECAT_TEST_STORE_KEY=test_...
+EXPO_PUBLIC_REVENUECAT_ENTITLEMENT_ID=echoflow_pro
+```
+
+The app only reads `EXPO_PUBLIC_REVENUECAT_TEST_STORE_KEY` in a development build. Preview and production builds use their platform-specific public keys, so the test key cannot be shipped accidentally. The backend environment must also set `REVENUECAT_ENTITLEMENT_ID=echoflow_pro`; it remains the authority for server-enforced limits after a purchase.
+
 ## Docs
 
 - [`docs/mobile-rebuild-plan.md`](../docs/mobile-rebuild-plan.md) — the

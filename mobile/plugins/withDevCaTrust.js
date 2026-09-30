@@ -44,7 +44,10 @@ const NETWORK_SECURITY_CONFIG = `<?xml version="1.0" encoding="utf-8"?>
   variant never inherits it.
 -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false">
+    <!-- Metro serves the JavaScript bundle over HTTP. This file is emitted
+         only into Android's debug source set, so it cannot affect a shipped
+         preview or production build. -->
+    <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
             <certificates src="system" />
             <certificates src="user" />

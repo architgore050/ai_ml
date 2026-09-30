@@ -11,6 +11,7 @@ import {
   getRevenueCatCustomerInfo,
   identifyRevenueCat,
   logoutRevenueCat,
+  revenueCatEntitlementId,
 } from '../lib/revenuecat';
 import { useAuthStore } from '../store/auth';
 
@@ -90,7 +91,7 @@ export function useSubscription(): SubscriptionState {
 
   const presentPaywall = useCallback(async () => {
     await RevenueCatUI.presentPaywallIfNeeded({
-      requiredEntitlementIdentifier: process.env.EXPO_PUBLIC_REVENUECAT_ENTITLEMENT_ID?.trim() || 'pro',
+      requiredEntitlementIdentifier: revenueCatEntitlementId(),
     });
     await sync();
   }, [sync]);

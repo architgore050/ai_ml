@@ -9,6 +9,14 @@ export type RevenueCatCustomerInfo = {
 
 /** Public store keys only. Secret RevenueCat credentials must never be bundled. */
 export function revenueCatPublicKey(): string | null {
+  const releaseChannel = process.env.EXPO_PUBLIC_RELEASE_CHANNEL?.trim() || 'development';
+  // RevenueCat deliberately rejects Test Store keys in release builds. Select
+  // it only for local/demo builds so a `test_` value can never be baked into a
+  // preview or store artifact by accident.
+  if (releaseChannel === 'development') {
+    return process.env.EXPO_PUBLIC_REVENUECAT_TEST_STORE_KEY?.trim() || null;
+  }
+
   const key = Platform.OS === 'ios'
     ? process.env.EXPO_PUBLIC_REVENUECAT_IOS_KEY
     : Platform.OS === 'android'
@@ -24,7 +32,13 @@ export function revenueCatEntitlementId(): string {
 /** Configure once per public key, then identify the API-owned customer. */
 export async function identifyRevenueCat(appUserId: string): Promise<void> {
   const key = revenueCatPublicKey();
-  if (!key) throw new Error(`RevenueCat public key is missing for ${Platform.OS}.`);
+  if (!key) {
+    const releaseChannel = process.env.EXPO_PUBLIC_RELEASE_CHANNEL?.trim() || 'development';
+    const requiredKey = releaseChannel === 'development'
+      ? 'EXPO_PUBLIC_REVENUECAT_TEST_STORE_KEY'
+      : `the ${Platform.OS} RevenueCat public key`;
+    throw new Error(`RevenueCat is not configured: set ${requiredKey}.`);
+  }
 
   if (!configuredKeys.has(key)) {
     Purchases.configure({ apiKey: key });

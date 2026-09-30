@@ -4,12 +4,14 @@ jest.mock('react-native-purchases', () => ({
 }));
 
 import Purchases from 'react-native-purchases';
+import { Platform } from 'react-native';
 import {
   __resetRevenueCatForTests,
   hasActiveRevenueCatEntitlement,
   identifyRevenueCat,
   logoutRevenueCat,
   revenueCatEntitlementId,
+  revenueCatPublicKey,
 } from '../revenuecat';
 
 const mockPurchases = Purchases as unknown as {
@@ -23,7 +25,15 @@ beforeEach(() => {
   jest.clearAllMocks();
   process.env.EXPO_PUBLIC_REVENUECAT_ANDROID_KEY = 'goog_public_key';
   process.env.EXPO_PUBLIC_REVENUECAT_IOS_KEY = 'appl_public_key';
+  process.env.EXPO_PUBLIC_REVENUECAT_TEST_STORE_KEY = 'test_demo_key';
+  process.env.EXPO_PUBLIC_RELEASE_CHANNEL = 'development';
   delete process.env.EXPO_PUBLIC_REVENUECAT_ENTITLEMENT_ID;
+});
+
+it('uses the Test Store key only in development', () => {
+  expect(revenueCatPublicKey()).toBe('test_demo_key');
+  process.env.EXPO_PUBLIC_RELEASE_CHANNEL = 'preview';
+  expect(revenueCatPublicKey()).toBe(Platform.OS === 'android' ? 'goog_public_key' : 'appl_public_key');
 });
 
 it('configures once and logs in with the backend-owned id', async () => {

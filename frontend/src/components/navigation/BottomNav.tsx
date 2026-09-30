@@ -29,7 +29,23 @@ export const BottomNav: React.FC<BottomNavProps> = ({ activeTab, setActiveTab, u
                 key={tab.id}
                 type="button"
                 onClick={() => setActiveTab(tab.id)}
-                className="flex flex-col items-center justify-center -mt-5 group focus:outline-none"
+                aria-current={isActive ? "page" : undefined}
+                // `focus:outline-none` used to sit here with nothing replacing
+                // it, deleting the browser's focus ring outright — a keyboard
+                // user tabbing to the primary action saw nothing at all. It is
+                // gone rather than overridden: leaving it beside
+                // `focus-visible:outline-none` would make the ring depend on
+                // which rule Tailwind happens to emit last, since both carry the
+                // same specificity. The ring is now drawn explicitly and scoped
+                // to `focus-visible`, so it follows the keyboard and not the
+                // mouse.
+                //
+                // White rather than the brand orange: this tab's fill is
+                // `bg-[#FF6321]` in both its active and inactive states, so an
+                // orange ring would be invisible on it. No `ring-offset-*`
+                // colour is used because Tailwind 4.3.3 emits no such utility —
+                // only the width — so the offset colour would have been dead CSS.
+                className="flex flex-col items-center justify-center -mt-5 group focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
               >
                 <div className={`w-12 h-12 rounded-xl flex items-center justify-center shadow-[0_0_20px_rgba(255,99,33,0.3)] transition-transform active:scale-95 ${
                   isActive
@@ -48,6 +64,7 @@ export const BottomNav: React.FC<BottomNavProps> = ({ activeTab, setActiveTab, u
               key={tab.id}
               type="button"
               onClick={() => setActiveTab(tab.id)}
+              aria-current={isActive ? "page" : undefined}
               className={`relative flex flex-col items-center justify-center py-1 px-3 transition-colors ${
                 isActive ? "text-[#FF6321]" : "text-white/40 hover:text-white/80"
               }`}

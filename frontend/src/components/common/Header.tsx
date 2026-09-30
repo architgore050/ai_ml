@@ -1,7 +1,8 @@
 import React from "react";
-import { Headphones, Radio, Inbox, User, Activity } from "lucide-react";
+import { Headphones } from "lucide-react";
 import { usePlayer } from "../../stores/player";
 import { useAuth } from "../../stores/auth";
+import { useBackendHealth, type BackendHealth } from "./useBackendHealth";
 
 interface HeaderProps {
   activeTab: string;
@@ -9,9 +10,45 @@ interface HeaderProps {
   unreadCount: number;
 }
 
+/**
+ * Copy is scoped to what the probes actually measure. `GET /health/` is a
+ * Django liveness probe and `GET /ready/` runs `SELECT 1` against Postgres
+ * (backend/EchoFlow/health.py) — neither observes a Celery worker, so this
+ * must not claim workers are active. It said "Workers Active" for months while
+ * never having asked anything.
+ */
+const HEALTH_VIEW: Record<
+  BackendHealth["status"],
+  { label: string; dot: string; text: string }
+> = {
+  checking: {
+    label: "Checking",
+    dot: "bg-white/30",
+    text: "text-white/40",
+  },
+  healthy: {
+    label: "Backend Ready",
+    dot: "bg-green-500",
+    text: "text-green-400",
+  },
+  unreachable: {
+    label: "Not Reachable",
+    dot: "bg-red-500",
+    text: "text-red-400",
+  },
+};
+
+function healthTitle(health: BackendHealth): string {
+  const checked = health.lastCheckedAt ? new Date(health.lastCheckedAt).toLocaleTimeString() : "never";
+  const suffix = health.lastError ? ` — ${health.lastError}` : "";
+  return `Liveness /health/ and readiness /ready/ — last checked ${checked}${suffix}`;
+}
+
 export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, unreadCount }) => {
   const { handsFreeMode, setHandsFreeMode } = usePlayer();
   const { user, profile } = useAuth();
+  const health = useBackendHealth();
+  const healthView = HEALTH_VIEW[health.status];
 
   const navLinks = [
     { id: "feed", label: "Live Feed" },
@@ -32,11 +69,8 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, unreadC
             <div className="w-3.5 h-3.5 border-2 border-black rounded-full animate-pulse" />
           </div>
           <div>
-            <span className="text-xl md:text-2xl font-black tracking-tighter uppercase text-[#F5F5F5] leading-none flex items-center gap-2">
+            <span className="text-xl md:text-2xl font-black tracking-tighter uppercase text-[#F5F5F5] leading-none">
               EchoFlow
-              <span className="hidden sm:inline-block text-[9px] font-mono font-bold tracking-widest px-1.5 py-0.5 rounded bg-[#FF6321]/15 text-[#FF6321] border border-[#FF6321]/30 uppercase">
-                v2.4
-              </span>
             </span>
             <p className="text-[10px] uppercase font-mono tracking-wider text-white/40 leading-none mt-0.5">
               Audio-First Short-Form
@@ -73,14 +107,27 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, unreadC
 
         {/* Right Actions: System Status & User Controls */}
         <div className="flex items-center gap-3 md:gap-5">
-          {/* System Status Indicator from Design Spec */}
+          {/* System Status Indicator — driven by a real poll of /health/ and
+              /ready/. `animate-pulse` appears only while a probe is genuinely
+              in flight; the old `animate-ping` pulsed for ever, which is a
+              visual claim of continuous activity the code never made. */}
           <div className="hidden lg:flex flex-col text-right">
             <span className="text-[9px] uppercase font-mono font-bold text-white/30 tracking-wider">
               System Status
             </span>
-            <span className="text-[10px] uppercase font-mono font-bold text-green-400 flex items-center justify-end gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-ping" />
-              Workers Active
+            <span
+              role="status"
+              aria-live="polite"
+              title={healthTitle(health)}
+              className={`text-[10px] uppercase font-mono font-bold flex items-center justify-end gap-1 ${healthView.text}`}
+            >
+              <span
+                aria-hidden="true"
+                className={`w-1.5 h-1.5 rounded-full ${healthView.dot} ${
+                  health.status === "checking" ? "animate-pulse" : ""
+                }`}
+              />
+              {healthView.label}
             </span>
           </div>
 
@@ -88,6 +135,7 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, unreadC
           <button
             type="button"
             onClick={() => setHandsFreeMode(!handsFreeMode)}
+            aria-pressed={handsFreeMode}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-mono font-bold uppercase tracking-wider transition-all border ${
               handsFreeMode
                 ? "bg-[#FF6321] text-black border-[#FF6321] shadow-[0_0_15px_rgba(255,99,33,0.3)]"

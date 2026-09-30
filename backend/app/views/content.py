@@ -223,6 +223,10 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
             headers=headers,
         )
 
+    #: Rights fields that are part of the record a moderator already approved.
+    #: See `update()` for the policy and the argument.
+    POST_APPROVAL_IMMUTABLE_FIELDS = ('license_type', 'copyright_owner_name')
+
     def update(self, request, *args, **kwargs):
         # N8 fix: PATCH/PUT on a clip must NOT replace original_file.
         # The previous approach (read_only_fields at serializer level)
@@ -231,14 +235,134 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
         # strip the file from the request data BEFORE the serializer
         # runs. A user who wants to replace their file must delete
         # the clip and re-upload via POST.
-        if 'original_file' in request.data:
+        data = request.data
+        if 'original_file' in data:
             # request.data is a QueryDict (immutable). Make a mutable copy
             # and replace the request's internal _full_data so the
             # serializer sees the file-stripped version.
-            data = request.data.copy()
+            data = data.copy()
             data.pop('original_file')
             request._full_data = data
+
+        # Creator scoping happens here, through get_object(), so a stranger's
+        # clip is still a 404 before the rights guard below ever runs and
+        # before the serializer sees the payload. get_object() is idempotent,
+        # so super().update() calling it again costs one extra SELECT.
+        clip = self.get_object()
+        refusal = self._refuse_post_approval_rights_change(clip, data)
+        if refusal is not None:
+            return refusal
+
         return super().update(request, *args, **kwargs)
+
+    def _refuse_post_approval_rights_change(self, clip, data):
+        """Refuse to rewrite the rights record of already-moderated content.
+
+        409 Conflict, same register as the two other state-dependent
+        refusals in this file (``share_link`` answers 409 for "clip media is
+        not ready", ``play_shared`` deliberately checks the media key before
+        the licence so a mid-encode caller gets 409 rather than 403). The
+        request is well-formed; it conflicts with the resource's state.
+
+        The policy
+        ----------
+        ``title`` and ``category`` stay freely editable after approval, and
+        ``license_type`` / ``copyright_owner_name`` do not. A moderation
+        decision is about the *audio*: ``run_moderation_check``
+        (services/content_moderation.py:132-179) checks the audio
+        fingerprint, the tags and the transcript, and moderation runs Whisper
+        over the file. A mistyped title is a typo, and forcing re-approval
+        over one would take a published clip out of every feed and suggestion
+        query for a cosmetic change — the edit would appear to revert and the
+        clip would vanish, which is a worse failure than the one being
+        prevented. So presentation metadata is not gated.
+
+        Why the rights fields are refused rather than re-moderated
+        ------------------------------------------------------------
+        The obvious alternative is to set ``moderation_approved = False`` on a
+        rights-field change. That is worse on both axes:
+
+        1. It buys nothing. Nothing in ``run_moderation_check`` reads the
+           licence, the owner or the acknowledgement, so the re-check would
+           re-evaluate the audio against checks that cannot detect a rights
+           problem. The clip would be withdrawn and re-admitted unchanged.
+        2. It costs the user their content. There is no un-approve route
+           (content_moderation.py:108 notes this) and nothing re-approves
+           automatically, so the clip silently leaves every feed until the
+           owner notices and calls approve-moderation again.
+
+        Refusing is inert: a 409 changes no field, so the clip stays exactly
+        as servable as it was.
+
+        Premise correction
+        -----------------
+        The finding this answers described ``license_type`` as the thing that
+        makes a clip NonCommercial. It does not. ``is_noncommercial`` and
+        ``requires_share_alike`` are separate columns, absent from
+        ``AudioUploadSerializer.Meta.fields``, written only by the scraper
+        uploader — so PATCH cannot open the redistribution gate at all
+        (pinned by
+        ``test_the_rights_flags_are_not_writable_through_the_api``). What
+        PATCH *could* do was silently rewrite the declared licence and
+        attribution of an upload a moderator already ruled on, with no audit
+        event. That is an audit-integrity defect, not a redistribution
+        bypass, and the severity claimed for it should be read down to match.
+
+        Two deliberate exclusions
+        ------------------------
+        * ``copyright_acknowledgement`` is not frozen. It is a one-way
+          affirmation: False -> True strengthens the record and can never
+          weaken it, and the stored column is the durable proof of a
+          declaration made at upload time. Guarding it would also 409 every
+          save on a legacy row uploaded before the acknowledgement became
+          mandatory — a failure with no security value.
+        * The comparison is by **value**, not key presence. A form that
+          submits the whole object sends ``license_type`` back unchanged on
+          every save; refusing that would break the shipped clip-edit form for
+          nothing. Only a value that actually differs from the stored one is
+          a rewrite.
+
+        What the user sees
+        ------------------
+        A title or category edit: 200, applied, clip unchanged in the feed.
+        A licence or owner change on an approved clip: 409, nothing written —
+        including a title edit sent in the same request, because a partial
+        apply leaves the client unable to tell which half landed and the half
+        that landed is the dangerous one. The remedy is the same one
+        ``original_file`` already has: delete and re-upload. The frontend
+        clip-edit form has to surface the 409 as a field-level error on the
+        licence input, or the user sees an unexplained save failure.
+        """
+        if not clip.moderation_approved:
+            # Nothing has been moderated, so there is no approved rights
+            # record to contradict. Same behaviour as before this guard.
+            return None
+
+        changed = [
+            field
+            for field in self.POST_APPROVAL_IMMUTABLE_FIELDS
+            if field in data and data.get(field) != getattr(clip, field)
+        ]
+        if not changed:
+            return None
+
+        logger.warning(
+            "post-approval rights rewrite refused: clip=%s creator=%s "
+            "fields=%s",
+            clip.id, clip.creator_id, changed,
+        )
+        return Response(
+            {
+                "detail": (
+                    "This clip has already been approved for moderation, so "
+                    "its licence and attribution can no longer be changed. "
+                    "Delete the clip and upload it again to publish it under "
+                    "a different licence."
+                ),
+                "immutable_fields": changed,
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
 
     @action(detail=True, methods=['post'], url_path='approve-moderation', permission_classes=[permissions.IsAuthenticated])
     def approve_moderation(self, request, pk=None):
@@ -310,8 +434,41 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
         The clip FK and the IT Rules-aligned reason enum are now populated and
         validated, and duplicate reports from the same user are collapsed
         (matching the partial unique constraint on the model).
+
+        A4 (2026-09-30, W2-H): the lookup was ``get_object_or_404(AudioClip,
+        pk=pk)`` — unscoped — so the endpoint answered 201 for any existing
+        clip UUID and 404 otherwise, at 20/hour. That is a clip-existence
+        oracle for content the caller has no entitlement to know about, and a
+        queue-pollution primitive: an operator receives a rights-violation
+        accusation against a clip the reporter cannot even see, with nothing
+        to verify it against.
+
+        Scoped with the same predicate as ``public_view`` above — copied from
+        ``profile.py:80-86``, not derived here — and to the same **404**, so
+        a non-servable clip and a nonexistent one are indistinguishable. The
+        two endpoints must agree: a report that 404s for a clip the public
+        page 403s on would confirm existence through the report endpoint
+        instead.
+
+        Not being able to report an invisible clip is also the *correct*
+        reading, not merely the safe one. A report is an accusation of a
+        violation that an operator has to be able to triage against the
+        content it describes, and a reporter who has seen nothing has no
+        standing to make it. The legitimate path for "I have evidence about
+        content that is already pulled or was never public" is
+        ``POST /legal/takedown/`` (``views/legal.py:56``,
+        ``TakedownRequest``), which does not require the clip to be servable
+        and is not narrowed by this change.
         """
-        clip = get_object_or_404(AudioClip, pk=pk)
+        clip = get_object_or_404(
+            AudioClip.objects.filter(
+                status='ready',
+                moderation_approved=True,
+                is_noncommercial=False,
+                requires_share_alike=False,
+            ),
+            pk=pk,
+        )
 
         reason = request.data.get('report_reason', '')
         valid_reasons = {code for code, _label in Report.REPORT_REASONS}
@@ -386,13 +543,48 @@ class AudioUploadViewSet(viewsets.ModelViewSet):
         are what make the share legible in WhatsApp/Slack/X without building
         a site first.
 
-        SECURITY: the queryset filter keeps unapproved clips invisible here.
+        SECURITY: the queryset filter keeps unservable clips invisible here.
         Filtering in the queryset rather than raising a 403 deliberately —
         a 404/403 split would confirm whether a given UUID exists to someone
         with no entitlement to ask.
+
+        A4 (2026-09-30, W2-H): the filter used to be
+        ``moderation_approved=True`` and nothing else, so this was the one
+        clip surface the licence work never reached. An unauthenticated caller
+        got a rendered title, description and cover image for NonCommercial
+        audio, for ShareAlike audio, and for clips still mid-encode — the
+        exact metadata ``feed.py``, ``social.py:173`` and this file's own
+        ``share_link`` / ``play_shared`` withhold. The audio stayed
+        token-gated, so this was metadata disclosure plus feed inconsistency
+        rather than a playback bypass, but a page whose content model
+        disagreed with the feed's is exactly the drift that produced the
+        original gap.
+
+        The four conditions are copied verbatim from ``profile.py:80-86`` and
+        ``feed.py:183-187`` rather than re-derived, for the reason
+        ``services/entitlements.py`` exists: two "what is servable" filters
+        that disagree are how this hole was created in the first place.
+
+        All four sit in the **queryset** rather than being a filter plus an
+        ``is_license_restricted`` check with a 403, which is the shape
+        ``social.py:166-181`` uses. That is deliberate and differs on
+        purpose: this action is ``AllowAny`` on an unguessable UUID, so
+        existence confirmation is the only thing at stake and a 403 would give
+        it away for free. Here a non-servable clip 404s *byte-identically* to
+        one that was never created, so the page is not an oracle. The
+        trade-off is a recipient whose share link has gone stale sees "not
+        found" rather than "may not be shared" — and the only way a minted
+        share link can point at an NC clip is if the clip was flipped after
+        minting, which is the fail-closed direction anyway.
         """
         clip = get_object_or_404(
-            AudioClip.objects.filter(moderation_approved=True), pk=pk
+            AudioClip.objects.filter(
+                status='ready',
+                moderation_approved=True,
+                is_noncommercial=False,
+                requires_share_alike=False,
+            ),
+            pk=pk,
         )
         data = PublicClipSerializer(clip, context={'request': request}).data
 

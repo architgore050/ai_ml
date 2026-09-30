@@ -113,16 +113,77 @@ class ShareViewSet(
 
     @action(detail=False, methods=['get'], url_path='find-user')
     def find_user(self, request):
+        """Look a peer up by username for the share flow.
+
+        SECURITY / R5-07: this was `User.objects.get(username__iexact=…)`
+        with `except User.DoesNotExist`. `User.username` is `unique=True` on a
+        case-SENSITIVE column (`varchar(150)` under `en_US.utf8`, verified:
+        `SELECT 'alice' = 'Alice'` -> false, `'alice' ILIKE 'Alice'` -> true),
+        so `alice` and `Alice` are both storable and `iexact` matches both.
+        `.get()` requires exactly one row, `MultipleObjectsReturned` is not a
+        `DoesNotExist`, and the exception escaped as a 500 — from two
+        registrations and one GET, on the public share path.
+
+        Two rows is the whole answer set here, so the query is sliced at 2
+        rather than counted. That keeps this at one query on every path,
+        which `len(User.objects.filter(...).count())` would not: the count
+        would be a second round trip on every single hit, the common case.
+
+        On a collision the answer is 409, not a silent pick:
+          * Both candidates are real, reachable accounts. Returning the
+            lowest `pk` would deliver the share to whichever row happened to
+            be created first — which is exactly the account an attacker
+            squats, since squatting means registering the name you want
+            shadowed. The listing order would be the attacker-tunable half of
+            the attack, and the UI would show the victim's name while
+            `send-share` wrote a ShareEvent for the impostor.
+          * A 404 would be worse than either: it tells someone looking for a
+            colleague that the colleague does not exist, and invites them to
+            re-search forever.
+          * 409 says the true thing — the name is taken, ambiguously — and
+            both are representable by the client: `ShareModal`'s
+            `lookupFailureMessage` already distinguishes 404 from "some other
+            status". It needs a 409 branch to show this particular message;
+            today it falls through to its generic "could not complete that
+            search". Presentation is the frontend's to fix; the semantic
+            status is this side's to get right.
+
+        The real fix is a case-insensitive uniqueness constraint plus a data
+        migration to resolve rows that already collide. Until that exists,
+        colliding rows must be *reported* rather than crashed on, so this logs
+        them: a collision is a data-integrity event, not a client error, and
+        it is otherwise invisible — every other lookup of that name succeeds.
+
+        `iexact` is deliberately kept: typing `ALICE` should find `alice`.
+        """
         username = request.query_params.get('username', '').strip()
         if not username:
             return Response({'error': 'Username required'}, status=400)
-        try:
-            user = User.objects.get(username__iexact=username)
-            if user == request.user:
-                return Response({'error': "You can't share with yourself"}, status=400)
-            return Response({'id': user.id, 'username': user.username})
-        except User.DoesNotExist:
+
+        matches = list(
+            User.objects.filter(username__iexact=username).order_by('pk')[:2]
+        )
+        if not matches:
             return Response({'error': f'No user found: @{username}'}, status=404)
+
+        if len(matches) > 1:
+            logger.warning(
+                "find_user refused: username=%r is ambiguous across %d accounts "
+                "(pk=%s). Resolved by a case-insensitive uniqueness "
+                "constraint; until that migration lands this name is unusable "
+                "for sharing.",
+                username, len(matches), [u.pk for u in matches],
+            )
+            return Response(
+                {'error': 'More than one account matches that username. '
+                          'Try the exact spelling, or ask them to change it.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        user = matches[0]
+        if user == request.user:
+            return Response({'error': "You can't share with yourself"}, status=400)
+        return Response({'id': user.id, 'username': user.username})
 
     @action(detail=True, methods=['post'], url_path='send-share')
     def send_share(self, request, pk=None):

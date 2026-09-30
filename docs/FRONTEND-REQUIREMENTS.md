@@ -545,13 +545,28 @@ Source: `backend/app/views/feed.py:200-249`. Body:
 - All other endpoints expect `Authorization: Bearer <access_token>`.
   401 → must refresh; 401-after-refresh-fail → must clear local state
   and route to login.
-- Password validation: Django's four built-in validators
-  (`AUTH_PASSWORD_VALIDATORS` at `backend/EchoFlow/settings.py:324-337`):
-  - `UserAttributeSimilarityValidator` (rejects passwords containing
-    username/first/last/email)
+- Password validation: `POST /auth/register/` runs Django's four configured
+  validators (`AUTH_PASSWORD_VALIDATORS` at
+  `backend/EchoFlow/settings.py:467-480`, all four enabled with default
+  arguments) and reports **every** message that failed, together, on the
+  `password` key of the 400 body:
+  - `UserAttributeSimilarityValidator` (similarity > 0.7 against
+    username/first name/last name/email — it is given the submitted
+    username and email, so `password` ≈ `username` is rejected)
   - `MinimumLengthValidator` (default ≥ 8 chars)
-  - `CommonPasswordValidator` (rejects top-1000 common passwords)
+  - `CommonPasswordValidator` (rejects Django's built-in list of 19,640
+    common passwords)
   - `NumericPasswordValidator` (rejects entirely-numeric passwords)
+
+  Example 400 body:
+
+  ```json
+  {"password": ["This password is too short. It must contain at least 8 characters.",
+                "This password is entirely numeric."]}
+  ```
+
+  So the form must render the list from `response.password`, not a single
+  `response.detail`, and must not assume only one rule failed.
 - Login throttled at **10/min/IP** — a credential-stuffing defense. The
   frontend must rate-limit login attempts (e.g., 1/sec with a cooldown
   on 429).

@@ -3,6 +3,8 @@ import logging
 from rest_framework import serializers
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.auth import password_validation
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Exists, OuterRef
 from backend.EchoFlow.client_ip import get_client_ip
 from .media_urls import get_hls_playback_url, get_signed_media_url
@@ -246,7 +248,40 @@ class AudioUploadSerializer(serializers.ModelSerializer):
         # SECURITY / REGULATORY: Enforce copyright acknowledgment.
         # Per ISSUE-05 (Copyright Act 1957 / IT Rules 2021), the user
         # must explicitly confirm they have the right to upload the audio.
-        if not data.get("copyright_acknowledgement", False):
+        #
+        # W2-G (2026-09-30) — this used to be a single unconditional
+        # `if not data.get("copyright_acknowledgement", False)`. That made
+        # every `PATCH /clips/{id}/` a 400: DRF's `partial=True` skips
+        # FIELD-level validation for absent fields, but the object-level
+        # `validate()` hook is still called, so a client editing a clip title
+        # without re-sending the flag was rejected. Clip editing could never
+        # have worked end to end.
+        #
+        # DECISION: required on create, and never revocable afterwards.
+        #
+        #  * Create — must be present and true, exactly as before. This is the
+        #    only moment the declaration can honestly be made: the audio is
+        #    being introduced here, and `original_file` is stripped from every
+        #    update by `AudioUploadViewSet.update` (N8), so the content being
+        #    licensed can never change afterwards.
+        #  * Update — absent is accepted (there is no new content to license);
+        #    present-and-false is rejected. The stored column is the durable
+        #    record of a declaration made at upload time, so letting any client
+        #    flip it to False would let the one actor with no standing erase
+        #    it, and would make the gate hold only until somebody PATCHed.
+        #    Note the rejected-update path is the pre-existing one: this
+        #    method rejected every update, so no client can have depended on
+        #    a `false` write succeeding.
+        #
+        # The error text is unchanged so anything already rendering it stays
+        # correct, and so the create-side behaviour is byte-identical.
+        creating = self.instance is None
+        acknowledged = data.get('copyright_acknowledgement')
+        if creating:
+            unsatisfied = not acknowledged
+        else:
+            unsatisfied = acknowledged is not None and not acknowledged
+        if unsatisfied:
             raise serializers.ValidationError(
                 {"copyright_acknowledgement": "You must acknowledge that you have the right to upload this audio and that it does not infringe any third-party rights."}
             )
@@ -628,6 +663,45 @@ class RegisterSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(f"Invalid terms version. Allowed: {allowed}")
         return value.strip()
 
+    def _validate_password(self, data):
+        """Run `settings.AUTH_PASSWORD_VALIDATORS` over the submitted password.
+
+        W2-G (2026-09-30). Extracted from `validate()` so the call site reads
+        as one step of the object-level gate rather than a wall of comments.
+
+        Error shape: `{'password': [...]}`, i.e. field-level. The rest of this
+        serializer reports on the offending field (`dob`, `parent_email`,
+        `original_file`, `copyright_acknowledgement`) and a client that renders
+        a field error next to its input is strictly better served than one
+        that gets an unattributable `detail`. `Frontend/client.ts:166`
+        flattens `Object.values(data).flat().join(" ")`, so it renders either
+        shape — but the field key is what a form needs.
+
+        Django's `ValidationError` is translated rather than propagated: DRF
+        does not recognise it and would surface it as a 500.
+        """
+        password = data.get('password')
+        if password is None:
+            # `password` is a required model field, so DRF has already
+            # rejected the request before `validate()` runs. Nothing to do,
+            # and `validate_password(None, ...)` would raise something less
+            # useful than the field error the client already has.
+            return
+
+        # Built from validated data, not `self.initial_data`: `initial_data`
+        # is un-validated, and the similarity check must compare against the
+        # values that will actually be stored.
+        candidate = User(
+            username=data.get('username') or '',
+            email=data.get('email') or '',
+            first_name=data.get('first_name') or '',
+            last_name=data.get('last_name') or '',
+        )
+        try:
+            password_validation.validate_password(password, user=candidate)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({'password': exc.messages})
+
     def validate(self, data):
         # DECISION: age < 18 requires a parent/guardian email and sets
         # is_minor. Tradeoff: extra validation vs. DPDP §9.
@@ -643,6 +717,26 @@ class RegisterSerializer(serializers.ModelSerializer):
         #    minor-safety question: the adult path is the one with fewer
         #    restrictions, so it is the one worth refusing to guess at.
         from datetime import date
+
+        # W2-G (2026-09-30) — AUTH_PASSWORD_VALIDATORS was dead code here.
+        # `EchoFlow/settings.py:467-480` configures all four validators
+        # (similarity, minimum length, common-password, numeric), but nothing
+        # on the registration path ever called `validate_password`, so
+        # `POST /auth/register/` accepted `password: "123"` and returned 201.
+        # Django's `UserCreationForm` runs these through
+        # `django.contrib.auth.password_validation`; a custom `ModelSerializer`
+        # that overrides `create()` gets none of that for free.
+        #
+        # The `user=` argument is the part that is easy to get wrong and
+        # silently wrong: `UserAttributeSimilarityValidator` iterates
+        # `getattr(user, attr)` for username/first_name/last_name/email and
+        # skips anything it cannot read, so a bare `validate_password(value)`
+        # enforces three of the four rules and quietly does nothing about the
+        # fourth. The unsaved `User` below is built from the *already
+        # validated* data, so it carries the same username/email the row will
+        # be created with. (SetPasswordForm passes the real instance for the
+        # same reason; here there is no row yet.)
+        self._validate_password(data)
 
         today = date.today()
         dob = data['dob']

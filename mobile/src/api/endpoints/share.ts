@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { apiFetch } from '../client';
+import { feedClipSchema } from '../schema';
 
 /**
  * Share endpoints — find a listener, send them a clip. Thin and typed, mirroring
@@ -169,6 +170,20 @@ const sendShareResultSchema = z.object({
 });
 export type SendShareResult = z.infer<typeof sendShareResultSchema>;
 
+/** One inbox row. `/share/inbox/` is deliberately a bare array, not a page. */
+const shareInboxItemSchema = z.object({
+  id: z.string(),
+  sender_name: z.string(),
+  clip: feedClipSchema,
+  clip_title: z.string(),
+  clip_hls_url: z.string().nullable().optional(),
+  created_at: z.string(),
+  is_read: z.boolean(),
+});
+export type ShareInboxItem = z.infer<typeof shareInboxItemSchema>;
+
+const shareInboxSchema = z.array(shareInboxItemSchema);
+
 /* ------------------------------------------------------------------ */
 /* Client-side bounds                                                   */
 /* ------------------------------------------------------------------ */
@@ -280,6 +295,23 @@ export async function sendShare(
     body: { receiver_id: receiverId },
   });
   return sendShareResultSchema.parse(raw);
+}
+
+/**
+ * Read the recipient's inbox. This is a bare top-level array, not a cursor or
+ * count envelope. It is safe to poll every 30 seconds under `share_poll`.
+ */
+export async function getShareInbox(): Promise<ShareInboxItem[]> {
+  return shareInboxSchema.parse(await apiFetch('/share/inbox/'));
+}
+
+/**
+ * Mark a received share as read. A 204 is also returned for an absent or
+ * foreign id, so callers must not use a successful response as proof that a
+ * locally deleted row still exists.
+ */
+export async function markShareRead(shareId: string): Promise<void> {
+  await apiFetch(`/share/${shareId}/mark-read/`, { method: 'POST' });
 }
 
 /* ------------------------------------------------------------------ */

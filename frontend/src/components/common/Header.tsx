@@ -16,6 +16,18 @@ interface HeaderProps {
  * (backend/EchoFlow/health.py) — neither observes a Celery worker, so this
  * must not claim workers are active. It said "Workers Active" for months while
  * never having asked anything.
+ *
+ * A note on the opacity floor in this file. The faint text was `text-white/40`
+ * (3.77:1) and `text-white/30` (2.61:1) — both under the 4.5:1 of WCAG 1.4.3,
+ * at 9-10px. They are now `text-white/50` (5.29:1), the smallest step that
+ * clears AA, because the app-wide decision about whether to move these to
+ * `--text-secondary` / `--text-tertiary` belongs to one sweep across all
+ * thirteen component files rather than to the four this pass touched. Do not
+ * reintroduce `/40` or `/30` here in the meantime.
+ *
+ * `bg-white/30` on the "checking" dot is left alone: it is `aria-hidden`,
+ * decorative, and redundant with the text label beside it, so it carries no
+ * information a sighted user needs it for.
  */
 const HEALTH_VIEW: Record<
   BackendHealth["status"],
@@ -24,7 +36,7 @@ const HEALTH_VIEW: Record<
   checking: {
     label: "Checking",
     dot: "bg-white/30",
-    text: "text-white/40",
+    text: "text-white/50",
   },
   healthy: {
     label: "Backend Ready",
@@ -60,26 +72,38 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, unreadC
   return (
     <header className="sticky top-0 z-30 w-full bg-[#0A0A0A]/95 backdrop-blur-xl border-b border-white/10 px-4 md:px-8 py-3.5 transition-all">
       <div className="max-w-7xl mx-auto flex items-center justify-between">
-        {/* Brand with Orange Pulse */}
-        <div
+        {/* Brand with Orange Pulse.
+            A <button>, not a <div onClick>: this is the shortest route back to
+            the feed from anywhere in the app, and as a div it had no role, no
+            tabIndex and no key handler, so it was unreachable by keyboard
+            (RECON-06 §10). `type="button"` keeps it from submitting anything. */}
+        <button
+          type="button"
           onClick={() => setActiveTab("feed")}
-          className="flex items-center gap-3 cursor-pointer select-none group"
+          className="flex items-center gap-3 cursor-pointer select-none group text-left"
         >
           <div className="w-8 h-8 bg-[#FF6321] rounded-full flex items-center justify-center shadow-[0_0_20px_rgba(255,99,33,0.35)] transition-transform group-hover:scale-105">
-            <div className="w-3.5 h-3.5 border-2 border-black rounded-full animate-pulse" />
+            <div className="w-3.5 h-3.5 border-2 border-black rounded-full animate-pulse" aria-hidden="true" />
           </div>
           <div>
             <span className="text-xl md:text-2xl font-black tracking-tighter uppercase text-[#F5F5F5] leading-none">
               EchoFlow
             </span>
-            <p className="text-[10px] uppercase font-mono tracking-wider text-white/40 leading-none mt-0.5">
+            <p className="text-[10px] uppercase font-mono tracking-wider text-white/50 leading-none mt-0.5">
               Audio-First Short-Form
             </p>
           </div>
-        </div>
+        </button>
 
-        {/* Center Desktop Navigation Tabs */}
-        <div className="hidden md:flex items-center gap-6 text-xs font-black uppercase tracking-widest text-white/40">
+        {/* Center Desktop Navigation Tabs.
+            Wrapped in a <nav>. The app's only other <nav> is `BottomNav`, which
+            is `md:hidden`, so on a desktop viewport — where these five
+            destinations are the entire navigation — the page had no navigation
+            landmark at all. Labelled because a second, equally valid answer to
+            "where am I?" is to name both (RECON-06 §16 Q10). `aria-current` is
+            the part that was outright missing: without it a screen-reader user
+            on desktop had no indication of the current page. */}
+        <nav aria-label="Primary" className="hidden md:flex items-center gap-6 text-xs font-black uppercase tracking-widest text-white/50">
           {navLinks.map((tab) => {
             const isActive = activeTab === tab.id;
             return (
@@ -87,15 +111,26 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, unreadC
                 key={tab.id}
                 type="button"
                 onClick={() => setActiveTab(tab.id)}
+                aria-current={isActive ? "page" : undefined}
                 className={`relative py-1 transition-colors hover:text-white flex items-center gap-1.5 ${
                   isActive ? "text-[#FF6321]" : ""
                 }`}
               >
                 <span>{tab.label}</span>
                 {tab.badge && tab.badge > 0 ? (
-                  <span className="px-1.5 py-0.2 rounded-full bg-[#FF6321] text-black text-[9px] font-mono font-black">
-                    {tab.badge}
-                  </span>
+                  <>
+                    <span
+                      aria-hidden="true"
+                      className="px-1.5 py-0.2 rounded-full bg-[#FF6321] text-black text-[9px] font-mono font-black"
+                    >
+                      {tab.badge}
+                    </span>
+                    {/* The badge alone is a number that states nothing about what
+                        it counts, and it changed on a 30s poll that no live region
+                        announced. The visible chip is now decorative and the
+                        count is spelled out for assistive technology. */}
+                    <span className="sr-only">{tab.badge} unread</span>
+                  </>
                 ) : null}
                 {isActive && (
                   <span className="absolute -bottom-1 left-0 right-0 h-0.5 bg-[#FF6321]" />
@@ -103,23 +138,33 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, unreadC
               </button>
             );
           })}
-        </div>
+        </nav>
 
         {/* Right Actions: System Status & User Controls */}
         <div className="flex items-center gap-3 md:gap-5">
           {/* System Status Indicator — driven by a real poll of /health/ and
               /ready/. `animate-pulse` appears only while a probe is genuinely
               in flight; the old `animate-ping` pulsed for ever, which is a
-              visual claim of continuous activity the code never made. */}
-          <div className="hidden lg:flex flex-col text-right">
-            <span className="text-[9px] uppercase font-mono font-bold text-white/30 tracking-wider">
+              visual claim of continuous activity the code never made.
+
+              It was wrapped in `hidden lg:flex`, which put it outside the
+              accessibility tree below 1024px — on a mobile-first app whose reels
+              are sized to a phone viewport. There was no backend-health signal at
+              all on the primary device. The region is now rendered at every
+              width; only the "System Status" caption drops below `sm`, where the
+              header row has no room for a third two-line block, and the dot plus
+              the verdict still carry the signal. What the indicator *claims* is
+              unchanged and must stay that way: `/health/` is liveness and
+              `/ready/` is readiness, and neither observes a Celery worker. */}
+          <div className="flex flex-col text-right">
+            <span className="hidden sm:block text-[9px] uppercase font-mono font-bold text-white/50 tracking-wider">
               System Status
             </span>
             <span
               role="status"
               aria-live="polite"
               title={healthTitle(health)}
-              className={`text-[10px] uppercase font-mono font-bold flex items-center justify-end gap-1 ${healthView.text}`}
+              className={`text-[10px] uppercase font-mono font-bold whitespace-nowrap flex items-center justify-end gap-1 ${healthView.text}`}
             >
               <span
                 aria-hidden="true"
@@ -148,10 +193,19 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, unreadC
             {handsFreeMode && <span className="w-1.5 h-1.5 rounded-full bg-black" />}
           </button>
 
-          {/* User Profile Avatar */}
+          {/* User Profile Avatar.
+              `aria-label` rather than relying on `title`: accessible-name
+              computation is aria-labelledby → aria-label → content → title, so
+              the only child here — `<img alt={user?.username}>`, or the initial
+              letter — supplied the name and the button was announced as the
+              user's own username. "alice" was the name of the control that opens
+              the profile page. The alt text is left intact rather than
+              `aria-hidden`, so the avatar is still described when the button is
+              reached by its label. */}
           <button
             type="button"
             onClick={() => setActiveTab("profile")}
+            aria-label="My Profile"
             className="flex items-center gap-2 p-1 rounded-full hover:ring-2 hover:ring-[#FF6321]/50 transition-all"
             title="My Profile"
           >

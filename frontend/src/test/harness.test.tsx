@@ -76,10 +76,14 @@ describe("ErrorBoundary", () => {
 });
 
 describe("useSessionAnnouncer", () => {
-  it("announces a session expiry in a polite live region", () => {
+  it("announces a session expiry assertively, because the user is signed out", () => {
+    // This asserted `polite` and the assertion was updated deliberately, not
+    // to keep the suite green. Session expiry is a loss of function: the tree is
+    // being replaced by a login screen, so a polite announcement queues behind
+    // content that is about to be removed and may never be read.
     render(<Harness />);
 
-    expect(screen.getByRole("status")).toHaveAttribute("aria-live", "polite");
+    expect(screen.getByRole("status")).toHaveAttribute("aria-live", "assertive");
     expect(screen.queryByText(/session expired/i)).not.toBeInTheDocument();
 
     // The listener is a plain window event, so the state update is outside
@@ -97,8 +101,10 @@ describe("useSessionAnnouncer", () => {
       window.dispatchEvent(new CustomEvent("ef_session_expired"));
     });
 
-    // No auto-expiry: unlike NetworkBanner's 2.5 s timer, the reason the user
-    // was signed out must not vanish on its own.
+    // No auto-expiry. This comment used to point at "NetworkBanner's 2.5 s
+    // timer" — that timer was removed, and `navNetworkBanner.test.tsx` proves
+    // it by advancing 60 s and finding the notice still there. The only live
+    // 2.5 s timer in the app is the upload success redirect.
     expect(screen.getByText(/session expired/i)).toBeInTheDocument();
 
     act(() => {

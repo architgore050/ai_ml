@@ -1,16 +1,29 @@
 /**
  * A route-based `fetch` mock.
  *
- * `apiRequest` in `src/api/client.ts` layers four behaviours on top of `fetch`
- * that the tests actually need to assert against: the `Authorization` header,
- * single-flight 401 refresh + replay, `202` passthrough, and `Retry-After`
- * extraction. Mocking at the `fetch` boundary (rather than mocking
+ * `apiRequest` in `src/api/client.ts` layers these behaviours on top of
+ * `fetch`, and the tests assert against all of them: the `Authorization`
+ * header, single-flight 401 refresh + replay, `202` passthrough, the
+ * `Retry-After` read, the offline/timeout error classification, and the
+ * request deadline. Mocking at the `fetch` boundary (rather than mocking
  * `apiRequest` or the API modules) keeps those behaviours under test.
  *
  * Usage:
  *   const api = installFetchMock();
  *   api.on("POST", /\/auth\/login\//, () => json(200, { detail: "ok" }));
  *   api.fail("GET", /\/feed\//, new TypeError("NetworkError"));
+ *
+ * Two things to know before adding a route:
+ *
+ * - **The FIRST matching route wins** (`routes.find`, below), not the most
+ *   specific one. Register the narrow route before the broad one, and give
+ *   `installFetchMock()` a fresh instance per test so a previous test's routes
+ *   cannot match by accident.
+ * - **The signal is ignored.** `init.signal` is recorded but never observed, so
+ *   a handler that would hang stays hung after an abort. That is deliberate:
+ *   it reproduces the transport that ignores `AbortSignal`, which is why
+ *   `apiRequest` cannot rely on the abort alone. Use `hang: true` to model a
+ *   half-open connection.
  */
 
 import { vi } from "vitest";
@@ -21,6 +34,11 @@ export interface MockResponseSpec {
   headers?: Record<string, string>;
   /** Throw instead of responding, to simulate a transport failure. */
   networkError?: Error;
+  /**
+   * Never settle. Models a half-open connection: the request is in flight and
+   * no byte ever comes back, so only a deadline can end it.
+   */
+  hang?: boolean;
 }
 
 export type RouteHandler = (request: {
@@ -40,11 +58,31 @@ export interface FetchMock {
   on(method: string, matcher: RegExp | string, handler: RouteHandler): FetchMock;
   /** Register a route that rejects — the network-throw path. */
   fail(method: string, matcher: RegExp | string, error: Error): FetchMock;
-  calls: { url: string; method: string; body: any }[];
+  /** Register a route that never settles — the half-open-connection path. */
+  hang(method: string, matcher: RegExp | string): FetchMock;
+  calls: FetchCall[];
   /** Calls whose URL matches, for focused assertions. */
-  callsTo(matcher: RegExp | string): { url: string; method: string; body: any }[];
+  callsTo(matcher: RegExp | string): FetchCall[];
   reset(): void;
   mock: ReturnType<typeof vi.fn>;
+}
+
+/**
+ * A recorded request.
+ *
+ * `credentials` is included because it is load-bearing for exactly one caller:
+ * `mediaAPI.getPlaybackToken` needs `credentials: "include"` for the HLS cookie
+ * handshake, and nothing else in the app does. Without it in the record, that
+ * contract is asserted by reading the source rather than by running it.
+ */
+export interface FetchCall {
+  url: string;
+  method: string;
+  body: any;
+  credentials: string;
+  /** The `Authorization` header as sent, for asserting refresh rotation. */
+  authorization: string | null;
+  signal: AbortSignal | null | undefined;
 }
 
 function toMatcher(matcher: RegExp | string): RegExp {
@@ -88,13 +126,21 @@ function buildResponse(spec: MockResponseSpec): Response {
 
 export function installFetchMock(): FetchMock {
   const routes: Route[] = [];
-  const calls: { url: string; method: string; body: any }[] = [];
+  const calls: FetchCall[] = [];
 
   const mock = vi.fn(async (input: any, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input.url;
     const method = (init?.method ?? "GET").toUpperCase();
     const body = await parseBody(init);
-    calls.push({ url, method, body });
+    const requestHeaders = new Headers(init?.headers ?? {});
+    calls.push({
+      url,
+      method,
+      body,
+      credentials: init?.credentials ?? "same-origin",
+      authorization: requestHeaders.get("Authorization"),
+      signal: init?.signal,
+    });
 
     const route = routes.find((r) => matches(r, method, url));
     if (!route) {
@@ -108,9 +154,14 @@ export function installFetchMock(): FetchMock {
       url,
       method,
       body,
-      headers: new Headers(init?.headers ?? {}),
+      headers: requestHeaders,
     });
 
+    if (spec.hang) {
+      // Never settles. Deliberately ignores `init.signal`, so this is also the
+      // transport that does not honour an abort — see the note at the top.
+      return new Promise<Response>(() => {});
+    }
     if (spec.networkError) throw spec.networkError;
     return buildResponse(spec);
   });
@@ -128,6 +179,10 @@ export function installFetchMock(): FetchMock {
         matcher,
         handler: () => ({ networkError: error }),
       });
+      return this;
+    },
+    hang(method, matcher) {
+      routes.push({ method, matcher, handler: () => ({ hang: true }) });
       return this;
     },
     calls,
@@ -155,7 +210,19 @@ export function noContent(): MockResponseSpec {
   return { status: 204, body: undefined };
 }
 
-/** Convenience: a 429 carrying `Retry-After` (seconds, as the server sends it). */
+/**
+ * A 429 carrying `Retry-After`, in the delta-seconds form DRF's throttles
+ * actually send (`SimpleRateThrottle.wait` → `Retry-After: <n>`).
+ *
+ * `apiRequest` reads this header and puts it on the thrown error as
+ * `retryAfterSeconds`; pass the value you want to assert against and read it
+ * back off the error, so the test pins the header the server sent rather than
+ * a constant invented here.
+ *
+ * For a 429 with NO `Retry-After` (a proxy, or a throttle response that lost
+ * the header) use `json(429, { detail: "..." })` — that is a different case and
+ * must not be modelled by passing a made-up number.
+ */
 export function tooManyRequests(retryAfterSeconds: number): MockResponseSpec {
   return {
     status: 429,

@@ -17,7 +17,13 @@ export const BottomNav: React.FC<BottomNavProps> = ({ activeTab, setActiveTab, u
   ];
 
   return (
-    <nav className="fixed bottom-0 left-0 right-0 z-40 bg-[#0A0A0A]/95 backdrop-blur-xl border-t border-white/10 pb-safe md:hidden">
+    // Labelled because the Header now renders a second <nav> for the same five
+    // destinations at `md` and up. Two unlabelled navigation landmarks are a
+    // list a screen reader cannot act on. Both are called "Primary" because they
+    // are the same navigation at two breakpoints; collapsing them into one
+    // landmark means dropping `md:hidden` from this element, which is a layout
+    // change and an owner decision (RECON-06 §16 Q10), not an a11y patch.
+    <nav aria-label="Primary" className="fixed bottom-0 left-0 right-0 z-40 bg-[#0A0A0A]/95 backdrop-blur-xl border-t border-white/10 pb-safe md:hidden">
       <div className="max-w-md mx-auto flex items-center justify-around px-2 py-2">
         {tabs.map((tab) => {
           const Icon = tab.icon;
@@ -66,15 +72,26 @@ export const BottomNav: React.FC<BottomNavProps> = ({ activeTab, setActiveTab, u
               onClick={() => setActiveTab(tab.id)}
               aria-current={isActive ? "page" : undefined}
               className={`relative flex flex-col items-center justify-center py-1 px-3 transition-colors ${
-                isActive ? "text-[#FF6321]" : "text-white/40 hover:text-white/80"
+                isActive ? "text-[#FF6321]" : "text-white/50 hover:text-white/80"
               }`}
             >
               <div className="relative">
                 <Icon className="w-5 h-5" />
                 {tab.badge && tab.badge > 0 ? (
-                  <span className="absolute -top-1.5 -right-2 min-w-4 h-4 px-1 rounded-full bg-[#FF6321] text-[9px] font-black text-black flex items-center justify-center font-mono">
-                    {tab.badge}
-                  </span>
+                  <>
+                    {/* The badge is a number that states nothing about what it
+                        counts, so the button's computed name was "Inbox 5" —
+                        ambiguous in isolation, and it changed on a 30s poll that
+                        no live region announced. The visible chip is decorative
+                        and the count is spelled out for assistive technology. */}
+                    <span
+                      aria-hidden="true"
+                      className="absolute -top-1.5 -right-2 min-w-4 h-4 px-1 rounded-full bg-[#FF6321] text-[9px] font-black text-black flex items-center justify-center font-mono"
+                    >
+                      {tab.badge}
+                    </span>
+                    <span className="sr-only">{tab.badge} unread</span>
+                  </>
                 ) : null}
               </div>
               <span className="text-[9px] font-black uppercase tracking-wider mt-1">{tab.label}</span>

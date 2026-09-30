@@ -25,8 +25,33 @@ interface ErrorBoundaryState {
  * It is a class component because React has no hook equivalent for
  * `componentDidCatch` — this is not a style regression.
  *
- * Boundary placement is deliberate: it sits *inside* the providers, so a throw
- * in the providers themselves is not caught here (see the note in `App.tsx`).
+ * Boundary placement, corrected. This comment used to assert the opposite of
+ * what the JSX does: it described the boundary as nested under the providers,
+ * with provider throws escaping it, and it pointed at a note in `App.tsx` to
+ * back that up. No such note has ever existed there.
+ *
+ * `App.tsx` in fact renders this as the *outermost* element —
+ *
+ *     <ErrorBoundary>
+ *       <AuthProvider>
+ *         <PlayerProvider>
+ *           <AuthenticatedApp />
+ *
+ * — so a render-phase throw inside `AuthProvider` or `PlayerProvider` **is**
+ * caught here. The false claim was copied into two planning documents before
+ * anyone checked the JSX, which is how it survived: the same failure mode as
+ * the `CORS_URLS_REGEX` comment that described a `CorsMiddleware.check_origin`
+ * that does not exist. The old wording is deliberately not quoted above, so it
+ * cannot be copy-pasted back into circulation.
+ *
+ * The accurate and much narrower statement: a React error boundary catches
+ * render-phase throws only. Throws in an effect, in an event handler, or in an
+ * async callback are not caught by any boundary, and never were.
+ *
+ * `fallback` and `label` exist for route-scoped boundaries. Nothing in the app
+ * uses either — this is the only boundary, and there is no router to scope one
+ * with. They are left in place because they are the right shape for the day a
+ * router lands, not because anything reads them today.
  */
 export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
   override state: ErrorBoundaryState = { error: null };

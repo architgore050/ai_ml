@@ -33,6 +33,8 @@ export type CachedToken = { token: string; expiresAt: number };
 const cache = new Map<string, CachedToken>();
 /** De-duplicates concurrent mints of one clip. */
 const inflight = new Map<string, Promise<CachedToken>>();
+/** Changes whenever an account boundary invalidates every token. */
+let cacheGeneration = 0;
 
 /**
  * Which clip a state describes.
@@ -119,6 +121,19 @@ export function evictToken(clipId: string): void {
 }
 
 /**
+ * Forget every bearer token at an account boundary.
+ *
+ * A map clear alone is insufficient: a mint started just before logout may
+ * resolve afterwards. The generation keeps that stale result from being
+ * cached for the next account on this device.
+ */
+export function clearPlaybackTokenCache(): void {
+  cacheGeneration += 1;
+  cache.clear();
+  inflight.clear();
+}
+
+/**
  * Return a valid token for `clipId`, minting only if the cache cannot serve it.
  *
  * Concurrent calls for the same clip share one request.
@@ -130,10 +145,11 @@ export async function getOrMintToken(clipId: string): Promise<CachedToken> {
   const existing = inflight.get(clipId);
   if (existing) return existing;
 
+  const generation = cacheGeneration;
   const promise = (async (): Promise<CachedToken> => {
     const { token } = await mintPlaybackToken(clipId);
     const entry: CachedToken = { token, expiresAt: Date.now() + ASSUMED_TTL_MS };
-    cache.set(clipId, entry);
+    if (cacheGeneration === generation) cache.set(clipId, entry);
     return entry;
   })();
 
@@ -141,7 +157,7 @@ export async function getOrMintToken(clipId: string): Promise<CachedToken> {
   try {
     return await promise;
   } finally {
-    inflight.delete(clipId);
+    if (inflight.get(clipId) === promise) inflight.delete(clipId);
   }
 }
 
@@ -160,6 +176,5 @@ export function prefetchToken(clipId: string): void {
 
 /** Test seam: module-level state would otherwise leak between test files. */
 export function __resetTokenCacheForTests(): void {
-  cache.clear();
-  inflight.clear();
+  clearPlaybackTokenCache();
 }

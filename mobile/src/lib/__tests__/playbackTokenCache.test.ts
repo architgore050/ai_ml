@@ -4,6 +4,7 @@ import {
   ASSUMED_TTL_MS,
   REFRESH_MARGIN_MS,
   __resetTokenCacheForTests,
+  clearPlaybackTokenCache,
   classifyTokenError,
   evictToken,
   getOrMintToken,
@@ -73,6 +74,30 @@ describe('playbackTokenCache', () => {
 
       evictToken('clip-a');
       expect((await getOrMintToken('clip-a')).token).toBe('fresh');
+    });
+
+    it('clears every cached token at an account boundary', async () => {
+      mockMint.mockResolvedValueOnce(ok('first')).mockResolvedValueOnce(ok('second'));
+      expect((await getOrMintToken('clip-a')).token).toBe('first');
+
+      clearPlaybackTokenCache();
+
+      expect((await getOrMintToken('clip-a')).token).toBe('second');
+      expect(mockMint).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not restore a token whose mint completed after an account change', async () => {
+      let release!: (value: { status: 'ok'; token: string }) => void;
+      mockMint.mockReturnValueOnce(new Promise((resolve) => { release = resolve; }));
+      const staleMint = getOrMintToken('clip-a');
+
+      clearPlaybackTokenCache();
+      release(ok('previous-account'));
+      await staleMint;
+
+      mockMint.mockResolvedValueOnce(ok('next-account'));
+      expect((await getOrMintToken('clip-a')).token).toBe('next-account');
+      expect(mockMint).toHaveBeenCalledTimes(2);
     });
   });
 

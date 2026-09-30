@@ -3,6 +3,7 @@ import { create } from 'zustand';
 import { getTokenStore, onSessionExpired } from '../api/client';
 import { installTokenStore, purgeLegacy, secureStoreTokens } from '../api/tokenStore';
 import * as authApi from '../api/endpoints/auth';
+import { clearPlaybackTokenCache } from '../lib/playbackTokenCache';
 import type { OwnProfile } from '../api/schema';
 
 /**
@@ -150,6 +151,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       // the local clear is what matters for the device.
     } finally {
       await getTokenStore().clear();
+      clearPlaybackTokenCache();
       set({ status: 'anonymous', user: null, busy: false, error: null });
     }
   },
@@ -161,6 +163,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   /** 401 that survived a refresh, or a 7-day refresh expiry. */
   setExpired() {
     if (get().status === 'authenticated') {
+      clearPlaybackTokenCache();
       set({ status: 'expired', user: null, error: null });
     }
   },

@@ -566,23 +566,37 @@ describe('the reel, assembled', () => {
     expect(view.getAllByTestId(/^waveform-bar-/)).toHaveLength(80);
   });
 
-  it('mounts the transport, the scrubber and the play target on the ACTIVE reel only', async () => {
+  it('activates the first loaded reel when Android misses the initial viewability callback', async () => {
     mockFeed.mockReturnValue(feedState([clip('a'), clip('b')]));
     const view = await measure(await renderScreen());
 
-    // Nothing is active yet: `onViewableItemsChanged` has not fired, so no reel
-    // is the one the user is on. Every control is a full-size target, so this is
-    // also the assertion that a second reel cannot be played by accident.
-    expect(view.queryByTestId('clip-transport')).toBeNull();
-    expect(view.queryByTestId('seek-progress-bar')).toBeNull();
-    expect(view.queryByTestId('play-overlay')).toBeNull();
-
-    await seedLoaded('a');
-    await selectReel(view, clip('a'));
-
+    // RNTL does not invoke FlatList viewability on mount, mirroring the Android
+    // failure this fallback covers. The first reel must still become active so
+    // its token hook and native load path can run; controls for reel B remain
+    // unmounted because exactly one reel owns the player.
     expect(view.getAllByTestId('clip-transport')).toHaveLength(1);
     expect(view.getAllByTestId('seek-progress-bar')).toHaveLength(1);
     expect(view.getAllByTestId('play-overlay')).toHaveLength(1);
+  });
+
+  it('does not reload an active clip on native status updates', async () => {
+    // The real hook creates a fresh return wrapper every render. A player
+    // status tick also re-renders this screen, so the load effect must depend
+    // on token facts rather than that wrapper identity; otherwise every tick
+    // calls replace() and ExoPlayer restarts the same HLS VOD at 0:00.
+    const refresh = jest.fn();
+    mockToken.mockImplementation(
+      () => ({ status: 'ready', clipId: 'a', token: 'tok-a', refresh }) as never,
+    );
+    mockFeed.mockReturnValue(feedState([clip('a')]));
+    await measure(await renderScreen());
+    expect(mockLoad).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      usePlayerStore.setState({ playback: 'buffering', currentTime: 1 });
+    });
+
+    expect(mockLoad).toHaveBeenCalledTimes(1);
   });
 
   it('routes a tap on the active reel to the player, through the store', async () => {
@@ -636,8 +650,6 @@ describe('the reel, assembled', () => {
     mockFeed.mockReturnValue(feedState([clip('a')]));
     mockToken.mockReturnValue(token('unavailable', 'a') as never);
     const view = await measure(await renderScreen());
-    await seedLoaded('a');
-    await selectReel(view, clip('a'));
 
     expect(view.getByText('This clip is no longer available')).toBeTruthy();
     expect(view.queryByText('Now playing')).toBeNull();

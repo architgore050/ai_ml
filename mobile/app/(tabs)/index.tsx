@@ -42,6 +42,7 @@ import { useTelemetrySkip } from '../../src/hooks/useWatchTelemetry';
 import { layout, spacing, surface } from '../../src/design/tokens';
 import { typography } from '../../src/design/typography';
 import type { FeedClip } from '../../src/api/schema';
+import type { TokenStatus } from '../../src/lib/playbackTokenCache';
 
 /**
  * The feed: vertical snap reels over ONE app-wide player.
@@ -286,6 +287,22 @@ export default function Screen({
 
   const viewabilityConfig = useRef({ itemVisiblePercentThreshold: 70 }).current;
 
+  /**
+   * `onViewableItemsChanged` is the preferred mount signal, but some Android
+   * navigation shells do not deliver its initial callback for an already
+   * visible tab scene. Without a selected reel, no playback token is minted
+   * and the full-card Play target correctly refuses to control a player that
+   * has never loaded anything. Select the first loaded reel as a non-user
+   * fallback. A later viewability or momentum event still owns subsequent
+   * selection, and this path deliberately reports no abandonment.
+   */
+  const firstClipId = clips[0]?.id ?? null;
+  useEffect(() => {
+    if (activeClipId !== null || firstClipId === null) return;
+    activeClipIdRef.current = firstClipId;
+    setActiveClipId(firstClipId);
+  }, [activeClipId, firstClipId]);
+
   // The visible reel is the only one that mints a token.
   const activeIndexById = useMemo(
     () => clips.findIndex((c) => c.id === activeClipId),
@@ -293,6 +310,21 @@ export default function Screen({
   );
   const activeClip = activeIndexById >= 0 ? clips[activeIndexById] : undefined;
   const token = usePlaybackToken(activeClipId);
+  /**
+   * `usePlaybackToken` returns a new wrapper object on every render. Native
+   * status ticks re-render this screen, so using that wrapper itself as a load
+   * effect dependency repeatedly called `player.replace()` for the same HLS
+   * source. ExoPlayer then restarted the VOD from zero while successfully
+   * fetching manifests and segments, which looked like silent playback.
+   *
+   * Keep the effect keyed to the token facts that change its decision. The
+   * refresh callback is separately stable for one clip (`useCallback` in the
+   * hook), and belongs only to the processing retry below.
+   */
+  const stableToken = useMemo<TokenStatus>(
+    () => token,
+    [token.status, token.clipId, token.status === 'ready' ? token.token : null],
+  );
 
   // Prefetch the NEXT clip so a swipe does not stall on a token mint.
   const nextClipId = useMemo(() => {
@@ -329,7 +361,7 @@ export default function Screen({
   useEffect(() => {
     const clip = activeClipRef.current;
     const action = decidePlaybackAction({
-      token,
+      token: stableToken,
       activeClipId,
       activeClipMissing: activeClipId !== null && !clip,
       activeClipHasNoPlaylist: Boolean(activeClipId) && !clip?.hls_playlist_url,
@@ -383,7 +415,7 @@ export default function Screen({
       default:
         return;
     }
-  }, [token, activeClipId, setCardStatus, pause]);
+  }, [stableToken, activeClipId, setCardStatus, pause, token.refresh]);
 
   /**
    * Hands-free auto-advance.

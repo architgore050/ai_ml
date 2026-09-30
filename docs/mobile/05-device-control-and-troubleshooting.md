@@ -60,6 +60,10 @@ In another terminal:
 ```bash
 adb devices
 adb reverse tcp:8081 tcp:8081
+# The local development HLS URL is https://127.0.0.1:19443. These forwards
+# make localhost on the physical phone reach nginx on this machine.
+adb reverse tcp:18443 tcp:18443
+adb reverse tcp:19443 tcp:19443
 curl -fsS http://127.0.0.1:8081/status
 ```
 
@@ -137,6 +141,9 @@ A `206` for a segment is expected for a range request.
 | Discover had no obvious playback action | Cards only displayed text | Discover was not connected to the shared player | A fixed 52px accessible play/pause control now mints a token and loads the selected clip |
 | Idle reel looked non-interactive | The full-card touch target existed but its overlay was hidden | Visibility only showed a transient playing state or a paused latch | Idle playable reels now show the central play triangle |
 | Feed stayed on “Loading feed” despite successful `/feed/` 200 responses | Device nginx logs showed pages arriving; accessibility tree still showed the spinner | Android did not dispatch the first tab-route `onLayout`, leaving viewport height at zero | Feed now starts with `Dimensions.get('window').height - layout.navClearance`, then replaces it with the measured layout height |
+| First feed reel accepted no Play tap and nginx logged no token or HLS request | The first reel remained labelled Play at `0:00`; after a tap there was no `POST /media/playback-token/` | On this Android tab scene, FlatList did not send its initial viewability callback, so `activeClipId` remained null and the overlay correctly refused to toggle an unloaded player | The screen now selects the first loaded clip when no viewability callback arrives. It does not report a skip because initial selection is not a departure. A render test covers this exact missing-callback path. |
+| ExoPlayer failed with `ConnectException` to port `19443` | Android logcat named `HttpDataSource` and `ECONNREFUSED`; the API and token mint still succeeded | Only Metro had an ADB reverse. The phone’s `127.0.0.1:19443` is its own loopback interface, not nginx on the laptop | Install forwards for `18443` and `19443` as well as `8081`, then reload the development client. The manifest and segments should appear in nginx as `200`. |
+| HLS requests were all `200`, but the transport remained at `0:00` and the player repeatedly fetched the whole VOD | nginx showed manifest, playlist, and all segments repeatedly, about once per second | Every native status tick re-rendered the feed. `usePlaybackToken` returned a fresh wrapper object, and the load effect depended on that wrapper, so it called `replace()` for the same clip on every tick | The load effect is keyed to the token’s status, clip ID, and ready token value. A render regression test now feeds a fresh wrapper on each render and verifies that a status update does not call `loadClip` twice. On the device the transport advanced from `0:00` to `0:37` after the fix. |
 | Local dev client opened Tools or a stale LAN error | Development-client launcher appeared, or `ECONNREFUSED` named the host LAN address | Metro only listened on loopback while the client had a cached LAN project URL | Run Metro, restore `adb reverse tcp:8081 tcp:8081`, and open the explicit loopback deep link |
 
 ## Feed cold start

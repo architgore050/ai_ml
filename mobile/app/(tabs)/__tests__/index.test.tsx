@@ -51,6 +51,12 @@ import type { FeedClip } from '../../../src/api/schema';
  */
 
 jest.mock('../../../src/hooks/useBackendStatus', () => ({ useBackendStatus: () => 'ok' }));
+// The feed only needs the viewer id to decide whether a comment can expose its
+// own edit/delete controls. Keep this native-storage-backed store outside this
+// geometry/transport suite.
+jest.mock('../../../src/store/auth', () => ({
+  useAuthStore: (selector: (state: { user: null }) => unknown) => selector({ user: null }),
+}));
 
 /**
  * The production abandonment seam, mocked wholesale so the screen's CALL

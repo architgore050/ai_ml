@@ -8,6 +8,7 @@ import { ClipTransport } from './ClipTransport';
 import { OVERLAY_Z, PlayOverlay } from './PlayOverlay';
 import { SeekProgressBar } from './SeekProgressBar';
 import { WaveformBars } from './WaveformBars';
+import { ActionCluster } from './ActionCluster';
 import { categoryColor, categoryLabel } from '../../design/categories';
 import { gradients, spacing } from '../../design/tokens';
 import { typography } from '../../design/typography';
@@ -80,6 +81,8 @@ export const LAYER = {
   progress: 22,
   /** Reserved for the status layer; nothing is drawn above the footer today. */
   status: 30,
+  /** Like/comment/share controls, above the full-bleed play overlay. */
+  actions: 31,
 } as const;
 
 /**
@@ -125,6 +128,8 @@ export function ReelCard({
   playback,
   durationMs,
   height,
+  onOpenComments,
+  onOpenShare,
 }: {
   clip: FeedClip;
   active: boolean;
@@ -135,6 +140,8 @@ export function ReelCard({
   durationMs?: number;
   /** Measured viewport height. `flex: 1` alone resolves to zero here. */
   height: number;
+  onOpenComments?: () => void;
+  onOpenShare?: () => void;
 }) {
   const tint = categoryColor(clip.category);
   const seconds = durationMs ? Math.round(msToSeconds(durationMs)) : null;
@@ -291,6 +298,25 @@ export function ReelCard({
           </View>
         </View>
       ) : null}
+
+      {/* The action controls are mounted only for the active reel. A mounted
+          neighbour must never offer mutations for a clip that is not on screen,
+          and the layer sits above PlayOverlay so its circles receive presses. */}
+      {active && onOpenComments && onOpenShare ? (
+        <View testID="reel-layer-actions" style={[styles.actions, { zIndex: LAYER.actions }]} pointerEvents="box-none">
+          <ActionCluster
+            clipId={clip.id}
+            isLiked={clip.is_liked}
+            likeCount={clip.likes}
+            commentCount={clip.comment_count}
+            shareCount={clip.shares}
+            isShareable
+            disabled={cardStatus !== 'idle'}
+            onOpenComments={onOpenComments}
+            onOpenShare={onOpenShare}
+          />
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -399,4 +425,5 @@ const styles = StyleSheet.create({
    * later `alignItems` on the footer must not be able to narrow it.
    */
   footerSlot: { alignSelf: 'stretch' },
+  actions: { position: 'absolute', right: 12, bottom: 140 },
 });

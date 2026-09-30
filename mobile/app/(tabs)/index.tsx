@@ -13,10 +13,13 @@ import {
 import { Button, Spinner } from '../../src/components/ui/Button';
 import { NetworkBanner } from '../../src/components/NetworkBanner';
 import { ReelCard } from '../../src/components/reel/ReelCard';
+import { ShareModal } from '../../src/components/share/ShareModal';
+import { CommentSheet } from '../../src/components/comments/CommentSheet';
 import { useBackendStatus } from '../../src/hooks/useBackendStatus';
 import { useFeedBuffer, useSuggestionsFallback } from '../../src/hooks/useFeedBuffer';
 import { usePlaybackToken, usePrefetchPlaybackToken } from '../../src/hooks/usePlaybackToken';
 import { loadClip, pause, usePlayerStore } from '../../src/store/player';
+import { useAuthStore } from '../../src/store/auth';
 import { decidePlaybackAction } from '../../src/lib/playbackDecision';
 import {
   clampIndex,
@@ -149,6 +152,9 @@ export default function Screen({
   /** Guards the inter-reel pause. */
   const lastLoadAt = useRef(0);
   const [activeClipId, setActiveClipId] = useState<string | null>(null);
+  const [shareClip, setShareClip] = useState<FeedClip | null>(null);
+  const [commentClip, setCommentClip] = useState<FeedClip | null>(null);
+  const viewerId = useAuthStore((state) => state.user?.id ?? null);
 
   /**
    * Mirror of `activeClipId` for use inside `onMomentumScrollEnd`, which must
@@ -533,6 +539,8 @@ export default function Screen({
         playback={playback}
         durationMs={item.duration_ms}
         height={viewport}
+        onOpenComments={() => setCommentClip(item)}
+        onOpenShare={() => setShareClip(item)}
       />
     ),
     [activeClipId, cardStatus, playback, viewport],
@@ -606,6 +614,20 @@ export default function Screen({
           }
         />
       )}
+      <ShareModal
+        visible={shareClip !== null}
+        clipId={shareClip?.id ?? ''}
+        title={shareClip?.title}
+        creatorName={shareClip?.creator_name}
+        isShareable
+        onClose={() => setShareClip(null)}
+      />
+      <CommentSheet
+        visible={commentClip !== null}
+        clipId={commentClip?.id ?? ''}
+        viewerId={viewerId}
+        onClose={() => setCommentClip(null)}
+      />
     </View>
   );
 }

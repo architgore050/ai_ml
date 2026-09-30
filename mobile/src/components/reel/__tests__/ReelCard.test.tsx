@@ -152,6 +152,19 @@ const renderCard = async (over: Partial<Parameters<typeof ReelCard>[0]> = {}) =>
     />,
   );
 
+it('mounts actionable controls above the play overlay only when the feed supplies both sheet callbacks', async () => {
+  const comments = jest.fn();
+  const share = jest.fn();
+  const r = await renderCard({ onOpenComments: comments, onOpenShare: share });
+  const layer = node(r, 'reel-layer-actions');
+  expect(styleOf(layer).zIndex).toBe(LAYER.actions);
+  expect(LAYER.actions).toBeGreaterThan(OVERLAY_Z);
+  await fireEvent.press(r.getByTestId('action-comment'));
+  await fireEvent.press(r.getByTestId('action-share'));
+  expect(comments).toHaveBeenCalledTimes(1);
+  expect(share).toHaveBeenCalledTimes(1);
+});
+
 /** Hidden-aware lookup — the orbs and the overlay circle are `aria-hidden`. */
 const node = (r: Rendered, testID: string): TestInstance =>
   r.getByTestId(testID, { includeHiddenElements: true });

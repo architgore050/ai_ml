@@ -331,13 +331,12 @@ describe('list geometry', () => {
 });
 
 describe('rendering', () => {
-  it('mounts without a SafeArea error and renders the feed', async () => {
-    // The screen is gated on the list measurement, so before `onLayout` fires
-    // it shows the loading spinner. Both that and the list are valid; a throw
-    // is not. Asserting on real output rather than a snapshot, because the
-    // failure this guards is a crash, not a shape change.
+  it('mounts with a window-height fallback when layout has not arrived', async () => {
+    // Android can render a tab route without delivering its first onLayout.
+    // The fallback must show real content rather than strand a healthy feed on
+    // the loading spinner; a later layout event still supplies the exact height.
     const view = await renderScreen();
-    expect(view.getByText('Loading feed')).toBeTruthy();
+    expect(view.getByText('clip a')).toBeTruthy();
   });
 
   it('renders the clips once the viewport is measured', async () => {
@@ -383,12 +382,11 @@ describe('rendering', () => {
     expect(heights[0]).not.toBe(844);
   });
 
-  it('does not render the list before the viewport is measured', async () => {
+  it('renders usable fallback-height cells before the route measurement arrives', async () => {
     mockFeed.mockReturnValue(feedState([clip('a')]));
     const view = await renderScreen();
-    // Pins the gate, so a future change cannot drop it and silently ship the
-    // zero-height cells.
-    expect(view.queryByText('clip a')).toBeNull();
+    expect(view.getByText('clip a')).toBeTruthy();
+    expect(cellHeights(view)[0]).toBeGreaterThan(0);
   });
 
   it('offers a retry when the feed errored, instead of blaming the content', async () => {

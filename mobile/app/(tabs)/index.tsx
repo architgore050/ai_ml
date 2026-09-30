@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   FlatList,
+  Dimensions,
   StyleSheet,
   Text,
   View,
@@ -38,7 +39,7 @@ import {
   type AdvanceReporter,
 } from '../../src/lib/handsFreeAdvance';
 import { useTelemetrySkip } from '../../src/hooks/useWatchTelemetry';
-import { spacing, surface } from '../../src/design/tokens';
+import { layout, spacing, surface } from '../../src/design/tokens';
 import { typography } from '../../src/design/typography';
 import type { FeedClip } from '../../src/api/schema';
 
@@ -178,7 +179,7 @@ export default function Screen({
   onAdvanceRef.current = onAdvance;
 
   /**
-   * Measured viewport height. NOT `window.height`: the tab bar is
+   * Measured viewport height. The tab bar is
    * `layout.navClearance` (100px), so a reel is the window minus the bar.
    *
    * The cells need this. `ReelCard`'s root was `flex: 1`, and a FlatList cell
@@ -188,9 +189,14 @@ export default function Screen({
    * height to snap to. This is the single most likely reason nothing appeared
    * on screen, and it cannot be caught by `tsc` or a unit test.
    *
-   * Until it is non-zero the list is not rendered at all (see below).
+   * Some Android navigation shells do not dispatch this route's first
+   * `onLayout`, even though the tab scene is already visible. Use the window
+   * minus the tab clearance as a conservative initial value; a real layout
+   * measurement still replaces it as soon as it arrives.
    */
-  const [viewport, setViewport] = useState(0);
+  const [viewport, setViewport] = useState(() =>
+    Math.max(1, Math.round(Dimensions.get('window').height - layout.navClearance)),
+  );
   const listRef = useRef<FlatList<FeedClip>>(null);
 
   const onListLayout = useCallback((e: LayoutChangeEvent) => {
@@ -569,51 +575,42 @@ export default function Screen({
       onLayout={onListLayout}
     >
       <NetworkBanner status={backend} />
-      {viewport === 0 ? (
-        // Not yet measured. Rendering the list here would produce the
-        // zero-height cells described above; the first `onLayout` resolves it
-        // within a frame.
-        <View style={styles.center}>
-          <Spinner label="Loading feed" />
-        </View>
-      ) : (
-        <FlatList
-          ref={listRef}
-          data={clips}
-          keyExtractor={(c) => c.id}
-          renderItem={renderItem}
-          pagingEnabled
-          getItemLayout={getItemLayout}
-          showsVerticalScrollIndicator={false}
-          onViewableItemsChanged={onViewableItemsChanged}
-          viewabilityConfig={viewabilityConfig}
-          onMomentumScrollEnd={onMomentumScrollEnd}
-          // Keeps the buffer shallow: these are full-bleed reels, and holding
-          // dozens of them mounted is what made the old feed stutter.
-          initialNumToRender={2}
-          windowSize={3}
-          removeClippedSubviews
-          onScrollToIndexFailed={onScrollToIndexFailed}
-          ListEmptyComponent={
-            <View style={styles.center}>
-              <Text style={typography.title}>Nothing to play yet</Text>
-              <Text style={[typography.bodySecondary, styles.emptyBody]}>
-                {feed.coolingDown
-                  ? 'Finding more for you…'
-                  : feed.error
-                    ? // A transport failure is not a statement about content,
-                      // and there is no pull-to-refresh on this list, so the
-                      // copy has to offer the action that actually exists.
-                      "We couldn't load the feed."
-                    : 'Upload a clip to get started.'}
-              </Text>
-              {feed.error ? (
-                <Button label="Try again" onPress={feed.refresh} style={styles.retry} />
-              ) : null}
-            </View>
-          }
-        />
-      )}
+      <FlatList
+        ref={listRef}
+        data={clips}
+        keyExtractor={(c) => c.id}
+        renderItem={renderItem}
+        pagingEnabled
+        getItemLayout={getItemLayout}
+        showsVerticalScrollIndicator={false}
+        onViewableItemsChanged={onViewableItemsChanged}
+        viewabilityConfig={viewabilityConfig}
+        onMomentumScrollEnd={onMomentumScrollEnd}
+        // Keeps the buffer shallow: these are full-bleed reels, and holding
+        // dozens of them mounted is what made the old feed stutter.
+        initialNumToRender={2}
+        windowSize={3}
+        removeClippedSubviews
+        onScrollToIndexFailed={onScrollToIndexFailed}
+        ListEmptyComponent={
+          <View style={styles.center}>
+            <Text style={typography.title}>Nothing to play yet</Text>
+            <Text style={[typography.bodySecondary, styles.emptyBody]}>
+              {feed.coolingDown
+                ? 'Finding more for you…'
+                : feed.error
+                  ? // A transport failure is not a statement about content,
+                    // and there is no pull-to-refresh on this list, so the
+                    // copy has to offer the action that actually exists.
+                    "We couldn't load the feed."
+                  : 'Upload a clip to get started.'}
+            </Text>
+            {feed.error ? (
+              <Button label="Try again" onPress={feed.refresh} style={styles.retry} />
+            ) : null}
+          </View>
+        }
+      />
       <ShareModal
         visible={shareClip !== null}
         clipId={shareClip?.id ?? ''}

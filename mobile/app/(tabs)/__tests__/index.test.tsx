@@ -1,5 +1,7 @@
-import { act, render } from '@testing-library/react-native';
+import { act, fireEvent, render } from '@testing-library/react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { readFileSync, readdirSync } from 'fs';
+import { join } from 'path';
 
 import Screen from '../index';
 
@@ -10,6 +12,7 @@ import { useFeedBuffer, useSuggestionsFallback } from '../../../src/hooks/useFee
 import { usePlaybackToken, usePrefetchPlaybackToken } from '../../../src/hooks/usePlaybackToken';
 import { loadClip, msToSeconds, pause, usePlayerStore } from '../../../src/store/player';
 import { decidePlaybackAction } from '../../../src/lib/playbackDecision';
+import { SKIP_SECONDS } from '../../../src/lib/skipSeconds';
 import {
   clampIndex,
   clipIdAtIndex,
@@ -57,12 +60,54 @@ jest.mock('../../../src/hooks/usePlaybackToken', () => ({
  *
  * Built inside the factory (jest forbids out-of-scope references there) and
  * reached afterwards through `jest.requireMock`.
+ *
+ * THE FACTORY IS AN EXHAUSTIVE LIST OF NAMES, and adding an import to
+ * `src/store/player` that is missing here does NOT fail `tsc` — it makes the
+ * importing component `undefined` at runtime instead. That is the failure
+ * "resolves every name the reel imports from store/player" below exists to
+ * catch, and it reads the names off the sources rather than off this comment.
  */
 jest.mock('../../../src/store/player', () => {
   const { create } = require('zustand');
+  const INITIAL = {
+    queue: [],
+    activeIndex: 0,
+    handsFree: true,
+    cardStatus: 'idle',
+    playback: 'idle',
+    currentTime: 0,
+    duration: 0,
+    playingClipId: null as string | null,
+    endedForClipId: null as string | null,
+    error: null as string | null,
+  };
   return {
     loadClip: jest.fn(),
     pause: jest.fn(),
+    // `PlayOverlay` calls `resume()` on the press that starts playback, so a
+    // missing name here is a TypeError on the tap path rather than a compile
+    // error.
+    resume: jest.fn(),
+    // `SeekProgressBar`'s tap channel commits through `clampSeekTime` and then
+    // `seekToSeconds`.
+    seekToSeconds: jest.fn(),
+    /**
+     * `null`, which is what the real `skipBy` returns when nothing is loaded
+     * (`clampSeekTime`'s refusal) — and the mock store's `duration` is 0 until a
+     * test seeds it.
+     */
+    skipBy: jest.fn(() => null),
+    /**
+     * A transcription of the real `clampSeekTime`, which is unit-tested in
+     * `store/__tests__/player.test.ts`. It cannot be re-exported from the real
+     * module: `jest.requireActual` would import `expo-audio`, whose native
+     * module does not exist under jest and which crashes at import.
+     */
+    clampSeekTime: (requested: number, duration: number) => {
+      if (!Number.isFinite(requested) || !Number.isFinite(duration)) return null;
+      if (duration <= 0) return null;
+      return Math.min(Math.max(requested, 0), duration);
+    },
     msToSeconds: (ms: number) => ms / 1000,
     playbackStateFrom: jest.fn(() => 'idle'),
     // Mirrors the real store's shape, including the split between the card's
@@ -70,27 +115,29 @@ jest.mock('../../../src/store/player', () => {
     // would let the screen render while hiding the very confusion this stage
     // removed.
     usePlayerStore: create((set: (p: unknown) => void) => ({
-      queue: [],
-      activeIndex: 0,
-      handsFree: true,
-      cardStatus: 'idle',
-      playback: 'idle',
-      currentTime: 0,
-      duration: 0,
-      playingClipId: null as string | null,
-      error: null as string | null,
+      ...INITIAL,
       setQueue: () => {},
       setActiveIndex: () => {},
       toggleHandsFree: () => {},
       setCardStatus: (cardStatus: string) => set({ cardStatus }),
       syncFromPlayer: () => {},
-      reset: () => {},
+      // Real, unlike the rest of the doubles: the reel's own components subscribe
+      // to this store, so a test that seeds it must not leak into the next one.
+      reset: () => set({ ...INITIAL }),
     })),
   };
 });
 
-const mockedPlayer = jest.requireMock('../../../src/store/player') as {
-  usePlayerStore: { getState: () => Record<string, unknown> };
+const mockedPlayer = jest.requireMock('../../../src/store/player') as Record<string, unknown> & {
+  usePlayerStore: { getState: () => Record<string, unknown>; setState: (p: unknown) => void };
+  loadClip: jest.Mock;
+  pause: jest.Mock;
+  resume: jest.Mock;
+  seekToSeconds: jest.Mock;
+  skipBy: jest.Mock;
+  clampSeekTime: unknown;
+  msToSeconds: unknown;
+  playbackStateFrom: unknown;
 };
 const playState = mockedPlayer.usePlayerStore.getState();
 
@@ -132,6 +179,8 @@ const VIEWPORT = 800;
 
 beforeEach(() => {
   jest.clearAllMocks();
+  // The mock store's `reset` is real (see the factory), because the reel's own
+  // components now subscribe to it and a seeded state would leak between tests.
   usePlayerStore.getState().reset();
   mockFallback.mockReturnValue({ clips: [], loading: false, error: null });
   mockToken.mockReturnValue({ status: 'minting', clipId: null, refresh: jest.fn() });
@@ -176,10 +225,21 @@ async function measure(result: Awaited<ReturnType<typeof render>>, height = 800)
   return result;
 }
 
-/** Numeric heights found in any host node's style, flattened from arrays. */
+/**
+ * The height handed to each reel card, flattened from its style array.
+ *
+ * SCOPED TO `reel-card` on purpose. This walked every host node when the card
+ * was identity-only, and the reel now contains fixed-size decoration — the two
+ * 280/200 px ambient orbs, the 60 px waveform row — whose numeric `height`
+ * landed in the same array and broke the "every height is the measured
+ * viewport" assertion with a value that is legitimately not a cell. Scoping to
+ * the card's own root is a tightening, not a weakening: the claim is still
+ * about every cell, and it can no longer be satisfied (or contradicted) by a
+ * view that is not a cell.
+ */
 function cellHeights(view: Awaited<ReturnType<typeof render>>): number[] {
   const out: number[] = [];
-  for (const node of view.root?.queryAll(() => true) ?? []) {
+  for (const node of view.root?.queryAll((n) => n.props?.testID === 'reel-card') ?? []) {
     const style = node.props?.style;
     const entries = Array.isArray(style) ? style : [style];
     for (const entry of entries) {
@@ -315,5 +375,246 @@ describe('rendering', () => {
     expect(typeof unambiguousViewableId).toBe('function');
     expect(typeof clampIndex).toBe('function');
     expect(typeof decidePlaybackAction).toBe('function');
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* The reel, assembled                                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Select a reel the way the app does, and let the screen's own effects run.
+ *
+ * `onViewableItemsChanged` is the screen's own callback (a `useRef(...).current`
+ * in `index.tsx:154`), driven here with one viewable item — which is the
+ * "settled on a reel" case, since mid-snap both reels clear the 70% threshold
+ * and `unambiguousViewableId` deliberately returns `null` for two.
+ *
+ * Nothing here reaches into the screen: the node is found by the props the
+ * FlatList itself was rendered with, and the handler is the shipped one.
+ */
+async function selectReel(
+  view: Awaited<ReturnType<typeof renderScreen>>,
+  item: FeedClip,
+) {
+  const list = view.root
+    ?.queryAll(
+      (n) =>
+        Array.isArray(n.props?.data) &&
+        typeof n.props?.onViewableItemsChanged === 'function',
+    )
+    .at(0);
+  await act(async () => {
+    list?.props.onViewableItemsChanged?.({
+      viewableItems: [{ item, isViewable: true, key: item.id }],
+      changed: [],
+    });
+  });
+  return view;
+}
+
+/** Seed the store the way a successful load would leave it. */
+async function seedLoaded(id: string) {
+  await act(async () => {
+    usePlayerStore.setState({
+      cardStatus: 'idle',
+      playback: 'playing',
+      currentTime: 12,
+      duration: 60,
+      playingClipId: id,
+      endedForClipId: null,
+      error: null,
+    });
+  });
+}
+
+const token = (status: string, id: string) => ({
+  status,
+  clipId: id,
+  refresh: jest.fn(),
+});
+
+/**
+ * Every name `src/store/player` has to export for this screen's reel to mount,
+ * READ OFF THE SOURCES.
+ *
+ * WHY A SCAN AND NOT A LIST. `jest.mock`'s factory replaces a module wholesale:
+ * an import this file does not name resolves to `undefined` at runtime, and
+ * `tsc` cannot see it because the real module still declares the export. A
+ * hand-written list in the test would be a second place to forget — the same
+ * arrangement `PlayOverlay`'s docstring warns about, where two copies of a set
+ * drift until someone edits one of them. So the expectation IS the derived set.
+ */
+function playerNamesImportedBy(file: string): string[] {
+  const source = readFileSync(file, 'utf8');
+  // `[^;]*?` and not `[\s\S]*?`: a lazy `[\s\S]` happily spans every import
+  // statement between this one and the first `from '…store/player'`, which
+  // collects the whole file's imports as if they were one clause.
+  const match = source.match(
+    /^import\s+([^;]*?)\s+from\s+['"][^'"]*store\/player['"]/m,
+  );
+  if (!match) return [];
+  // `import { msToSeconds, type CardStatus } from …` and `import type { X } from
+  // …`: a `type` import is stripped by the TS transform and never becomes a
+  // runtime reference, so requiring those in the mock would be wrong. What has
+  // to resolve is the VALUE import. Both the inline `type X` pair and a leading
+  // `type` keyword are removed, because only the keyword is a word boundary the
+  // name can hide behind.
+  const clause = (match[1] ?? '')
+    .replace(/\btype\s+[A-Za-z_$][\w$]*/g, '')
+    .replace(/^\s*type\b\s*/, '');
+  return clause.match(/[A-Za-z_$][\w$]*/g) ?? [];
+}
+
+function playerNamesTheScreenNeeds(): string[] {
+  const reelDir = join(__dirname, '..', '..', '..', 'src', 'components', 'reel');
+  const files = [
+    join(__dirname, '..', 'index.tsx'),
+    ...readdirSync(reelDir)
+      .filter((f) => f.endsWith('.tsx') || f.endsWith('.ts'))
+      .map((f) => join(reelDir, f)),
+  ];
+  return [...new Set(files.flatMap(playerNamesImportedBy))].sort();
+}
+
+describe('the reel, assembled', () => {
+  it('resolves every name the reel imports from store/player through this mock', () => {
+    const required = playerNamesTheScreenNeeds();
+
+    // The scan has to actually find something, or a broken regex would make the
+    // expectation below vacuously true.
+    expect(required.length).toBeGreaterThan(5);
+    expect(required).toEqual([
+      'clampSeekTime',
+      'loadClip',
+      'msToSeconds',
+      'pause',
+      'resume',
+      'seekToSeconds',
+      'skipBy',
+      'usePlayerStore',
+    ]);
+    // And each one resolves to something callable/usable, which is the actual
+    // failure mode: `undefined` reaching a component that renders it.
+    for (const name of required) {
+      expect({ name, resolved: typeof mockedPlayer[name] }).not.toEqual({
+        name,
+        resolved: 'undefined',
+      });
+    }
+  });
+
+  it('draws the backdrop, the orbs and the waveform on every reel', async () => {
+    mockFeed.mockReturnValue(feedState([clip('a'), clip('b')]));
+    const view = await measure(await renderScreen());
+
+    // `ambient-orbs` is `aria-hidden` and `pointerEvents="none"` by design, so
+    // RNTL v14 needs to be told it is allowed to see it.
+    expect(view.getAllByTestId('ambient-orbs', { includeHiddenElements: true })).toHaveLength(2);
+    expect(view.getAllByTestId('reel-backdrop')).toHaveLength(2);
+    // 40 bars per cell, so 80 for two — the row is per-card, not per-screen.
+    expect(view.getAllByTestId(/^waveform-bar-/)).toHaveLength(80);
+  });
+
+  it('mounts the transport, the scrubber and the play target on the ACTIVE reel only', async () => {
+    mockFeed.mockReturnValue(feedState([clip('a'), clip('b')]));
+    const view = await measure(await renderScreen());
+
+    // Nothing is active yet: `onViewableItemsChanged` has not fired, so no reel
+    // is the one the user is on. Every control is a full-size target, so this is
+    // also the assertion that a second reel cannot be played by accident.
+    expect(view.queryByTestId('clip-transport')).toBeNull();
+    expect(view.queryByTestId('seek-progress-bar')).toBeNull();
+    expect(view.queryByTestId('play-overlay')).toBeNull();
+
+    await seedLoaded('a');
+    await selectReel(view, clip('a'));
+
+    expect(view.getAllByTestId('clip-transport')).toHaveLength(1);
+    expect(view.getAllByTestId('seek-progress-bar')).toHaveLength(1);
+    expect(view.getAllByTestId('play-overlay')).toHaveLength(1);
+  });
+
+  it('routes a tap on the active reel to the player, through the store', async () => {
+    mockFeed.mockReturnValue(feedState([clip('a')]));
+    mockToken.mockReturnValue(token('ready', 'a') as never);
+    const view = await measure(await renderScreen());
+    await seedLoaded('a');
+    await selectReel(view, clip('a'));
+
+    await fireEvent.press(view.getByTestId('play-overlay'));
+
+    // The screen's own `pause` export, which is what `PlayOverlay` calls. The
+    // store is a double here, so this is the seam: a reel that mounted a
+    // different `play-overlay` (an `undefined` component, or one reading a
+    // different store) would not reach it.
+    expect(mockedPlayer.pause).toHaveBeenCalled();
+    expect(mockedPlayer.resume).not.toHaveBeenCalled();
+
+    // ...and the other direction, which is what a missing `resume` in the mock
+    // factory actually breaks: the press throws a TypeError inside the handler
+    // rather than failing a build.
+    await act(async () => {
+      usePlayerStore.setState({ playback: 'paused' });
+    });
+    await fireEvent.press(view.getByTestId('play-overlay'));
+
+    expect(mockedPlayer.resume).toHaveBeenCalled();
+  });
+
+  it('routes the transport\'s ±10s to the store, at the shared step', async () => {
+    mockFeed.mockReturnValue(feedState([clip('a')]));
+    mockToken.mockReturnValue(token('ready', 'a') as never);
+    const view = await measure(await renderScreen());
+    await seedLoaded('a');
+    await selectReel(view, clip('a'));
+
+    await fireEvent.press(view.getByTestId('clip-transport-advance'));
+    await fireEvent.press(view.getByTestId('clip-transport-rewind'));
+
+    expect(mockedPlayer.skipBy.mock.calls).toEqual([
+      [SKIP_SECONDS],
+      [-SKIP_SECONDS],
+    ]);
+  });
+
+  it('lets the terminal state outrank playback on screen', async () => {
+    // The screen-level version of the same rule `ReelCard` owns: the token
+    // lifecycle reported a 403, so the card must not also be claiming to play.
+    // The token drives it through the real effect — `decidePlaybackAction`'s
+    // `show` arm is what calls `setCardStatus` here, not a direct store write.
+    mockFeed.mockReturnValue(feedState([clip('a')]));
+    mockToken.mockReturnValue(token('unavailable', 'a') as never);
+    const view = await measure(await renderScreen());
+    await seedLoaded('a');
+    await selectReel(view, clip('a'));
+
+    expect(view.getByText('This clip is no longer available')).toBeTruthy();
+    expect(view.queryByText('Now playing')).toBeNull();
+  });
+
+  it('leaves the feed\'s own touch surface alone', async () => {
+    // The pager regression guard, at the level where it would happen: no cell in
+    // this list may claim a touch down, because the cell is inside a
+    // `pagingEnabled` FlatList. `PlayOverlay` is the one full-size target, and
+    // it is the one that is allowed to be one.
+    mockFeed.mockReturnValue(feedState([clip('a'), clip('b')]));
+    const view = await measure(await renderScreen());
+    await seedLoaded('a');
+    await selectReel(view, clip('a'));
+
+    const flatList = view.root
+      ?.queryAll((n) => Array.isArray(n.props?.data) && n.props?.pagingEnabled === true)
+      .at(0);
+    expect(flatList).toBeTruthy();
+    // The list is still a pager, still measured, still windowed.
+    expect(typeof flatList?.props.getItemLayout).toBe('function');
+    expect(typeof flatList?.props.onMomentumScrollEnd).toBe('function');
+    expect(typeof flatList?.props.onScrollToIndexFailed).toBe('function');
+
+    for (const node of view.root?.queryAll((n) => n.props?.testID === 'reel-card') ?? []) {
+      expect(node.props.onStartShouldSetResponder).toBeUndefined();
+      expect(node.props.onResponderGrant).toBeUndefined();
+    }
   });
 });

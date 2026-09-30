@@ -88,7 +88,10 @@ export default (_context: ConfigContext): ExpoConfig => {
     version: APP_VERSION,
     runtimeVersion,
     orientation: 'portrait',
-    scheme: 'echoflow',
+    // Keep the product scheme for app links and register RevenueCat's
+    // dashboard-generated callback scheme for paywall previews/redemptions.
+    // Both are public routing metadata; neither is a credential.
+    scheme: ['echoflow', 'rc-72c5c981d7'],
     // D3: expo-router owns the entry point, so `main` moves off index.ts.
     userInterfaceStyle: 'dark',
     icon: './assets/icon.png',
@@ -135,7 +138,8 @@ export default (_context: ConfigContext): ExpoConfig => {
       // D3: file-based routing. Auth lives in route groups — app/(auth)/ vs
       // app/(tabs)/ — which is what makes the `scheme: "echoflow"` declared
       // above actually do something. The old app declared it and had zero
-      // deep-link handlers.
+      // deep-link handlers. RevenueCat's generated scheme is declared beside
+      // it at the top level so Expo emits both native URL registrations.
       'expo-router',
       'expo-secure-store',
       // D2: the reason expo-audio was chosen over react-native-track-player.

@@ -54,11 +54,16 @@ def _annotated_clip_prefetch(viewer):
         queryset=AudioClip.objects
         .select_related('creator')
         .annotate(
+            # `is_active=True` is required for the same reason as in
+            # FastFeedViewSet (feed.py:119-122): un-like flips the flag rather
+            # than deleting the row, so without the clause every un-liked clip
+            # in the inbox reads as liked on both share surfaces too.
             user_has_liked=Exists(
                 UserInteraction.objects.filter(
                     clip=OuterRef('pk'),
                     user=viewer,
                     interaction_type='like',
+                    is_active=True,
                 )
             ),
             **following_annotation(viewer),

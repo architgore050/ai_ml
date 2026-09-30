@@ -32,7 +32,7 @@ from conftest import assert_view_queries  # noqa: E402  (query budget excl. midd
 import pytest
 from rest_framework.test import APIClient
 
-from backend.app.models import AudioClip, ShareEvent
+from backend.app.models import AudioClip, ShareEvent, UserInteraction
 
 pytestmark = pytest.mark.django_db
 
@@ -333,3 +333,149 @@ class TestShareListQueryCount:
         post_share(sender, shareable, receiver.id)
         data = authed(receiver).get("/share/inbox/").json()
         assert data[0]["clip"]["is_following"] is False
+
+
+# ---------------------------------------------------------------------------
+# is_liked ignores is_active on the two share read surfaces
+# ---------------------------------------------------------------------------
+
+def _like_then_unlike(client, clip):
+    """Drive the real toggle endpoint twice.
+
+    Deliberately the HTTP endpoint rather than
+    ``UserInteraction.objects.create(...)``: the defect is that the *row*
+    survives the un-like, and a hand-built row would not prove that the
+    production write path leaves the state the subquery then misreads. Same
+    helper, same reasoning as ``test_feed_and_comments_gates.py``.
+    """
+    for _ in range(2):
+        response = client.post(f"/interactions/{clip.id}/toggle-like/")
+        assert response.status_code == 200, response.data
+
+    row = UserInteraction.objects.get(clip=clip, interaction_type="like")
+    assert row.is_active is False, (
+        "precondition: the un-like must leave the row in place with "
+        "is_active=False — record_like_toggle flips the flag, it does not "
+        "delete. If this ever deletes instead, the defect is unreachable and "
+        "these tests are measuring nothing."
+    )
+    return row
+
+
+def _inbox_is_liked(client, clip):
+    response = client.get("/share/inbox/")
+    assert response.status_code == 200, response.data
+    return {row["clip"]["id"]: row["clip"]["is_liked"] for row in response.json()}
+
+
+def _share_list_is_liked(client, clip):
+    response = client.get("/share/")
+    assert response.status_code == 200, response.data
+    return {row["clip"]["id"]: row["clip"]["is_liked"]
+            for row in response.json()["results"]}
+
+
+def _profile_clips_is_liked(client, creator):
+    """`views/profile.py:62` — the independently-correct copy of the subquery.
+
+    This is the parity target rather than a restated copy of the rule: a
+    restated predicate cannot detect the two copies drifting, which is how the
+    omission shipped at all.
+    """
+    response = client.get(f"/profile/{creator.id}/clips/")
+    assert response.status_code == 200, response.data
+    return {row["id"]: row["is_liked"] for row in response.json()["results"]}
+
+
+class TestIsLikedRespectsIsActiveOnTheShareSurfaces:
+    """REGRESSION: `_annotated_clip_prefetch` omitted `is_active=True`.
+
+    `record_like_toggle` (`services/interactions.py:144-152`) does NOT delete
+    the row on un-like — it flips `is_active=False` in place. A subquery
+    without that clause therefore matches the very row that records the
+    un-like, and `FeedClipSerializer.get_is_liked` returns the annotation
+    verbatim when it is present (`serializers.py:669-670`), so the
+    serializer's own correct fallback query is never reached.
+
+    This is the fourth site with the identical defect. The first three were
+    found and fixed in `views/feed.py` (primary path, degraded fallback,
+    suggestions) in a10fe14; `serializers.py:1120` and
+    `views/profile.py:62` already carried the clause. `_annotated_clip_prefetch`
+    was the one remaining `user_has_liked` producer without it, so both
+    `GET /share/` and `GET /share/inbox/` reported `is_liked: true` for
+    every clip the recipient had explicitly un-liked.
+
+    Both read endpoints are covered because they share the helper: fixing one
+    and not the other is possible, and only the second surface would go
+    unnoticed otherwise.
+
+    Nothing here asserts on the counter store. `record_like_toggle` writes
+    likes/completion keys into the Redis instance shared with every other
+    agent in this stack, and this file deliberately does not request
+    `clear_throttle_cache` (that fixture is a FLUSHDB) — the assertions are
+    DB-backed and per-test-database, so they cannot be perturbed by another
+    agent's drain.
+    """
+
+    def test_inbox_reports_an_unliked_clip_as_not_liked(
+        self, sender, receiver, shareable
+    ):
+        post_share(sender, shareable, receiver.id)
+        client = authed(receiver)
+        _like_then_unlike(client, shareable)
+
+        liked = _inbox_is_liked(client, shareable)
+        assert liked == {str(shareable.id): False}, (
+            f"/share/inbox/ reported {liked} after an explicit un-like. The "
+            "row is still there with is_active=False, so the subquery matched "
+            "it — the recipient sees a filled heart for a like they removed."
+        )
+
+    def test_share_list_reports_an_unliked_clip_as_not_liked(
+        self, sender, receiver, shareable
+    ):
+        post_share(sender, shareable, receiver.id)
+        client = authed(receiver)
+        _like_then_unlike(client, shareable)
+
+        liked = _share_list_is_liked(client, shareable)
+        assert liked == {str(shareable.id): False}, (
+            f"GET /share/ reported {liked} after an explicit un-like."
+        )
+
+    def test_inbox_agrees_with_profile_clips_after_unlike(
+        self, sender, receiver, shareable
+    ):
+        """The actual bug is the *disagreement*, so assert the two screens.
+
+        A pair of independent assertions restating the rule would both go
+        red today and both go green after any patch that adds
+        `is_active=True` — including one that fixes only one of them. This
+        fails if either copy drifts.
+        """
+        post_share(sender, shareable, receiver.id)
+        client = authed(receiver)
+        _like_then_unlike(client, shareable)
+
+        inbox_liked = _inbox_is_liked(client, shareable)
+        profile_liked = _profile_clips_is_liked(client, shareable.creator)
+        assert inbox_liked == profile_liked, (
+            "the same user sees contradictory is_liked for the same clip "
+            f"depending on the screen: /share/inbox/={inbox_liked} "
+            f"/profile/{{id}}/clips/={profile_liked}"
+        )
+        assert inbox_liked == {str(shareable.id): False}
+
+    def test_a_live_like_is_still_reported_as_liked(
+        self, sender, receiver, shareable
+    ):
+        """The guard against fixing this by always returning False."""
+        post_share(sender, shareable, receiver.id)
+        client = authed(receiver)
+        response = client.post(f"/interactions/{shareable.id}/toggle-like/")
+        assert response.status_code == 200, response.data
+
+        liked = _inbox_is_liked(client, shareable)
+        assert liked == {str(shareable.id): True}, (
+            f"/share/inbox/ reported {liked} for a like the user still holds."
+        )

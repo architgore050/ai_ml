@@ -295,7 +295,8 @@ services:
       - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis_cache:6379/0}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
       - DJANGO_DEBUG=${DJANGO_DEBUG:-False}
-      - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS:-localhost}
+      # Prometheus reaches Gunicorn directly at the internal `web` hostname.
+      - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS:-localhost},web
       - GUNICORN_WORKERS=${GUNICORN_WORKERS:-4}
       - GUNICORN_THREADS=${GUNICORN_THREADS:-4}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is required}
@@ -672,8 +673,9 @@ services:
         hard: 65536
 
   # DECISION: Prometheus scrapes /metrics/ from the web container every
-  # 15s. web:8005 is the in-container gunicorn port (the same port the
-  # debug-escape host port 8005 maps to). 15s is the smallest scrape
+  # 15s. web:8000 is the in-container gunicorn port; the debug-escape host
+  # port 8005 maps to that port but is not used inside the Compose network.
+  # 15s is the smallest scrape
   # interval that doesn't dominate disk I/O at 7-day retention. Retention
   # is the prometheus default (15 days) — production should override with
   # --storage.tsdb.retention.time=30d and provision more disk.
@@ -778,5 +780,3 @@ volumes:
 secrets:
   hf_token:
     environment: HF_TOKEN
-
-    

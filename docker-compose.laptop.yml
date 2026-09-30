@@ -61,7 +61,7 @@ services:
       - HF_HUB_OFFLINE=1
       - TRANSFORMERS_OFFLINE=1
       - SENTRY_DSN=${SENTRY_DSN:-}
-      - SENTRY_ENV=${SENTRY_ENy:-production}
+      - SENTRY_ENV=${SENTRY_ENV:-production}
 
 volumes:
   laptop-scratch:

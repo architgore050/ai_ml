@@ -252,6 +252,46 @@ if DATABASES['default'].get('ENGINE', '').endswith('postgresql'):
     )
     DATABASES['default']['OPTIONS']['connect_timeout'] = 10
 
+# DECISION (placeholder guard): the *effective* database password is guarded
+# here, and the earlier claim that it was not reachable in-process was wrong.
+#
+# `settings.py` does not read the `DB_PASSWORD` env var — it builds DATABASES
+# with `dj_database_url.config(DATABASE_URL)`, and every compose file builds
+# `DATABASE_URL` *from* `DB_PASSWORD`::
+#
+#     DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+#
+# so the value the process actually authenticates with is
+# `DATABASES['default']['PASSWORD']`. Checking the env var NAME was checking
+# the wrong thing: the name is genuinely absent from this module, and the
+# secret is not. It is checked here rather than at the top of the file
+# because this is the first point at which the value exists.
+#
+# `.env.example` and `.env.vps.example` ship `DB_PASSWORD=change-me-strong-password`
+# and `.env.laptop.example` ships `DB_PASSWORD=<same-as-vps>`, both committed to
+# this repository in plain text, so a deployment that copies a template
+# unchanged hands anyone who has read the repo the whole database: every user
+# row, every password hash, and the DPDP §8(5) erasure records.
+#
+# An EMPTY password is not a placeholder failure and is deliberately not
+# treated as one. There is no `if not SECRET_KEY` raise above for the same
+# reason: bare-metal development against a local Postgres that trusts the
+# socket, or a `DATABASE_URL` with no credential at all, is a legitimate
+# configuration. What is rejected is a value that looks like documentation.
+# `require_real_secret` applies the same two documented bypasses as
+# `DJANGO_SECRET_KEY` and the Redis passwords — see `EchoFlow/secrets.py`.
+_DB_PASSWORD = DATABASES['default'].get('PASSWORD')
+if _DB_PASSWORD:
+    DATABASES['default']['PASSWORD'] = require_real_secret(
+        "DB_PASSWORD",
+        _DB_PASSWORD,
+        purpose=(
+            "the PostgreSQL server (every table, every user row, password "
+            "hashes and the DPDP §8(5) erasure records)"
+        ),
+        generate='python -c "import secrets; print(secrets.token_urlsafe(32))"',
+    )
+
 # DECISION: optional 'read' connection for routing pure reads to a
 # PostgreSQL streaming replica. See backend/app/db_routers.py and
 # docs/EXPLAIN/database/05-read-replica-design.md. The replica is not
@@ -415,6 +455,107 @@ def resolve_redis_url(prefix: str) -> str:
 # fine for one developer.
 REDIS_BROKER_URL = resolve_redis_url("REDIS_BROKER")
 REDIS_CACHE_URL = resolve_redis_url("REDIS_CACHE")
+
+
+# DECISION (2026-09-30): under the test suite the cache moves to its own Redis
+# database index, so a test run cannot destroy live development state.
+#
+# `django_redis.cache.RedisCache.clear()` is FLUSHDB, not a prefix scan, and
+# conftest's `clear_throttle_cache` calls it precisely so one file's rate-limit
+# spend cannot fail another. Against the default index that is a FLUSHDB of the
+# *live* cache: throttle budgets, `user_feed:*` queues, `user_vectors:*` and
+# every `clip:*` counter go together. `counter_store.drain()` (`KEYS clip:*` +
+# `DEL`) is a second door into that same shared keyspace, so two concurrent
+# runs delete each other's state even without a flush. Postgres is already
+# isolated per run by TEST_DB_NAME, which is what made this read as flakiness
+# rather than as a gap: three runs of identical, unmodified code produced three
+# different failure sets.
+#
+# WHY IT LIVES HERE AND NOT IN conftest.py: pytest-django calls
+# `django.setup()` from its own `pytest_load_initial_conftests`, while
+# `_pytest.config`'s implementation of that same hook is `trylast`, so the
+# rootdir conftest's module body has not run yet. An `os.environ[...]` assigned
+# there cannot reach CACHES — this module is imported *inside*
+# `django.setup()`. `backend/app/tests/test_redis_isolation.py` pins both
+# halves of that claim (the env var does work; a late one provably does not).
+#
+# The gate is `testing_enabled()`, the signal `secrets.py` already uses: true
+# under pytest, or with `ECHOFLOW_TESTING=1`. Neither is set by any compose
+# file, so gunicorn and all four Celery services keep the configured index.
+#
+# Precedence, all read from the process environment at settings-import time so
+# that `docker compose exec -e TEST_REDIS_CACHE_DB=14` works:
+#   TEST_REDIS_CACHE_URL  a full URL, for a CI runner with its own Redis
+#   TEST_REDIS_CACHE_DB   the index alone, which keeps the base64 password
+#                         (it contains `+`, `/` and `=`) out of the command line
+#   default               TEST_REDIS_CACHE_DB_DEFAULT
+#
+# Index 0 is refused rather than honoured: in every stack it *is* the live
+# cache, so accepting it would be the defect rather than an escape from it.
+# The default is 13 because 0 is the live cache and 14/15 are FLUSHed by the
+# `redis_scratch` fixture in `test_telemetry_flush_integrity.py`; the server
+# ships `databases 16`, so 1-13 are unclaimed.
+TEST_REDIS_CACHE_DB_DEFAULT = 13
+
+
+def resolve_test_redis_cache_url(resolved: str) -> str:
+    """Point a resolved cache URL at this test run's own Redis database.
+
+    ``resolved`` is the cache URL as the *process* would use it in production;
+    only the database path component is replaced, so the host and the
+    percent-encoded credential compose supplied are carried through untouched.
+    That is deliberate — an index swap must not become a different server,
+    because `tasks.flush_telemetry_stream` builds its own client from
+    `CACHES['default']['LOCATION']` and the end-to-end tests need real Redis.
+
+    Splitting the URL with ``str.rpartition('/')`` would be wrong: in
+    ``redis://host:6379`` the last ``/`` precedes the *port*.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    override = (os.getenv("TEST_REDIS_CACHE_URL") or "").strip()
+    if override:
+        return override
+
+    raw = (os.getenv("TEST_REDIS_CACHE_DB") or "").strip()
+    if not raw:
+        index = TEST_REDIS_CACHE_DB_DEFAULT
+    else:
+        try:
+            index = int(raw)
+        except ValueError:
+            raise ImproperlyConfigured(
+                f"TEST_REDIS_CACHE_DB={raw!r} is not an integer database index. "
+                "A value that does not parse would leave the suite on the live "
+                "cache index, which is the failure this setting exists to "
+                "prevent. Redis here serves 16 databases: use 1-15."
+            )
+        if not 1 <= index <= 15:
+            raise ImproperlyConfigured(
+                f"TEST_REDIS_CACHE_DB={index} is out of range. Index 0 is the "
+                "live development cache in every stack, and flushing it is the "
+                "defect this setting exists to prevent. Redis here serves 16 "
+                "databases: use 1-15."
+            )
+
+    parts = urlsplit(resolved)
+    return urlunsplit(parts._replace(path=f"/{index}"))
+
+
+if testing_enabled():
+    REDIS_CACHE_URL = resolve_test_redis_cache_url(REDIS_CACHE_URL)
+
+# DECISION (2026-09-30): the *broker* is deliberately NOT retargeted for
+# tests, unlike the cache above. Nothing in the suite publishes to a real
+# broker — every reachable path is stubbed at the seam the code reads
+# (`services.uploads.publish`, `tasks.sync_revenuecat_entitlements`) and
+# `tasks.py`'s own `.delay()` only runs inside a worker. The one consumer that
+# does talk to a real Redis, `flush_telemetry_stream`, builds its client from
+# `CACHES['default']['LOCATION']`, i.e. the cache, so it is already isolated.
+# Moving the broker would put test-published tasks in a database no worker
+# reads (silent, unbounded accumulation) and would desynchronise
+# `celery inspect ping` (the compose worker healthcheck) and
+# `views/system_health.py` from the Redis the tests were writing to.
 
 # This is how you connect Redis to Django
 CACHES = {
@@ -902,6 +1043,16 @@ REST_FRAMEWORK = {
         # name twice and then succeeds on the third attempt.
         'register_username': '3/hour',
         'login': '10/min',          # TokenObtainPairView: prevent credential stuffing
+        # Per-username, applied alongside 'login' by ThrottledTokenObtainPairView.
+        # 'login' has to stay IP-keyed — it is the credential-stuffing gate and
+        # login is anonymous, so unlike token refresh there is no verified
+        # subject to key on — but one IP is a carrier NAT gateway on a mobile
+        # network, so 10/min is one budget for everyone behind that address.
+        # This is the half of the gate that is not NAT-bound: one account, one
+        # bucket. 10/hour is far above a human's real behaviour (a handful of
+        # typos, then success) and 60x below what a credential-stuffing run
+        # needs against a single account.
+        'login_username': '10/hour',
         # Per VERIFIED refresh-token subject, not per IP — see
         # backend/app/throttling.py. Sized for a 15-minute access token: ~4
         # refreshes/hour is the steady state, so 120/hour is ~30x headroom

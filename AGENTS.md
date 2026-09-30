@@ -950,6 +950,31 @@ Durable, repo-specific knowledge. Append a concise entry at the end of each sess
 
 ---
 
+### 2026-09-30 — Phase A: test-run Redis isolation
+**Learned:**
+- **`cache.clear()` was `FLUSHDB` of the live dev cache.** `clear_throttle_cache` needs a global clear (throttle keys are `throttle_*` with no shared prefix), so the fix had to be a *keyspace* change, not a narrower clear. `clear_throttle_cache`'s fail-loud retry behaviour is unchanged.
+- **The ordering trap is real and was demonstrated, not assumed.** pytest-django calls `django.setup()` from its own `pytest_load_initial_conftests`; `_pytest.config`'s impl of that hook is `trylast`, so the rootdir `conftest.py` body has not run. Measured: `os.environ['REDIS_CACHE_URL']=.../13` set in the conftest body left `settings.CACHES['default']['LOCATION']` at `.../0`. A `conftest.py` fix would have looked correct and done nothing.
+- **`allkeys-lru` is server-wide, so index isolation does not bound memory.** `redis_cache_local` is `maxmemory 1073741824` + `allkeys-lru`; a suite index cannot evict *or* be evicted independently of db0. Measured headroom is huge (1.87 MB used of 1 GB), so this is not a live risk, but it is not an isolation guarantee either.
+
+**Changed:** `backend/EchoFlow/settings.py` (`resolve_test_redis_cache_url` + `TEST_REDIS_CACHE_DB_DEFAULT=13`, gated on `testing_enabled()`), `backend/app/tests/test_env_file_hygiene.py` (two `_NOT_IN_ANY_TEMPLATE` entries). New: `backend/app/tests/test_redis_isolation.py` (16). No migration, no dependency, no conftest edit. Suite **1308 passed, 0 failed, 7 skipped, 1 xfailed** (measured with concurrent Phase-B work in the tree, so the count includes tests this change did not add; `test_redis_isolation.py` contributes 16).
+
+**Test-only env vars — deliberately in NO `.env` template** (a template entry would pin the *dev* stack to the suite's index, which is the defect):
+- `TEST_REDIS_CACHE_DB=14` — pick the index per run, so parallel agents get separate keyspaces. 1-15; **0 is refused** (that is the live index).
+- `TEST_REDIS_CACHE_URL=redis://…/3` — full-URL form, for a CI runner with its own Redis. Wins over the index.
+
+```bash
+docker compose exec -e PYTHONPATH=/app -e TEST_DB_NAME=echoflow_test_<unique> \
+  -e TEST_REDIS_CACHE_DB=14 web_local pytest backend/app/tests/ -q
+```
+`TEST_DB_NAME` alone is no longer sufficient for parallel agents — pick `TEST_REDIS_CACHE_DB` too, or the runs share throttle budgets.
+
+**Open:**
+- `test_telemetry_flush_integrity.py`'s `redis_scratch` fixture picks `14 + (os.getpid() % 2)` and **FLUSHes it**, so two concurrent runs of that file collide with each other. Measured: 3 failures in one concurrent agent, 1 in the other, while the rest of the suite was green. Pre-existing and independent of this change (it bypasses `CACHES` entirely); the fix is to widen or derive that scratch range per run.
+- The **broker** Redis is deliberately *not* retargeted. Every publish path a test can reach is stubbed (`services.uploads.publish`, `tasks.sync_revenuecat_entitlements`), `tasks.py`'s own `.delay()` only runs in a worker, and the one real Redis consumer (`flush_telemetry_stream`) builds its client from `CACHES['default']['LOCATION']`, so it is already isolated. Moving it would strand test-published tasks in a DB no worker reads and desync `celery inspect ping` (the compose healthcheck) from `views/system_health.py`.
+- `counter_store.drain()` (`KEYS clip:*` + DEL) still deletes **live** `clip:*` counters every 300 s via the `flush_counters_to_pg` beat task. That is production behaviour and arguably correct (the counters have been folded into Postgres), but it means "live counter keys survive" is not a property anyone can rely on.
+
+---
+
 ## DOs and DON'Ts
 
 Accumulated from user corrections. Append on your own when corrected.

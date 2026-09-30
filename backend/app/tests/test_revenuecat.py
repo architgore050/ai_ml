@@ -54,6 +54,54 @@ class TestIsPro:
 # 2. RevenueCat service layer (sync_entitlements)
 # ---------------------------------------------------------------------------
 class TestSyncEntitlements:
+    def test_sync_accepts_documented_v1_entitlement_payload(self, user, settings):
+        """RevenueCat v1 keys entitlements by ID and uses ISO timestamps."""
+        from backend.app.services.revenuecat import sync_entitlements
+
+        settings.REVENUECAT_SECRET_KEY = "test-secret-key"
+        settings.REVENUECAT_ENTITLEMENT_ID = "pro"
+        expires_at = timezone.now() + timedelta(days=30)
+        grace_until = timezone.now() + timedelta(days=33)
+        fake_subscriber = {
+            "entitlements": {
+                "pro": {
+                    "product_identifier": "com.echoflow.pro.monthly",
+                    "expires_date": expires_at.isoformat(),
+                    "grace_period_expires_date": grace_until.isoformat(),
+                }
+            }
+        }
+
+        with mock.patch("backend.app.services.revenuecat.get_subscriber_info", return_value=fake_subscriber):
+            changed = sync_entitlements(user)
+
+        user.refresh_from_db()
+        assert changed is True
+        assert user.has_pro_entitlement is True
+        assert user.pro_expires_at == expires_at
+        assert user.pro_grace_until == grace_until
+
+    def test_sync_does_not_treat_unrelated_entitlement_as_pro(self, user, settings):
+        from backend.app.services.revenuecat import sync_entitlements
+
+        settings.REVENUECAT_SECRET_KEY = "test-secret-key"
+        settings.REVENUECAT_ENTITLEMENT_ID = "pro"
+        fake_subscriber = {
+            "entitlements": {
+                "other": {
+                    "product_identifier": "com.echoflow.other.monthly",
+                    "expires_date": (timezone.now() + timedelta(days=30)).isoformat(),
+                }
+            }
+        }
+
+        with mock.patch("backend.app.services.revenuecat.get_subscriber_info", return_value=fake_subscriber):
+            changed = sync_entitlements(user)
+
+        user.refresh_from_db()
+        assert changed is False
+        assert user.has_pro_entitlement is False
+
     def test_sync_sets_pro_when_entitlement_active(self, user, settings):
         from backend.app.services.revenuecat import sync_entitlements
 
@@ -105,6 +153,21 @@ class TestSyncEntitlements:
 
         user.refresh_from_db()
         assert user.has_pro_entitlement is False
+
+    def test_sync_preserves_pro_when_revenuecat_lookup_fails(self, user, settings):
+        from backend.app.services.revenuecat import sync_entitlements
+
+        settings.REVENUECAT_SECRET_KEY = "test-secret-key"
+        user.has_pro_entitlement = True
+        user.pro_expires_at = timezone.now() + timedelta(days=30)
+        user.save()
+
+        with mock.patch("backend.app.services.revenuecat.get_subscriber_info", return_value=None):
+            changed = sync_entitlements(user)
+
+        user.refresh_from_db()
+        assert changed is False
+        assert user.has_pro_entitlement is True
 
     def test_sync_no_app_user_id_skipped(self, user, settings):
         from backend.app.services.revenuecat import sync_entitlements

@@ -7,8 +7,15 @@ global:
 scrape_configs:
   - job_name: "echoflow-web"
     metrics_path: "/metrics/"
+    # The scrape is an internal HTTP hop. Match nginx's proxy contract so
+    # Django does not redirect it to TLS on the Gunicorn-only port.
+    http_headers:
+      X-Forwarded-Proto:
+        values: ["https"]
     static_configs:
-      - targets: ["web:8005"]
+      # Gunicorn listens on 8000 inside the Compose network. 8005 is only
+      # the host-side debug port mapping and is not reachable as web:8005.
+      - targets: ["web:8000"]
         labels:
           service: "web"
           tier: "echoflow"

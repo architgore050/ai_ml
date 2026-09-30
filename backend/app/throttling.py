@@ -94,19 +94,64 @@ Two layers fix it, and both are needed:
   1. `NUM_PROXIES = 1` in settings. There is exactly one nginx in front, so
      DRF takes the `addrs[-1]` branch — the hop nginx appended. This is the
      guaranteed backstop: it covers the views that declare a bare
-     `ScopedRateThrottle` or rely on the inherited `DEFAULT_THROTTLE_CLASSES`,
-     including the login view in `backend/app/urls.py`, which this file does
-     not control. It is one line and it is easy to delete by accident.
+     `ScopedRateThrottle` or rely on the inherited `DEFAULT_THROTTLE_CLASSES`.
+     It is one line and it is easy to delete by accident.
 
   2. `TrustedProxyRateThrottle` below. It reuses the resolution the repo
      already trusts, and — unlike layer 1 — validates each candidate through
      `ipaddress.ip_address`, so a garbage `X-Real-IP` degrades to
      `REMOTE_ADDR` instead of becoming a throttle key. Layer 1 alone would
-     happily key on `1.2.3.4; DROP TABLE`.
+     happily key on `1.2.3.4; DROP TABLE`. Every throttle in this project that
+     keys on the caller uses it — including `POST /auth/login/`, the
+     credential-stuffing gate, which lists this class itself in
+     `backend/app/urls.py` rather than relying on the backstop alone.
 
 The third fix here is fail-closed behaviour: a dead cache must produce 503,
 not 500. See `TrustedProxyRateThrottle.allow_request` and
 `backend/EchoFlow/exception_handlers.py`.
+
+
+THIRD BUG: A CLASS-LEVEL `scope` ON A `ScopedRateThrottle` IS DEAD CODE
+=====================================================================
+
+`RegisterUsernameRateThrottle` shipped `scope = 'register_username'` and was
+listed on `RegisterView`, whose own `throttle_scope` is `'register'`. DRF's
+`ScopedRateThrottle.allow_request` opens with::
+
+    self.scope = getattr(view, self.scope_attr, None)
+
+so the view's scope overwrote the class's on the first request, and the
+per-username throttle charged every key against `register` — 200/hour. Its
+3/hour limit was never in force. The bucket was still per-username, so nothing
+leaked across accounts; the limit was simply 66x looser than it read, and
+nothing anywhere reported it. The test that appeared to cover it looped 120
+times, which is `token_refresh`'s rate, not this scope's.
+
+The second clean DRF mechanism is `get_throttles()` initkwargs — passing
+`{'scope': ...}` to the constructor, which `APIView.get_throttles` does not do
+on its own. That was not used: the scope then lives on the *view*, so the
+throttle class is only correct for as long as someone remembers to pass it, and
+a second view reusing the class silently reverts to a dead scope. The fix here
+is `TrustedProxyRateThrottle.resolve_scope`, which makes "pin my own scope" an
+override the class owns.
+
+
+FOURTH BUG: `login: 10/min` IS ONE SHARED BUDGET PER CARRIER NAT
+==================================================================
+
+Refresh could stop keying on IP because it carries a signed, verified subject
+to key on instead. Login cannot: it *is* the credential-stuffing gate, so it
+has to stay IP-keyed, and an IP on a mobile network is a cell rather than a
+person. 10/min is ~600/hour shared by everyone the carrier has behind that
+address.
+
+So login gets the same shape of second limit registration has —
+`LoginUsernameRateThrottle`, one bucket per claimed account, alongside the
+per-IP `login` bucket rather than in place of it. Neither alone is the right
+limit: the IP key bounds the flood, and is unusable on its own; the username
+key bounds a sustained attack on one known account, and is trivially sidestepped
+by an attacker rotating names. Together the flood is capped and the target
+account is capped, without either limit being NAT-bound.
 """
 
 from django_redis.exceptions import ConnectionInterrupted
@@ -158,6 +203,10 @@ class TrustedProxyRateThrottle(ScopedRateThrottle):
     in front, it validates nothing, and it only reads `X-Forwarded-For`.
     """
 
+    #: Read off the view unless a subclass overrides `resolve_scope`. Named
+    #: here so `resolve_scope` does not have to know DRF's attribute name.
+    scope_attr = 'throttle_scope'
+
     def get_ident(self, request):
         """Return the caller's address, or '' when it cannot be resolved.
 
@@ -167,8 +216,36 @@ class TrustedProxyRateThrottle(ScopedRateThrottle):
         """
         return get_client_ip(request) or ""
 
+    def resolve_scope(self, view):
+        """The scope in force for `view`; None means "do not throttle".
+
+        This is DRF's own rule (`ScopedRateThrottle.scope_attr`) behind a
+        method, and it exists as a method for one reason: a `ScopedRateThrottle`
+        subclass that declares its own `scope` gets it **silently overwritten**
+        on the first request, because `allow_request` assigns
+        `self.scope = getattr(view, 'throttle_scope', None)` before reading
+        the rate. A class attribute is therefore not a scope; it is a default
+        that a view's own scope always wins over.
+
+        `RegisterUsernameRateThrottle` shipped that way for a month: its
+        `register_username` (3/hour) scope was never read, and it enforced the
+        view's `register` rate of 200/hour under a per-username key. A
+        subclass that needs a scope of its own overrides this to return it —
+        that is the supported way to pin one, and
+        `backend/app/tests/test_throttle_scopes_and_db_password.py` fails if a
+        class-declared scope and the scope actually enforced disagree.
+        """
+        return getattr(view, self.scope_attr, None)
+
     def allow_request(self, request, view):
-        """Fail closed with 503 when the throttle counter is unreadable.
+        """Resolve the scope, re-derive the rate, fail closed on a dead cache.
+
+        Inlined from `ScopedRateThrottle.allow_request` for two reasons, both
+        of which are behaviours DRF's version does not have:
+
+          * the scope comes from `resolve_scope`, so a subclass can pin one
+            (see its docstring for the defect that made this necessary);
+          * the `ConnectionInterrupted` handler wraps the cache read.
 
         `SimpleRateThrottle.allow_request` reads `self.cache.get(self.key,
         [])`. A stale `django-redis` connection raises
@@ -184,9 +261,30 @@ class TrustedProxyRateThrottle(ScopedRateThrottle):
         django-redis raises (it re-raises it around every command in
         `django_redis/client/default.py`), so catching it catches all of
         them without also swallowing genuine bugs.
+
+        `SimpleRateThrottle.allow_request` is called explicitly rather than
+        through `super()`: `ScopedRateThrottle.allow_request` is the copy being
+        replaced, and it re-reads the scope from the view, which is the bug.
+        Rate and `num_requests` are still re-derived on every call, so a
+        `THROTTLE_RATES` override applied after instantiation takes effect.
+
+        `SimpleRateThrottle` is imported here rather than at module scope
+        because this module's namespace is audited:
+        `test_throttle_identity_and_secrets.py::
+        TestThrottleCacheFailureIs503::test_no_throttle_shadows_the_inherited_cache`
+        walks every `SimpleRateThrottle` subclass reachable from here and
+        asserts none of them defines its own `cache`. A top-level import would
+        put DRF's own class into that set and fail it.
         """
+        from rest_framework.throttling import SimpleRateThrottle
+
         try:
-            return super().allow_request(request, view)
+            self.scope = self.resolve_scope(view)
+            if not self.scope:
+                return True
+            self.rate = self.get_rate()
+            self.num_requests, self.duration = self.parse_rate(self.rate)
+            return SimpleRateThrottle.allow_request(self, request, view)
         except ConnectionInterrupted:
             raise ThrottleBackendUnavailable() from None
 
@@ -282,23 +380,34 @@ class RefreshTokenRateThrottle(TrustedProxyRateThrottle):
         return None
 
 
-class RegisterUsernameRateThrottle(TrustedProxyRateThrottle):
-    """Scope-addressed throttle keyed on the username being registered.
+class UsernameKeyedRateThrottle(TrustedProxyRateThrottle):
+    """Shared keying for the two throttles keyed on a username in the body.
 
-    Runs alongside the per-IP `register` limit rather than replacing it.
-    The per-IP limit bounds how much traffic one source address can generate;
-    this one bounds how fast any single account name can be re-created, which
-    is the abuse the IP limit cannot see once the rate is raised high enough
-    to accommodate a carrier NAT.
+    Neither endpoint is authenticated when the throttle runs — registering and
+    logging in are the two requests a caller makes *before* they have a
+    credential — so there is no principal to read and the only useful identity
+    is the name the caller asked for.
 
-    Only counts requests that actually get far enough to be a registration
-    attempt. A throttle that counts malformed bodies would let an attacker
-    burn another user's budget with garbage — `request.data` is read after
-    parsing, and a missing/blank username simply does not consume a token
-    from the bucket.
+    Subclasses supply their own `scope`; this class pins it and supplies the
+    key, which is what makes each caller a bucket of their own.
     """
 
-    scope = 'register_username'
+    def resolve_scope(self, view):
+        """Pin `self.scope`, ignoring whatever the view declares.
+
+        Both throttles here are registered *alongside* another throttle on the
+        same view, and that view carries a different `throttle_scope` of its
+        own — `RegisterView` is `'register'`, `ThrottledTokenObtainPairView` is
+        `'login'`. DRF's `ScopedRateThrottle.allow_request` overwrites
+        `self.scope` with it before reading the rate, so an unpinned subclass
+        runs its own key against someone else's rate and nobody notices.
+
+        Reading `self.scope` rather than the literal is safe because
+        `TrustedProxyRateThrottle.allow_request` only ever assigns this
+        method's own result back to it, so the value is a fixed point from the
+        first call onwards.
+        """
+        return self.scope
 
     def get_cache_key(self, request, view):
         username = ''
@@ -331,3 +440,47 @@ class RegisterUsernameRateThrottle(TrustedProxyRateThrottle):
             'scope': self.scope,
             'ident': f'ip:{self.get_ident(request)}',
         }
+
+
+class RegisterUsernameRateThrottle(UsernameKeyedRateThrottle):
+    """Scope-addressed throttle keyed on the username being registered.
+
+    Runs alongside the per-IP `register` limit rather than replacing it.
+    The per-IP limit bounds how much traffic one source address can generate;
+    this one bounds how fast any single account name can be re-created, which
+    is the abuse the IP limit cannot see once the rate is raised high enough
+    to accommodate a carrier NAT.
+
+    Only counts requests that actually get far enough to be a registration
+    attempt. A throttle that counts malformed bodies would let an attacker
+    burn another user's budget with garbage — `request.data` is read after
+    parsing, and a missing/blank username simply does not consume a token
+    from the bucket.
+    """
+
+    scope = 'register_username'
+
+
+class LoginUsernameRateThrottle(UsernameKeyedRateThrottle):
+    """Per-account login limit, alongside the per-IP `login` limit.
+
+    `POST /auth/login/` is `login: 10/min`, keyed on the caller's address.
+    That key has to stay: login is anonymous, so there is no verified subject
+    to key on the way token refresh has one. But a carrier NAT gateway is one
+    address for thousands of subscribers, so the 10/min is a budget the whole
+    cell shares and the 11th genuine user on a busy cell gets a 429.
+
+    Raising it fixes that and costs the thing the limit exists for: 10/min is
+    the credential-stuffing gate. This throttle keeps it — one account, one
+    bucket, sized for a human who fat-fingers a password a few times. An
+    attacker who is stuffing credentials rotates usernames, so the per-username
+    bucket barely constrains them either; the IP limit is what bounds the flood
+    and this one is what bounds a sustained attack on a single known account.
+
+    `resolve_scope` pins `login_username` for the same reason
+    `RegisterUsernameRateThrottle` pins `register_username`: inheriting the
+    view's `login` scope here would run this key at 10/min and quietly make
+    the per-account limit indistinguishable from the per-IP one.
+    """
+
+    scope = 'login_username'

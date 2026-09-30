@@ -60,6 +60,19 @@ def _parse_date_ms(date_ms: str | int | None) -> datetime | None:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
 
 
+def _parse_revenuecat_date(value: str | None) -> datetime | None:
+    """Parse the ISO-8601 timestamps returned by RevenueCat API v1."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _is_active_entitlement(subscriber: dict):
     """Determine entitlement status and dates from subscriber info.
 
@@ -70,15 +83,48 @@ def _is_active_entitlement(subscriber: dict):
 
     entitlement_id = getattr(settings, "REVENUECAT_ENTITLEMENT_ID", "pro")
     entitlements = subscriber.get("entitlements", {})
+    if not isinstance(entitlements, dict):
+        return False, None, None
 
-    for _, ent_data in entitlements.items():
-        if isinstance(ent_data, dict) and ent_data.get("product_id") == settings.REVENUECAT_ENTITLEMENT_ID:
-            is_active = bool(ent_data.get("is_active", False))
-            expires_at = _parse_date_ms(ent_data.get("expires_date_ms")) or _parse_date_ms(ent_data.get("expire_date_ms"))
-            grace_until = _parse_date_ms(ent_data.get("grace_period_expire_date_ms"))
-            return is_active, expires_at, grace_until
+    # RevenueCat API v1 keys this dictionary by entitlement identifier.  Do
+    # not identify an entitlement by its product: a single entitlement can be
+    # granted by multiple products (monthly, annual, promotional, etc.).
+    ent_data = entitlements.get(entitlement_id)
 
-    return False, None, None
+    # Keep accepting the old internal payload while clients roll over.  The
+    # documented API-v1 shape above is always preferred.
+    if not isinstance(ent_data, dict):
+        ent_data = next(
+            (
+                data for data in entitlements.values()
+                if isinstance(data, dict) and data.get("product_id") == entitlement_id
+            ),
+            None,
+        )
+    if not isinstance(ent_data, dict):
+        return False, None, None
+
+    expires_at = (
+        _parse_revenuecat_date(ent_data.get("expires_date"))
+        or _parse_date_ms(ent_data.get("expires_date_ms"))
+        or _parse_date_ms(ent_data.get("expire_date_ms"))
+    )
+    grace_until = (
+        _parse_revenuecat_date(ent_data.get("grace_period_expires_date"))
+        or _parse_date_ms(ent_data.get("grace_period_expire_date_ms"))
+    )
+
+    if "is_active" in ent_data:
+        return bool(ent_data["is_active"]), expires_at, grace_until
+
+    raw_expiry = ent_data.get("expires_date")
+    if raw_expiry and expires_at is None:
+        logger.warning("RevenueCat returned an invalid entitlement expiry for %s", entitlement_id)
+        return False, None, grace_until
+
+    # API v1 does not return an is_active field. A present entitlement is
+    # active until its expiry; a null expiry represents a lifetime purchase.
+    return expires_at is None or expires_at > dt_timezone.now(), expires_at, grace_until
 
 
 def sync_entitlements(user) -> bool:
@@ -96,6 +142,12 @@ def sync_entitlements(user) -> bool:
 
     app_user_id = str(user.revenuecat_app_user_id)
     subscriber = get_subscriber_info(app_user_id)
+    # A transport failure (and an unknown remote customer) must not revoke a
+    # previously confirmed purchase. Successful subscriber payloads with no
+    # matching entitlement still clear access below.
+    if subscriber is None:
+        logger.warning("RevenueCat lookup unavailable for user %s; preserving current Pro state", user.id)
+        return False
     is_active, expires_at, grace_until = _is_active_entitlement(subscriber)
 
     changed = False

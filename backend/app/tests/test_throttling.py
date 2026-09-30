@@ -317,6 +317,68 @@ class TestRefreshThrottleKeying:
         assert f"user:{user_a.id}" in key
 
 
+#: The address nginx puts in `X-Real-IP` for the register endpoint, i.e.
+#: what it actually saw. Mirrors `LOGIN_REAL_IP` for the other anonymous
+#: endpoint: same terminator, same header precedence, same attacker.
+REGISTER_REAL_IP = "203.0.113.7"
+#: `REMOTE_ADDR` behind the terminator: the nginx container, not the user.
+REGISTER_NGINX_PEER = "172.29.0.13"
+#: The attacker's own entry, which nginx prepends to X-Forwarded-For.
+REGISTER_SPOOFED = "9.9.9.9"
+
+
+def _register_body(username):
+    """A registration payload `RegisterSerializer` will actually accept.
+
+    `dob` is required (B1, 2026-09-29) and the password must clear all four
+    `AUTH_PASSWORD_VALIDATORS` while not resembling the username. Without
+    these the endpoint 400s and the test would be asserting against a
+    validation error rather than the throttle — the throttle runs in
+    `initial()` either way, so a 400 body would still be *counted*, but a
+    201 makes it unambiguous that the endpoint accepted the signup.
+    """
+    return {
+        "username": username,
+        "email": f"{username}@example.com",
+        "password": "Str0ngPass!2026",
+        "dob": "1990-01-01",
+        "consent_accepted": True,
+        "terms_version": "v1.0",
+    }
+
+
+def _post_register(client, spoofed_xff, username="rot0", real_ip=REGISTER_REAL_IP):
+    """POST `/auth/register/` as it arrives *after* nginx.
+
+    nginx APPENDS to X-Forwarded-For (`$proxy_add_x_forwarded_for`) and
+    OVERWRITES X-Real-IP (`$remote_addr`), so a rotated header reaches Django
+    as `<attacker's entry>, <real client>`. A test that set only
+    X-Forwarded-For would model a caller with no proxy in front of it, which
+    is not the deployment being defended — see backend/EchoFlow/client_ip.py.
+    """
+    return client.post(
+        "/auth/register/",
+        _register_body(username),
+        format="json",
+        HTTP_X_FORWARDED_FOR=f"{spoofed_xff}, {real_ip}",
+        HTTP_X_REAL_IP=real_ip,
+        REMOTE_ADDR=REGISTER_NGINX_PEER,
+    )
+
+
+def _register_request(spoofed_xff=REGISTER_SPOOFED, real_ip=REGISTER_REAL_IP):
+    """A DRF Request for `/auth/register/` shaped like post-nginx traffic."""
+    wsgi = APIRequestFactory().post(
+        "/auth/register/",
+        data=_register_body("probe"),
+        format="json",
+        HTTP_X_FORWARDED_FOR=f"{spoofed_xff}, {real_ip}",
+        HTTP_X_REAL_IP=real_ip,
+        REMOTE_ADDR=REGISTER_NGINX_PEER,
+    )
+    return Request(wsgi, parsers=[JSONParser()])
+
+
 class TestRegisterThrottle:
     """Registration is anonymous, so the IP key cannot be removed — only
     re-sized, and paired with a second limit that can see what the IP key
@@ -335,14 +397,24 @@ class TestRegisterThrottle:
             format="json",
         )
 
-    def test_per_username_limit_stops_repeated_registration(self):
+    def test_per_username_limit_stops_repeated_registration(self, monkeypatch):
+        from django.core.cache.backends.locmem import LocMemCache
+        from rest_framework.throttling import SimpleRateThrottle
         from backend.app.throttling import RegisterUsernameRateThrottle
 
+        # This is a unit-level throttle contract. It must not consume or read
+        # the local stack's real Redis budget, which would make the first
+        # assertion depend on unrelated test order or a prior pytest run.
+        monkeypatch.setattr(
+            SimpleRateThrottle,
+            'cache',
+            LocMemCache('register-username-throttle', {}),
+            raising=False,
+        )
         throttle = RegisterUsernameRateThrottle()
         request = _fake_request_body({"username": "squatter"})
+        view = _view_with_scope('token_refresh')
         for _ in range(3):
-            view = _view_with_scope('token_refresh')
-        for _ in range(120):
             assert throttle.allow_request(request, view) is True
         assert throttle.allow_request(request, view) is False
 
@@ -389,17 +461,159 @@ class TestRegisterThrottle:
         )
 
     def test_register_endpoint_uses_both_throttles(self):
-        from backend.app.throttling import RegisterUsernameRateThrottle
-        from backend.app.views.auth import RegisterView
+        """The `register` per-IP limit must be present *and* must not key on
+        the client-supplied `X-Forwarded-For`.
+
+        The original assertion here was
+        `ScopedRateThrottle in classes, "per-IP 'register' limit was dropped"`.
+        That message asserts a *capability*, not a class, and keeping it
+        meaningful means keeping the capability: a throttle list can name
+        `ScopedRateThrottle` while being completely bypassable, because DRF's
+        `BaseThrottle.get_ident` returns the caller's own header. So the
+        intent is now pinned two ways — the bare class must be gone, and
+        everything left must inherit the trusted identity resolver — and
+        "per-IP" is asserted by the keying, not by the name.
+
+        Which class supplies the per-IP limit is read structurally: the
+        per-username throttle overrides `get_cache_key` to key on the claimed
+        name, so the one still using `ScopedRateThrottle.get_cache_key` IS the
+        per-IP limiter. Naming it by identity would break the day someone
+        subclasses for a different scope.
+
+        Note the reference is `ScopedRateThrottle.get_cache_key`, not
+        `SimpleRateThrottle`'s: DRF's `ScopedRateThrottle` overrides it to
+        prefer `request.user.pk` and fall back to `get_ident` for anonymous
+        callers. Register is `AllowAny`, so it is always the `get_ident` branch
+        that runs — which is exactly the branch the bare class resolves
+        through the spoofable header.
+        """
         from rest_framework.throttling import ScopedRateThrottle
 
+        from backend.app.throttling import (
+            RegisterUsernameRateThrottle,
+            TrustedProxyRateThrottle,
+        )
+        from backend.app.views.auth import RegisterView
+
         classes = list(RegisterView.throttle_classes)
-        assert ScopedRateThrottle in classes, "per-IP 'register' limit was dropped"
+        assert classes, "the register view has no throttles at all"
+        assert ScopedRateThrottle not in classes, (
+            "bare ScopedRateThrottle keys on the client-supplied "
+            "X-Forwarded-For via DRF's get_ident; the per-IP 'register' limit "
+            "is only real via TrustedProxyRateThrottle"
+        )
+        for cls in classes:
+            assert issubclass(cls, TrustedProxyRateThrottle), (
+                f"{cls.__name__} does not inherit TrustedProxyRateThrottle, so "
+                "its identity comes from a header the caller controls"
+            )
+
+        per_ip = [
+            cls
+            for cls in classes
+            if cls.get_cache_key is ScopedRateThrottle.get_cache_key
+        ]
+        assert len(per_ip) == 1, (
+            f"per-IP 'register' limit was dropped: expected exactly one throttle "
+            f"keying on the caller, got {[cls.__name__ for cls in classes]}"
+        )
         assert RegisterUsernameRateThrottle in classes, (
             "per-username limit missing; the per-IP rate alone cannot stop one "
             "host cycling through accounts once it is raised for CGNAT"
         )
         assert RegisterView.throttle_scope == "register"
+
+    def test_register_per_ip_identity_is_not_drf_get_ident(self):
+        """Read off the instance the view really uses, not the class attribute.
+
+        A throttle list can name the right class and still be wrong if
+        something downstream swaps the instance or subclasses it back to
+        DRF's resolution. Mirrors
+        `TestLoginThrottleWiring.test_login_identity_is_not_drf_get_ident`.
+        """
+        from rest_framework.throttling import ScopedRateThrottle, SimpleRateThrottle
+
+        from backend.app.throttling import TrustedProxyRateThrottle
+        from backend.app.views.auth import RegisterView
+
+        throttles = [
+            t
+            for t in RegisterView().get_throttles()
+            if type(t).get_cache_key is ScopedRateThrottle.get_cache_key
+        ]
+        assert len(throttles) == 1, (
+            f"expected exactly one per-IP throttle, got "
+            f"{[type(t).__name__ for t in throttles]}"
+        )
+        throttle = throttles[0]
+
+        assert isinstance(throttle, TrustedProxyRateThrottle)
+        assert throttle.get_ident.__func__ is not SimpleRateThrottle.get_ident, (
+            "the per-IP register throttle is still calling DRF's get_ident, "
+            "which returns the client-supplied X-Forwarded-For"
+        )
+        request = _register_request(spoofed_xff=REGISTER_SPOOFED)
+        assert throttle.get_ident(request) == REGISTER_REAL_IP, (
+            "register identity is not the address nginx set in X-Real-IP"
+        )
+
+    def test_rotating_xff_does_not_buy_extra_registrations(
+        self, settings, db, monkeypatch
+    ):
+        """The behavioural proof: the per-IP limit survives header rotation.
+
+        RED against the pre-fix wiring. `NUM_PROXIES` is removed first (see
+        `_without_the_num_proxies_backstop`), which is the configuration the
+        repo's own comments describe as silently re-breaking when a second
+        proxy is added. A bare `ScopedRateThrottle` then keys on the whole
+        header, so each rotated value is a brand-new bucket and all six
+        attempts get a fresh 3/hour allowance. With `TrustedProxyRateThrottle`
+        every attempt lands on the same `X-Real-IP` bucket and only the first
+        three are served.
+
+        Non-vacuous only because of the `NUM_PROXIES` removal: with the
+        backstop still at 1, DRF takes `addrs[-1]` — the hop nginx appended —
+        so the bare class passes this identical test. Verified by running it
+        that way (see the report); `test_the_removed_backstop_is_load_bearing`
+        in `TestLoginThrottleWiring` pins the helper itself for both endpoints.
+
+        Every attempt claims a different username, so the per-username limit
+        (3/hour, keyed on the name) cannot be the source of the 429s: a 429
+        here is unambiguously the per-IP `register` bucket refusing.
+        """
+        from rest_framework.throttling import ScopedRateThrottle
+
+        _without_the_num_proxies_backstop(settings)
+        # Shrink the scope so the boundary is 3 requests in. `ScopedRateThrottle`
+        # re-derives `rate`/`num_requests` from the view on every call, so the
+        # class attribute is the only seam that survives. Restored by
+        # monkeypatch, not by a `finally` block that re-assigns the attribute:
+        # `THROTTLE_RATES` is inherited, so an unconditional re-assignment
+        # would leave a permanent shadow on the subclass.
+        monkeypatch.setattr(
+            ScopedRateThrottle,
+            "THROTTLE_RATES",
+            {"register": "3/hour", "register_username": "3/hour"},
+            raising=False,
+        )
+
+        client = APIClient()
+        statuses = []
+        for i in range(6):
+            response = _post_register(client, f"1.1.1.{i + 1}", username=f"rot{i}")
+            statuses.append(response.status_code)
+            if i < 3:
+                assert response.status_code == 201, (
+                    f"attempt {i + 1} should have registered, got "
+                    f"{response.status_code}: {getattr(response, 'data', None)!r}"
+                )
+
+        assert statuses[:3] == [201, 201, 201]
+        assert statuses[3:] == [429, 429, 429], (
+            f"rotating X-Forwarded-For bought extra registrations: {statuses!r}. "
+            "The per-IP account-creation limit is bypassable with one HTTP "
+            "header, the moment a second proxy sits in front of nginx."
+        )
 
 
 def _fake_request(refresh, ip="10.0.0.1", explode_data=False):
@@ -548,6 +762,230 @@ class TestRefreshThrottleWiring:
         from django.conf import settings
 
         assert "register_username" in settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]
+
+
+# ---------------------------------------------------------------------------
+# Login throttle identity — the credential-stuffing gate (2026-09-30)
+# ---------------------------------------------------------------------------
+#: The address nginx puts in `X-Real-IP`, i.e. what it actually saw.
+LOGIN_REAL_IP = "203.0.113.7"
+#: `REMOTE_ADDR` behind the terminator: the nginx container, not the user.
+LOGIN_NGINX_PEER = "172.29.0.13"
+#: The attacker's own entry, which nginx will prepend to X-Forwarded-For.
+LOGIN_SPOOFED = "9.9.9.9"
+
+
+def _post_login(client, spoofed_xff, real_ip=LOGIN_REAL_IP):
+    """POST the credential-stuffing gate as it arrives *after* nginx.
+
+    nginx APPENDS to X-Forwarded-For (`$proxy_add_x_forwarded_for`) and
+    OVERWRITES X-Real-IP (`$remote_addr`), so a rotated header reaches Django
+    as `<attacker's entry>, <real client>`. A test that set only
+    X-Forwarded-For would model a caller with no proxy in front of it, which
+    is not the deployment being defended — see backend/EchoFlow/client_ip.py.
+    """
+    return client.post(
+        "/auth/login/",
+        {"username": "nobody", "password": "wrong"},
+        format="json",
+        HTTP_X_FORWARDED_FOR=f"{spoofed_xff}, {real_ip}",
+        HTTP_X_REAL_IP=real_ip,
+        REMOTE_ADDR=LOGIN_NGINX_PEER,
+    )
+
+
+def _without_the_num_proxies_backstop(settings):
+    """Delete `REST_FRAMEWORK['NUM_PROXIES']` for the duration of one test.
+
+    `NUM_PROXIES` is currently 1, which makes DRF's `get_ident` take
+    `addrs[-1]` — the hop nginx appended — so a bare `ScopedRateThrottle`
+    survives rotation *by accident of a single setting*. That is the
+    "backstop", and both settings.py and backend/app/throttling.py say in so
+    many words that it is one line, easy to delete by accident, and silently
+    re-broken by adding a second proxy. These tests assert the login gate
+    does not *depend* on it: they remove the backstop and require the wiring
+    to hold on its own.
+
+    `settings` is pytest-django's fixture, which fires Django's
+    `setting_changed`; DRF's own `reload_api_settings` receiver is connected
+    to it, so `api_settings.NUM_PROXIES` really reads back as absent. Patching
+    the `api_settings` object directly instead would install a permanent
+    instance attribute on undo — the same shadowing pollution the
+    `RefreshTokenRateThrottle.cache` restore once caused (see
+    test_throttle_identity_and_secrets.py).
+    """
+    settings.REST_FRAMEWORK = {
+        key: value
+        for key, value in settings.REST_FRAMEWORK.items()
+        if key != "NUM_PROXIES"
+    }
+
+
+class TestLoginThrottleWiring:
+    """`POST /auth/login/` — 10/min, the gate against credential stuffing.
+
+    Same shape of guard as `TestRefreshThrottleWiring` above, and for a
+    sharper reason. `ScopedRateThrottle` resolves its identity through DRF's
+    `BaseThrottle.get_ident`, which reads the client-supplied
+    `X-Forwarded-For`. Behind the terminator the caller controls that string,
+    so the throttle class alone cannot make this endpoint safe — it needs
+    `TrustedProxyRateThrottle`, whose `get_ident` delegates to
+    `EchoFlow.client_ip.get_client_ip` (X-Real-IP first, which nginx
+    overwrites and therefore cannot be spoofed).
+
+    The class-attribute assertion is necessary but not sufficient: a throttle
+    list can name the right class while the limit stays decorative. The
+    behavioural test below is the one that carries the proof, and the control
+    test alongside it exists so it cannot pass for the wrong reason.
+    """
+
+    def test_login_view_uses_a_trusted_proxy_throttle(self):
+        """The bare framework class must not be back on this view."""
+        from rest_framework.throttling import ScopedRateThrottle
+
+        from backend.app.throttling import TrustedProxyRateThrottle
+        from backend.app.urls import ThrottledTokenObtainPairView
+
+        classes = list(ThrottledTokenObtainPairView.throttle_classes)
+        assert classes, "the login view has no throttles at all"
+        assert ScopedRateThrottle not in classes, (
+            "bare ScopedRateThrottle keys on the client-supplied "
+            "X-Forwarded-For via DRF's get_ident, which is the credential-"
+            "stuffing bypass; use TrustedProxyRateThrottle"
+        )
+        for cls in classes:
+            assert issubclass(cls, TrustedProxyRateThrottle), (
+                f"{cls.__name__} does not inherit TrustedProxyRateThrottle"
+            )
+
+    def test_login_identity_is_not_drf_get_ident(self):
+        """Item 3 of the fix, asserted on the instance the view really uses.
+
+        Read off `get_throttles()` rather than off the class attribute, so
+        this fails if the wiring is right but something downstream replaces the
+        instance or subclasses it back to DRF's resolution.
+        """
+        from rest_framework.throttling import SimpleRateThrottle, ScopedRateThrottle
+
+        from backend.app.throttling import TrustedProxyRateThrottle
+        from backend.app.urls import ThrottledTokenObtainPairView
+
+        throttles = ThrottledTokenObtainPairView().get_throttles()
+        per_ip = [
+            throttle
+            for throttle in throttles
+            if type(throttle).get_cache_key is ScopedRateThrottle.get_cache_key
+        ]
+        assert len(per_ip) == 1, (
+            f"expected exactly one per-IP throttle, got "
+            f"{[type(t).__name__ for t in throttles]}"
+        )
+        throttle = per_ip[0]
+
+        assert throttle.get_ident.__func__ is not SimpleRateThrottle.get_ident, (
+            "the login throttle is still calling DRF's get_ident, which returns "
+            "the client-supplied X-Forwarded-For"
+        )
+        assert isinstance(throttle, TrustedProxyRateThrottle)
+
+        request = _login_request(spoofed_xff=LOGIN_SPOOFED)
+        assert throttle.get_ident(request) == LOGIN_REAL_IP, (
+            "login identity is not the address nginx set in X-Real-IP"
+        )
+
+    def test_rotating_xff_does_not_buy_extra_login_attempts(
+        self, settings, db, monkeypatch
+    ):
+        """The behavioural proof: the limit survives header rotation.
+
+        RED against the pre-fix wiring. `NUM_PROXIES` is removed first (see
+        `_without_the_num_proxies_backstop`), which is the configuration the
+        repo's own comments describe as silently re-breaking. A bare
+        `ScopedRateThrottle` then keys on the whole header, so each rotated
+        value is a brand-new bucket and all six attempts get a fresh 3/min
+        allowance. With `TrustedProxyRateThrottle` every attempt lands on the
+        same `X-Real-IP` bucket and only the first three are served.
+        """
+        from rest_framework.throttling import ScopedRateThrottle
+
+        _without_the_num_proxies_backstop(settings)
+        # Shrink the scope so the boundary is 3 requests in. `ScopedRateThrottle`
+        # re-derives `rate`/`num_requests` from the view on every call, so the
+        # class attribute is the only seam that survives. Restored by
+        # monkeypatch, not by a `finally` block that re-assigns the attribute:
+        # `THROTTLE_RATES` is inherited, so an unconditional re-assignment
+        # would leave a permanent shadow on the subclass.
+        rates = dict(ScopedRateThrottle.THROTTLE_RATES)
+        rates.update({"login": "3/min", "login_username": "1000/hour"})
+        monkeypatch.setattr(
+            ScopedRateThrottle, "THROTTLE_RATES", rates, raising=False
+        )
+
+        client = APIClient()
+        statuses = []
+        for i in range(6):
+            response = _post_login(client, f"1.1.1.{i + 1}")
+            statuses.append(response.status_code)
+            if i < 3:
+                assert response.status_code == 401, (
+                    f"attempt {i + 1} should be a wrong-credentials 401, got "
+                    f"{response.status_code}: "
+                    f"{getattr(response, 'data', None)!r}"
+                )
+
+        assert statuses[:3] == [401, 401, 401]
+        assert statuses[3:] == [429, 429, 429], (
+            f"rotating X-Forwarded-For bought extra login attempts: {statuses!r}. "
+            "The credential-stuffing gate is bypassable with one HTTP header."
+        )
+
+    def test_the_removed_backstop_is_load_bearing(self, settings):
+        """Control for the test above — it must fail for the right reason.
+
+        If `_without_the_num_proxies_backstop` silently did nothing (stale
+        `api_settings`, a signal DRF is not connected to), the behavioural
+        test would keep passing against the unfixed code and prove nothing.
+        This pins the DRF behaviour that makes the two outcomes differ.
+        """
+        from rest_framework.throttling import AnonRateThrottle
+        from rest_framework.settings import api_settings
+
+        assert api_settings.NUM_PROXIES == 1, "the shipped backstop is not 1"
+
+        _without_the_num_proxies_backstop(settings)
+
+        assert api_settings.NUM_PROXIES is None, (
+            "NUM_PROXIES survived the override, so the behavioural test is "
+            "still running with the backstop in place and cannot distinguish "
+            "the two throttle classes"
+        )
+        # With NUM_PROXIES unset DRF returns `''.join(xff.split())` — the whole
+        # header, every client-chosen byte included.
+        assert AnonRateThrottle().get_ident(
+            _login_request(spoofed_xff=LOGIN_SPOOFED)
+        ) == f"{LOGIN_SPOOFED},{LOGIN_REAL_IP}"
+
+    def test_login_scope_and_rate_are_unchanged(self):
+        """Guards the deliberate 10/min decision against a drive-by retune."""
+        from django.conf import settings
+
+        from backend.app.urls import ThrottledTokenObtainPairView
+
+        assert ThrottledTokenObtainPairView.throttle_scope == "login"
+        assert settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]["login"] == "10/min"
+
+
+def _login_request(spoofed_xff=LOGIN_SPOOFED, real_ip=LOGIN_REAL_IP):
+    """A DRF Request for `/auth/login/` shaped like post-nginx traffic."""
+    wsgi = APIRequestFactory().post(
+        "/auth/login/",
+        data={"username": "nobody", "password": "wrong"},
+        format="json",
+        HTTP_X_FORWARDED_FOR=f"{spoofed_xff}, {real_ip}",
+        HTTP_X_REAL_IP=real_ip,
+        REMOTE_ADDR=LOGIN_NGINX_PEER,
+    )
+    return Request(wsgi, parsers=[JSONParser()])
 
 
 # ---------------------------------------------------------------------------

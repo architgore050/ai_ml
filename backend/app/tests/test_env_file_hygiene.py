@@ -701,6 +701,20 @@ _NOT_IN_ANY_TEMPLATE: dict[str, str] = {
     'FEED_POOL_GLOBAL_TTL': 'Feed-pool sizing. Code default 300s.',
     'FEED_POOL_USER_TTL': 'Feed-pool sizing. Code default 86400s.',
     'FEED_POOL_REBUILD_CHUNK_SIZE': 'Feed-pool sizing. Code default 1000.',
+    'TEST_REDIS_CACHE_DB': (
+        'Per-test-RUN Redis database index, passed as '
+        '`docker compose exec -e TEST_REDIS_CACHE_DB=14` so two concurrent '
+        'runs get separate keyspaces. Deliberately never an active template '
+        'key: an operator who set it in .env would pin the *development* stack '
+        'to the suite\'s index, which is the shared-state defect it exists to '
+        'remove. Read only when testing_enabled() is true, so gunicorn and '
+        'the Celery fleet ignore it regardless.'
+    ),
+    'TEST_REDIS_CACHE_URL': (
+        'Full-URL form of the above, for a CI runner whose Redis is not the '
+        'one compose configured. Same reasoning for being absent from every '
+        'template.'
+    ),
 }
 
 

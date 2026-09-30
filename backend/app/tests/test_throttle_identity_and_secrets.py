@@ -150,10 +150,12 @@ def login_rate(monkeypatch):
     """
     from rest_framework.throttling import ScopedRateThrottle
 
+    rates = dict(ScopedRateThrottle.THROTTLE_RATES)
+    rates.update({"login": "3/min", "login_username": "1000/hour"})
     monkeypatch.setattr(
         ScopedRateThrottle,
         "THROTTLE_RATES",
-        {"login": "3/min"},
+        rates,
         raising=False,
     )
 
@@ -227,8 +229,15 @@ class TestRotatingXForwardedForDoesNotBypassTheLimit:
             "no throttle key was written — the throttle never ran, so this "
             "test would pass vacuously"
         )
-        login_keys = [k for k in throttle_cache.keys if "login" in k]
-        assert login_keys, f"no `login` scope key among {throttle_cache.keys!r}"
+        # Login also has a username-keyed companion throttle. This assertion
+        # is specifically about the IP-keyed `login` bucket, whose identity
+        # must come from nginx's X-Real-IP rather than client-supplied XFF.
+        login_keys = [
+            key for key in throttle_cache.keys
+            if key.startswith("throttle_login_")
+            and not key.startswith("throttle_login_username_")
+        ]
+        assert login_keys, f"no per-IP `login` key among {throttle_cache.keys!r}"
 
         for key in login_keys:
             assert REAL_CLIENT_IP in key, (

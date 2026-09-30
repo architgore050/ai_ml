@@ -36,12 +36,18 @@ Every tracked env template ships documentation placeholders:
   * ``REDIS_BROKER_PASSWORD`` / ``REDIS_CACHE_PASSWORD`` were read with **no
     validation at all**, so a copied example gives an attacker who has read
     the repo full access to the broker (task injection) and the cache.
-  * ``DB_PASSWORD`` is **not readable from here**: it appears zero times in
-    `settings.py` and is consumed only by docker-compose interpolation, so
-    there is no in-process place to guard it. It is called out in
-    `.env.example`/`.env.vps.example` and needs a different kind of check
-    (compose-level or CI-level). No settings-level guard is invented for it
-    here, because a guard that reads nothing protects nothing.
+  * ``DB_PASSWORD`` is guarded against the **effective** password,
+    ``settings.DATABASES['default']['PASSWORD']``, not against the env var
+    name. ``settings.py`` never reads ``DB_PASSWORD`` — it builds DATABASES
+    from ``DATABASE_URL``, and every compose file builds that URL from
+    ``DB_PASSWORD`` — so the name really is absent from the module while the
+    secret is fully reachable in-process. An earlier version of this file
+    concluded from the absent name that there was "no in-process place to
+    guard it", which is what a guard that reads nothing protects nothing
+    says about the value. ``settings.py`` calls ``require_real_secret`` on the
+    resolved password, and an empty one is skipped rather than rejected:
+    bare-metal development against a Postgres that trusts the socket is a
+    legitimate configuration, not a placeholder.
 
 THE TRADE-OFF, STATED PLAINLY
 =============================

@@ -234,7 +234,7 @@ services:
       - REDIS_CACHE_PASSWORD=${REDIS_CACHE_PASSWORD}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
       - DJANGO_DEBUG=${DJANGO_DEBUG:-False}
-      - DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1
+      - DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1,web
       - GUNICORN_WORKERS=2
       - GUNICORN_THREADS=2
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
@@ -267,6 +267,11 @@ services:
       - .:/app
     ports:
       - "18000:8000"
+    networks:
+      default:
+        aliases:
+          # Keep the shared Prometheus configuration addressable locally.
+          - web
     depends_on:
       db_local:
         condition: service_healthy
@@ -586,4 +591,3 @@ volumes:
 secrets:
   hf_token:
     environment: HF_TOKEN
-

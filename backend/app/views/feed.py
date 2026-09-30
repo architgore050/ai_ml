@@ -232,6 +232,31 @@ class SuggestionViewSet(viewsets.ReadOnlyModelViewSet):
         )
 
 
+# SECURITY (R5-04): bounds on POST /tags/initialize/'s `selected_tags`.
+#
+# _MAX_SELECTED_TAGS: each tag becomes one OR'd `tags @> '["tag"]'` JSONB
+# containment clause, and `app_audioclip` has NO GIN index on `tags` (only
+# btrees on status/category/creator plus the two HNSW vector indexes), so
+# every clause is a sequential-scan containment check per row — cost grows
+# with clauses x rows. Measured on this repo's local stack: 1 000 tags build
+# a 48 KB query, 50 000 tags build 2.4 MB and cost 5.5 s of Django Q-tree
+# construction in the request thread *before* Postgres is reached, plus 2.1 s
+# of query. Note the Python half is NOT bounded by statement_timeout=30s
+# (settings.py:225) — only the SQL half is.
+# 20 is ~2.5x what the product actually sends: the onboarding UI offers 8
+# vibes (frontend/src/components/feed/OnboardingModal.tsx:11-20), leaving
+# room for a larger picker while keeping the worst case trivial.
+_MAX_SELECTED_TAGS = 20
+#
+# _MAX_TAG_LENGTH: `AudioClip.tags` is written from KeyBERT with
+# keyphrase_ngram_range=(1, 1) and top_n=3 (tasks.py:284-292), i.e. single
+# words, plus the literal "instrumental" for instrumental-only tracks
+# (tasks.py:296). The longest id the current UI offers is "instrumental"
+# (12 chars), so 64 is already far above any real keyword while keeping each
+# clause small.
+_MAX_TAG_LENGTH = 64
+
+
 class TagsViewSet(viewsets.ViewSet):
     """
     Cold-start onboarding: Initialize user preferences from tag selection.
@@ -243,7 +268,75 @@ class TagsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['post'], url_path='initialize')
     def initialize_vectors(self, request):
         user = request.user
-        selected_tags = request.data.get('selected_tags', [])
+        selected_tags = request.data.get('selected_tags')
+
+        # SECURITY (R5-04): `selected_tags` used to be read straight off the
+        # body with no type or bound. All rejections below are 400s in the
+        # `{"error": ...}` shape this action already used for "Not enough
+        # data to build baseline." — DRF's own `{"detail": ...}` / a
+        # serializer's `{"selected_tags": {...}}` would be a third shape in a
+        # file the project already splits between two.
+        #
+        # Validated inline rather than via a serializer: feed.py has no
+        # body-validating action to copy, and its only comparable input path
+        # (SuggestionViewSet's `category`) normalises inline too.
+        if not isinstance(selected_tags, list):
+            return Response(
+                {"error": "selected_tags is required and must be a list of strings."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not selected_tags:
+            return Response(
+                {"error": "selected_tags must contain at least one tag."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(selected_tags) > _MAX_SELECTED_TAGS:
+            return Response(
+                {"error": f"selected_tags accepts at most {_MAX_SELECTED_TAGS} tags "
+                          f"(got {len(selected_tags)})."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        cleaned = []
+        for index, tag in enumerate(selected_tags):
+            if not isinstance(tag, str):
+                return Response(
+                    {"error": f"selected_tags[{index}] must be a string, "
+                              f"not {type(tag).__name__}."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # NUL survives JSON parsing and then kills the jsonb literal
+            # server-side: psycopg raises "unsupported Unicode escape
+            # sequence". Same rule CommentSerializer.validate_text applies.
+            if '\x00' in tag:
+                return Response(
+                    {"error": f"selected_tags[{index}] must not contain null bytes."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            tag = tag.strip()
+            # Stripped to empty it can never match, so a clause for it is pure
+            # waste — and the caller deserves to be told rather than to be
+            # handed a misleading "Not enough data to build baseline."
+            if not tag:
+                return Response(
+                    {"error": f"selected_tags[{index}] must not be empty or whitespace only."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if len(tag) > _MAX_TAG_LENGTH:
+                return Response(
+                    {"error": f"selected_tags[{index}] is {len(tag)} characters; "
+                              f"the maximum is {_MAX_TAG_LENGTH}."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            cleaned.append(tag)
+
+        # Normalise duplicates instead of rejecting them: `Q(a) | Q(a)` is
+        # the same predicate as `Q(a)`, so this is lossless *and* it further
+        # shrinks the clause count the bounds above exist to cap. Rejecting
+        # would turn a benign client bug (double-tap, retried request, a
+        # state array that already held the tag) into a failed cold-start,
+        # and this one-shot onboarding path is where that costs the most.
+        selected_tags = list(dict.fromkeys(cleaned))
 
         # N bug fix: tags is a JSONField(default=list) (see models.py:69),
         # NOT a Postgres ArrayField. The old code used Django's ArrayField
@@ -256,20 +349,18 @@ class TagsViewSet(viewsets.ViewSet):
         # Postgres JSONB has no native "any-of" operator. The right
         # primitive is `@>` (contains): tags @> '["tag"]'::jsonb is true
         # when the array contains "tag". We OR one Q per selected tag.
-        # Empty selected_tags short-circuits to no match.
+        # selected_tags is guaranteed non-empty by the validation above, so
+        # there is no empty-selection case to short-circuit.
         from django.db.models import Q
-        if not selected_tags:
-            baseline_clips = AudioClip.objects.none()
-        else:
-            tag_filter = Q()
-            for tag in selected_tags:
-                tag_filter |= Q(tags__contains=[tag])
-            baseline_clips = AudioClip.objects.filter(
-                tag_filter,
-                semantic_vector__isnull=False,
-                acoustic_vector__isnull=False,
-                moderation_approved=True,
-            ).order_by('-likes')[:100]
+        tag_filter = Q()
+        for tag in selected_tags:
+            tag_filter |= Q(tags__contains=[tag])
+        baseline_clips = AudioClip.objects.filter(
+            tag_filter,
+            semantic_vector__isnull=False,
+            acoustic_vector__isnull=False,
+            moderation_approved=True,
+        ).order_by('-likes')[:100]
 
         if not baseline_clips:
             return Response({"error": "Not enough data to build baseline."}, status=400)

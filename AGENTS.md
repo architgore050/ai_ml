@@ -24,6 +24,87 @@ Django 5.2 / DRF 3.18 · PostgreSQL 16 + pgvector (HNSW) · Redis 7 · Celery + 
 
 > **Docker is the only supported way to run EchoFlow locally.** There is no bare-metal install path. The `Dockerfile` and `docker-compose.yml` provision every dependency (Postgres+pgvector, Redis, MinIO, all Celery queues, ffmpeg, Python 3.11, ML libs, nginx, Prometheus, Grafana) in a single `docker compose up --build`. For production at small scale (~$6/month), use the hybrid deployment: `docker-compose.vps.yml` on a VPS + `docker-compose.laptop.yml` on a laptop + Cloudflare R2 for object storage. See [docs/EXPLAIN/DEPLOYMENT/01-hybrid-deployment-overview.md](docs/EXPLAIN/DEPLOYMENT/01-hybrid-deployment-overview.md).
 
+## Startup sequence (local dev)
+
+**This is the order. Do not reorder it and do not substitute the bare `docker compose` commands** — see the warning at the top of this file. Four things must be up: the container stack, Metro, the HLS Worker, and the `adb reverse` rules for a physical phone.
+
+### 1. Container stack
+
+```bash
+cd /home/devansh/Code/EchoFlow
+docker compose -f docker-compose.local.yml --env-file .env.local up -d
+docker compose -f docker-compose.local.yml --env-file .env.local ps
+curl -kI https://127.0.0.1:18443/health/     # expect HTTP/2 200
+```
+
+`--env-file .env.local` is **mandatory**: compose interpolates `DB_PASSWORD` from it, and that value differs from the one the Postgres volume was created with. Omit it and every service dies with `password authentication failed for user "echoflow"`.
+
+### 2. Host processes (Metro + HLS Worker + adb forwards)
+
+One command covers all three. Metro and the Worker are plain host processes, not services, and they die with whatever session started them:
+
+```bash
+setsid nohup bash scripts/mobile-dev-supervisor.sh \
+  > /tmp/mobile-dev-supervisor.out 2>&1 < /dev/null &
+bash scripts/mobile-dev-supervisor.sh --status
+```
+
+`setsid` is required — the supervisor dies with its launching shell otherwise, which is the exact failure class it exists to fix. Expected `--status`:
+
+```
+adb reverse   : 3/3
+metro         : healthy (http://127.0.0.1:8081/status, also http://172.25.186.111:8081)
+hls worker    : healthy (http://127.0.0.1:8787/healthz)
+```
+
+It re-asserts the forwards and restarts Metro/Worker every 30s. **If the Worker is missing, nginx returns `502` for every HLS manifest** — a healthy `/health/` proves nothing about audio.
+
+### 3. Open the mobile dev client (physical device only)
+
+```bash
+adb devices
+LAN_IP=$(hostname -I | tr ' ' '\n' | grep -E '^[0-9]+\.' | grep -vE '^(127\.|172\.(17|18|28|29)\.)' | head -1)
+adb shell am start -a android.intent.action.VIEW \
+  -d "exp+echoflow-mobile://expo-development-client/?url=http%3A%2F%2F${LAN_IP}%3A8081"
+```
+
+Use the **LAN** URL, not `127.0.0.1`. The supervisor starts Metro with `--host lan`, so the bundle no longer depends on an `adb reverse` rule surviving a USB re-enumeration. The dev client re-fetches the bundle on **every** foreground return, not just at launch, so a lost JS context is unrecoverable until Metro answers again — and the app cannot render its own error, because rendering the error *is* the bundle it lost. Symptoms and evidence: [docs/mobile/05-device-control-and-troubleshooting.md](docs/mobile/05-device-control-and-troubleshooting.md).
+
+### 4. Frontend (only for web work)
+
+```bash
+cd frontend && npm run dev     # https://127.0.0.1:5173  (HTTPS, self-signed)
+```
+
+**The dev server is HTTPS-only.** It serves either TLS or plain HTTP on a port, never both, so `http://127.0.0.1:5173` is refused. An already-open `http://` tab cannot even reload. Use `https://127.0.0.1:5173`.
+
+### Canonical local origins
+
+| Purpose | Origin | Configured in |
+|---|---|---|
+| API | `https://127.0.0.1:18443` | `frontend/.env` → `VITE_API_BASE_URL` |
+| Media / HLS edge | `https://127.0.0.1:19443` | `.env.local` → `PUBLIC_HLS_ENDPOINT_URL` |
+| Metro (phone) | `http://<host-LAN-IP>:8081` | supervisor `--host lan` |
+| Web page | `https://127.0.0.1:5173` | `frontend/vite.config.ts` |
+
+`.env.local` and `frontend/.env` are **gitignored** — a fresh clone has neither and must set them by hand. `mobile/.env.local` holds `EXPO_PUBLIC_API_BASE_URL` (baked into the bundle at build time) and points at the host's **LAN** address, so it must be updated whenever that address changes. Do **not** move the HLS origin to the LAN address: it is `127.0.0.1` so the web page origin and media origin share a host, which is what lets the `SameSite=Lax` `ef_hls_token` cookie be sent. Native clients are unaffected — they send `X-EchoFlow-Media-Token` instead.
+
+### Shutdown
+
+**Order matters.** Stop the supervisor first, or it restarts what you just killed.
+
+```bash
+kill -TERM "$(cat /tmp/mobile-dev-supervisor.pid 2>/dev/null)" 2>/dev/null
+for p in $(pgrep -f 'expo start|wrangler dev|vite'); do
+  kill -TERM -"$(ps -o pgid= -p "$p" | tr -d ' ')" 2>/dev/null
+done
+docker compose -f docker-compose.local.yml --env-file .env.local down
+```
+
+Each host server was `setsid`'d, so it leads its own process group — signal the **group**, not the pid. Killing the top ancestor frees nothing: `wrangler` respawns its own `workerd` child, which keeps port 8787 and makes every replacement die with `Address already in use`. There is no supervisor to prevent that, hence the group kill.
+
+**Do not add `-v`.** Plain `down` removes containers and the network but keeps the named volumes, so the database and MinIO objects survive. Add `-v` only when you intend to wipe local data. And never `docker compose down` without both `-f` and `--env-file`, which targets a different project and orphans the running one.
+
 ## Docker
 ```bash
 docker compose up --build          # 14 services: db, pgbouncer, redis_broker, redis_cache, minio, minio-init, nginx, web, celery, celery_feed, celery_media, celery_beat, prometheus, grafana

@@ -266,14 +266,23 @@ def post_fork(server, worker):
 #   [ -s ... ] guard     -> absent/empty secret = anonymous public download
 ```
 
-### 2. Split ACL (hls/ public, uploads/ private)
-**File:** `media_urls.py:1-38`
+### 2. Split ACL (hls/ token-gated, uploads/ private) — **SUPERSEDED**
+**Was:** `media_urls.py:1-38`, claiming `hls/` was intentionally public
 ```python
-# SECURITY: 
+# SECURITY:
 # - `hls/` is intentionally public for playback; this is not a data leak — originals remain private
 # - No admin/backend access is granted through MinIO public access
 # - `mc anonymous set download` is scoped to `/hls/` prefix only
 ```
+**Now:** the quoted comment is gone and the claim is inverted. `hls/` is
+private and reachable only through the validating edge, which requires a
+short-lived per-clip HMAC token (`ef_hls_token` cookie, or the
+`X-EchoFlow-Media-Token` header for native players). `mc anonymous set
+download` is no longer run anywhere. The "not a data leak" reasoning was
+wrong: segments are verbatim transcripts, so a public prefix is the whole
+clip in one request. See
+[`../storage/04-hls-token-protection.md`](../storage/04-hls-token-protection.md)
+and `2026-09-28-native-media-auth-and-cgnat-throttling.md`.
 
 ### 3. Fail-Fast on Encryption Key
 **File:** `models.py:16-22`

@@ -49,6 +49,21 @@ def cleanup_audioclip_storage(sender, instance, **kwargs):
                 instance.original_file.name, instance.id, exc,
             )
 
+    # B3 (2026-09-29): cover_image was never deleted. It is a user-supplied
+    # image in object storage, so leaving it behind on erasure retains
+    # personal data outside the database — and the DB half of a DPDP erasure
+    # that claims completeness while the bucket keeps the photo is the worst
+    # combination. A user's cover image is personal data whatever the clip
+    # was.
+    if instance.cover_image:
+        try:
+            instance.cover_image.delete(save=False)
+        except Exception as exc:
+            logger.warning(
+                "post_delete: failed to delete cover_image %s for clip %s: %s",
+                instance.cover_image.name, instance.id, exc,
+            )
+
     # hls_playlist_url looks like "hls/<clip_id>/master.m3u8" (or
     # absent if processing never reached HLS). The whole prefix is
     # ours to clean.

@@ -1,0 +1,53 @@
+name: Mobile CI
+
+on:
+  push:
+    branches: [main, feat/frontend-mvp]
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/mobile-ci.yml'
+  pull_request:
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/mobile-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck, test, and validate release configuration
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test -- --runInBand --silent
+      - name: Validate HTTPS preview configuration
+        env:
+          EXPO_PUBLIC_RELEASE_CHANNEL: preview
+          EXPO_PUBLIC_RUNTIME_VERSION: 1.0.0-preview
+          EXPO_PUBLIC_API_BASE_URL: https://preview.example.invalid
+        run: npx expo config --type public --json > /tmp/expo-public-config.json
+      - name: Reject an insecure production API origin
+        shell: bash
+        run: |
+          if EXPO_PUBLIC_RELEASE_CHANNEL=production \
+            EXPO_PUBLIC_RUNTIME_VERSION=1.0.0 \
+            EXPO_PUBLIC_API_BASE_URL=http://insecure.example.invalid \
+            npx expo config --type public --json; then
+            echo 'production config accepted an insecure API origin' >&2
+            exit 1
+          fi

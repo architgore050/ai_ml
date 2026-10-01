@@ -112,6 +112,9 @@ This directory contains comprehensive, code-grounded technical documentation for
 - [comprehensive-bug-sweep.md](decisions/comprehensive-bug-sweep.md) — Original Group A/B/C/D audit findings (4 groups, 31 items, 3 false positives, 1 not-shipped)
 - [group-b-architectural-plan.md](decisions/group-b-architectural-plan.md) — Plan for Group B items 9-12 (counter store, cache invalidation, correlation_id, orphan cleanup)
 - [partial-issues-completion-plan.md](decisions/partial-issues-completion-plan.md) — Plan + completion record for the 7 partially-addressed items (A1, A3, A5, A8, B13, B14, B17) + B19 docstring (added 2026-09-04)
+- [2026-09-28-local-hls-worker.md](decisions/2026-09-28-local-hls-worker.md) — Local HLS token Worker (S3/MinIO storage backend, `/healthz`, nginx `:9443` routing) (added 2026-09-28)
+- [2026-09-28-native-media-auth-and-cgnat-throttling.md](decisions/2026-09-28-native-media-auth-and-cgnat-throttling.md) — Native media auth transport (body token + Worker header) and CGNAT-safe throttle keying (added 2026-09-28)
+- [Mobile rebuild plan](../../mobile-rebuild-plan.md) — Approved plan for rewriting `mobile/` from scratch: architecture decisions, playback sequence, feature scope, UI/UX port, build phases (added 2026-09-28)
 
 ---
 
@@ -132,6 +135,7 @@ This directory contains comprehensive, code-grounded technical documentation for
 | POST | `/share/{id}/send-share/` | ✓ | Send clip to another user |
 | GET | `/share/inbox/` | ✓ | Get user's share inbox |
 | POST | `/follow/{id}/toggle-follow/` | ✓ | Follow/unfollow user |
+| GET | `/media/playback-token/{clip_id}/` | ✓ | HLS play token — cookie, or body token for native (`X-EchoFlow-Client: native`) |
 | POST | `/tags/initialize/` | ✓ | Cold-start tag-based vector bootstrapping |
 | GET | `/suggestions/?category=X` | ✓ | Category-scoped vector ranking |
 | GET | `/profile/me/` | ✓ | Own profile |
@@ -147,10 +151,11 @@ This directory contains comprehensive, code-grounded technical documentation for
 4. **`backend/app/views.py`** — API ViewSets: feed, uploads, interactions, comments, share, follow, tags
 5. **`backend/app/serializers.py`** — DRF serializers with HLS URL signing logic
 6. **`backend/app/services/`** — Service layer: `interactions.py` (cache invalidation), `counter_store.py` (Redis INCR + dual-write), `task_publisher.py` (correlation_id propagation), `sentry.py` (error capture)
-7. **`backend/app/db_routers.py`** — Read-replica routing; auto-activates when `READ_DATABASE_URL` is set
-8. **`docker-compose.yml`** — 14-service deployment topology
-9. **`docker/nginx.conf`** — TLS terminator with 3 listeners (`:80`/`:443`/`:9443`)
-10. **`Dockerfile`** — Multi-stage build with offline wheelhouse and HF model baking
+7. **`backend/app/throttling.py`** — `RefreshTokenRateThrottle` (keyed on the **verified** token subject, not the client IP — a carrier NAT is thousands of callers) and `RegisterUsernameRateThrottle`
+8. **`backend/app/db_routers.py`** — Read-replica routing; auto-activates when `READ_DATABASE_URL` is set
+9. **`docker-compose.yml`** — 14-service deployment topology
+10. **`docker/nginx.conf`** — TLS terminator with 3 listeners (`:80`/`:443`/`:9443`)
+11. **`Dockerfile`** — Multi-stage build with offline wheelhouse and HF model baking
 
 ---
 

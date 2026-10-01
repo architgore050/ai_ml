@@ -16,7 +16,7 @@ This document explains how to set up the VPS half of the hybrid deployment.
 1. **VPS instance** — Hetzner CX22 (2 vCPU, 4 GB RAM, 20 GB NVMe) or Oracle A1
    (4 x ARM AMP, 24 GB RAM, $0/mo). This guide assumes 4 GB RAM.
 2. **Docker + Compose V2** — `docker compose` (not `docker-compose`).
-3. **Cloudflare account** — with `echo-flow.in` domain pointed via Cloudflare
+3. **Cloudflare account** — with `echoflow.in` domain pointed via Cloudflare
    nameservers.
 4. **cloudflared** — installed separately on the VPS for the tunnel.
 5. **Tailscale** — installed separately for subnet router.
@@ -45,7 +45,7 @@ tunnel: <tunnel-uuid>
 credentials-file: /etc/cloudflared/<tunnel-uuid>.json
 
 ingress:
-  - hostname: api.echo-flow.in
+  - hostname: api.echoflow.in
     service: http://localhost:80
   - service: http_status:404
 ```
@@ -56,16 +56,16 @@ ingress:
 sudo cloudflared --config /etc/cloudflared/config.yml run
 ```
 
-6. In the Cloudflare dashboard, add a public hostname `api.echo-flow.in`
+6. In the Cloudflare dashboard, add a public hostname `api.echoflow.in`
    pointing to the tunnel.
 
 ## Step 3: Cloudflare Custom Domain for HLS
 
 1. In the **R2** bucket settings, go to **Custom Domains**.
-2. Add `media.echo-flow.in` as a custom domain.
+2. Add `media.echoflow.in` as a custom domain.
 3. Cloudflare will provision TLS automatically (Universal SSL).
 4. **HLS playback** is now served directly from R2 via
-   `https://media.echo-flow.in/hls/{clip_id}/master.m3u8` — no VPS hop.
+   `https://media.echoflow.in/hls/{clip_id}/master.m3u8` — no VPS hop.
 
 ## Step 4: Deploy on VPS
 
@@ -296,13 +296,13 @@ requires valid database credentials.
 
 ```bash
 # API health
-curl -I https://api.echo-flow.in/health/
+curl -I https://api.echoflow.in/health/
 
 # Media worker heartbeat (should return false until laptop worker starts)
-curl https://api.echo-flow.in/api/v1/health/media-worker/
+curl https://api.echoflow.in/api/v1/health/media-worker/
 
 # Django admin (create superuser first)
-open https://api.echo-flow.in/admin/
+open https://api.echoflow.in/admin/
 ```
 
 **Also verify actual TCP reachability from the laptop, not just ICMP.**

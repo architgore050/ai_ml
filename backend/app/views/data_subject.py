@@ -6,6 +6,8 @@ from django.db import transaction
 from datetime import timedelta
 from django.contrib.auth import get_user_model
 from ..models import DataSubjectRequest, UserInteraction, Comment, ShareEvent
+from ..services.task_publisher import publish
+from ..tasks import execute_data_erasure
 
 User = get_user_model()
 
@@ -75,16 +77,37 @@ class DataSubjectErasureView(generics.GenericAPIView):
                     'cooling_off_until': existing.cooling_off_until,
                 }, status=status.HTTP_403_FORBIDDEN)
             else:
-                # Cooling-off passed: proceed with deletion logic (v1: mark completed)
-                existing.status = 'completed'
-                existing.completed_at = timezone.now()
-                existing.save()
-                # HACK: Actual data deletion deferred to Celery/task pipeline for v1.
-                # In production, trigger a background task (cleanup_orphan_hls-style) here.
+                # B3 (2026-09-29): the cooling-off has passed, so actually
+                # arrange the deletion.
+                #
+                # Previously this set status='completed', stamped
+                # completed_at, and returned "Data erasure process initiated."
+                # — having deleted nothing. That is the worst possible
+                # combination: the user is told their data is gone (so keeps
+                # no copy) and a regulator query surfaces the claim as a
+                # representation. The HACK comment said the work was deferred
+                # to a task pipeline; the task now exists.
+                #
+                # status stays 'in_progress' and is set to 'completed' by
+                # execute_data_erasure when it finishes. Claiming completion
+                # here would reintroduce the same lie one layer down.
+                existing.status = 'in_progress'
+                existing.save(update_fields=['status'])
+
+                publish(execute_data_erasure, int(user.id))
+
                 return Response({
                     'request_id': existing.id,
-                    'status': 'completed',
-                    'message': 'Cooling-off period completed. Data erasure process initiated.',
+                    'status': 'in_progress',
+                    'message': (
+                        'Cooling-off period complete. Erasure has been '
+                        'scheduled. Your account, clips, comments, shares, '
+                        'interactions and uploaded media will be deleted. '
+                        'Consent, audit and grievance records are retained '
+                        'with your identity removed, as required by the DPDP '
+                        'Act 2023 and CERT-In 2022.'
+                    ),
+                    'cooling_off_until': existing.cooling_off_until,
                 })
         # Create new erasure request with 30-day cooling off.
         req, _ = DataSubjectRequest.objects.get_or_create(

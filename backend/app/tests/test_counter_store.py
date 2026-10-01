@@ -281,7 +281,12 @@ class TestFlushCountersToPg:
 
         assert result['applied_completion'] == 1
         ready_clip.refresh_from_db()
-        assert ready_clip.avg_completion_rate == pytest.approx(0.6)
+        # 0.6, blended against the stored prior with weight 10:
+        # (0.0 * 10 + 1.2) / (10 + 2) = 0.1. This asserted exactly 0.6 before,
+        # because the flusher replaced the value outright — which meant one
+        # beat's samples *were* the whole global value, and a single sample
+        # could pin the term that is 30% of the recommendation score.
+        assert ready_clip.avg_completion_rate == pytest.approx(0.1)
 
     def test_completion_deltas_materialize_userinteraction_rows(
         self, user, other_user, ready_clip, monkeypatch,
@@ -421,9 +426,12 @@ class TestServiceLayerIntegration:
         # Redis has the completion sample and the skip counter.
         deltas = counter_store.drain()
         assert deltas['counters'][str(ready_clip.id)] == {'skips': 1}
+        # 15000 / 60000 (ready_clip.duration_ms) = 0.25. Was 0.5, computed as
+        # listen/reel_position — a divisor the caller controls. See
+        # _completion_rate in services/interactions.py.
         assert deltas['completion'][(str(ready_clip.id), str(user.id))][
             'completion_sum'
-        ] == pytest.approx(0.5)
+        ] == pytest.approx(0.25)
         assert deltas['completion'][(str(ready_clip.id), str(user.id))][
             'completion_count'
         ] == 1
@@ -466,8 +474,14 @@ class TestServiceLayerIntegration:
         # After flush: counter advanced, row materialized, ACR set.
         ready_clip.refresh_from_db()
         assert ready_clip.skips == before_skips + 1
-        assert ready_clip.avg_completion_rate == pytest.approx(1.0)
+        # listen 30000 / duration 60000 = 0.5, then blended against the
+        # prior with weight 10: (0.0*10 + 0.5) / 11 = 0.04545. Previously
+        # this asserted 1.0, because the divisor was reel_position_ms and the
+        # flusher *replaced* the value instead of blending it.
+        assert ready_clip.avg_completion_rate == pytest.approx(0.5 / 11)
+        # The materialized per-user row is still the raw sample, not blended:
+        # the blend is a property of the clip-global aggregate only.
         row = UserInteraction.objects.get(
             user=user, clip=ready_clip, interaction_type='view',
         )
-        assert row.completion_rate == pytest.approx(1.0)
+        assert row.completion_rate == pytest.approx(0.5)

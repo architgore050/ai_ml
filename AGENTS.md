@@ -24,6 +24,87 @@ Django 5.2 / DRF 3.18 · PostgreSQL 16 + pgvector (HNSW) · Redis 7 · Celery + 
 
 > **Docker is the only supported way to run EchoFlow locally.** There is no bare-metal install path. The `Dockerfile` and `docker-compose.yml` provision every dependency (Postgres+pgvector, Redis, MinIO, all Celery queues, ffmpeg, Python 3.11, ML libs, nginx, Prometheus, Grafana) in a single `docker compose up --build`. For production at small scale (~$6/month), use the hybrid deployment: `docker-compose.vps.yml` on a VPS + `docker-compose.laptop.yml` on a laptop + Cloudflare R2 for object storage. See [docs/EXPLAIN/DEPLOYMENT/01-hybrid-deployment-overview.md](docs/EXPLAIN/DEPLOYMENT/01-hybrid-deployment-overview.md).
 
+## Startup sequence (local dev)
+
+**This is the order. Do not reorder it and do not substitute the bare `docker compose` commands** — see the warning at the top of this file. Four things must be up: the container stack, Metro, the HLS Worker, and the `adb reverse` rules for a physical phone.
+
+### 1. Container stack
+
+```bash
+cd /home/devansh/Code/EchoFlow
+docker compose -f docker-compose.local.yml --env-file .env.local up -d
+docker compose -f docker-compose.local.yml --env-file .env.local ps
+curl -kI https://127.0.0.1:18443/health/     # expect HTTP/2 200
+```
+
+`--env-file .env.local` is **mandatory**: compose interpolates `DB_PASSWORD` from it, and that value differs from the one the Postgres volume was created with. Omit it and every service dies with `password authentication failed for user "echoflow"`.
+
+### 2. Host processes (Metro + HLS Worker + adb forwards)
+
+One command covers all three. Metro and the Worker are plain host processes, not services, and they die with whatever session started them:
+
+```bash
+setsid nohup bash scripts/mobile-dev-supervisor.sh \
+  > /tmp/mobile-dev-supervisor.out 2>&1 < /dev/null &
+bash scripts/mobile-dev-supervisor.sh --status
+```
+
+`setsid` is required — the supervisor dies with its launching shell otherwise, which is the exact failure class it exists to fix. Expected `--status`:
+
+```
+adb reverse   : 3/3
+metro         : healthy (http://127.0.0.1:8081/status, also http://172.25.186.111:8081)
+hls worker    : healthy (http://127.0.0.1:8787/healthz)
+```
+
+It re-asserts the forwards and restarts Metro/Worker every 30s. **If the Worker is missing, nginx returns `502` for every HLS manifest** — a healthy `/health/` proves nothing about audio.
+
+### 3. Open the mobile dev client (physical device only)
+
+```bash
+adb devices
+LAN_IP=$(hostname -I | tr ' ' '\n' | grep -E '^[0-9]+\.' | grep -vE '^(127\.|172\.(17|18|28|29)\.)' | head -1)
+adb shell am start -a android.intent.action.VIEW \
+  -d "exp+echoflow-mobile://expo-development-client/?url=http%3A%2F%2F${LAN_IP}%3A8081"
+```
+
+Use the **LAN** URL, not `127.0.0.1`. The supervisor starts Metro with `--host lan`, so the bundle no longer depends on an `adb reverse` rule surviving a USB re-enumeration. The dev client re-fetches the bundle on **every** foreground return, not just at launch, so a lost JS context is unrecoverable until Metro answers again — and the app cannot render its own error, because rendering the error *is* the bundle it lost. Symptoms and evidence: [docs/mobile/05-device-control-and-troubleshooting.md](docs/mobile/05-device-control-and-troubleshooting.md).
+
+### 4. Frontend (only for web work)
+
+```bash
+cd frontend && npm run dev     # https://127.0.0.1:5173  (HTTPS, self-signed)
+```
+
+**The dev server is HTTPS-only.** It serves either TLS or plain HTTP on a port, never both, so `http://127.0.0.1:5173` is refused. An already-open `http://` tab cannot even reload. Use `https://127.0.0.1:5173`.
+
+### Canonical local origins
+
+| Purpose | Origin | Configured in |
+|---|---|---|
+| API | `https://127.0.0.1:18443` | `frontend/.env` → `VITE_API_BASE_URL` |
+| Media / HLS edge | `https://127.0.0.1:19443` | `.env.local` → `PUBLIC_HLS_ENDPOINT_URL` |
+| Metro (phone) | `http://<host-LAN-IP>:8081` | supervisor `--host lan` |
+| Web page | `https://127.0.0.1:5173` | `frontend/vite.config.ts` |
+
+`.env.local` and `frontend/.env` are **gitignored** — a fresh clone has neither and must set them by hand. `mobile/.env.local` holds `EXPO_PUBLIC_API_BASE_URL` (baked into the bundle at build time) and points at the host's **LAN** address, so it must be updated whenever that address changes. Do **not** move the HLS origin to the LAN address: it is `127.0.0.1` so the web page origin and media origin share a host, which is what lets the `SameSite=Lax` `ef_hls_token` cookie be sent. Native clients are unaffected — they send `X-EchoFlow-Media-Token` instead.
+
+### Shutdown
+
+**Order matters.** Stop the supervisor first, or it restarts what you just killed.
+
+```bash
+kill -TERM "$(cat /tmp/mobile-dev-supervisor.pid 2>/dev/null)" 2>/dev/null
+for p in $(pgrep -f 'expo start|wrangler dev|vite'); do
+  kill -TERM -"$(ps -o pgid= -p "$p" | tr -d ' ')" 2>/dev/null
+done
+docker compose -f docker-compose.local.yml --env-file .env.local down
+```
+
+Each host server was `setsid`'d, so it leads its own process group — signal the **group**, not the pid. Killing the top ancestor frees nothing: `wrangler` respawns its own `workerd` child, which keeps port 8787 and makes every replacement die with `Address already in use`. There is no supervisor to prevent that, hence the group kill.
+
+**Do not add `-v`.** Plain `down` removes containers and the network but keeps the named volumes, so the database and MinIO objects survive. Add `-v` only when you intend to wipe local data. And never `docker compose down` without both `-f` and `--env-file`, which targets a different project and orphans the running one.
+
 ## Docker
 ```bash
 docker compose up --build          # 14 services: db, pgbouncer, redis_broker, redis_cache, minio, minio-init, nginx, web, celery, celery_feed, celery_media, celery_beat, prometheus, grafana
@@ -322,11 +403,10 @@ docker builder prune                                # CAREFUL — wipes dangling
 | `DATABASE_URL` | Docker: `postgres://user:pass@pgbouncer:6432/echoflow_db`. Non-Docker dev: `postgres://user:pass@localhost:5432/echoflow_db` |
 | `READ_DATABASE_URL` | Optional. When set, activates the read-replica routing in `backend/app/db_routers.py`. Postgres URL of the streaming replica. See [docs/EXPLAIN/database/05-read-replica-design.md](docs/EXPLAIN/database/05-read-replica-design.md) for the activation playbook. |
 | `REDIS_URL` | Non-Docker dev: `redis://localhost:6379/1` (single Redis). Optional in Docker. |
-| `REDIS_BROKER_URL` | Docker: `redis://redis_broker:6379/0`. Falls back to `REDIS_URL`. |
+| `REDIS_BROKER_URL` | Broker URL. **Ignored when `REDIS_BROKER_HOST` is set** — compose always sets it, so a stale URL in `.env.local` cannot override the service name. Falls back to `REDIS_URL`. See the gotcha below. |
 | `REDIS_CACHE_URL` | Docker: `redis://redis_cache:6379/0`. Falls back to `REDIS_URL`. |
 | `HF_TOKEN` | HuggingFace token (model baking at build time). See [docs/EXPLAIN/operations/hf-token-rotation.md](docs/EXPLAIN/operations/hf-token-rotation.md) for the rotation runbook. |
 | `OPENAI_API_KEY` | Optional — reserved for OpenAI pipeline branch |
-| `FREESOUND_API_KEY` | Required only for freesound scraper |
 | `SEED_AUTH_TOKEN` | Auth token for `seed_db.py` |
 | `GUNICORN_WORKERS` | Default gunicorn workers (default: 4) |
 | `GUNICORN_THREADS` | Default gunicorn threads (default: 4) |
@@ -346,6 +426,7 @@ docker builder prune                                # CAREFUL — wipes dangling
 | `SENTRY_PROFILES_SAMPLE_RATE` | Fraction of profiled requests. Default: `0.05`. |
 | `GRAFANA_ADMIN_PASSWORD` | Initial admin password for Grafana (first-boot only). Required — Grafana v11 refuses to start without one. |
 | `TERMS_VERSIONS` | Comma-separated consent versions (e.g. `v1.0,v1.1`). Used by `RegisterSerializer` and `ConsentAudit` (`terms_version_id`). Default: `v1.0`. See `settings.py:622`. |
+- **Age gate (`dob` is required at registration)**: `RegisterSerializer.dob` is `required=True` as of 2026-09-29. It was optional, which meant a client that omitted it registered as an adult (`is_minor=False`) and had its telemetry processed under the adult path — the optionality *was* the DPDP §9 bypass. Under-18 now requires `parent_email`, sets `is_minor=True`, and `POST /interactions/{id}/log-telemetry/` returns **403** for minors. `minor_consent_verified` is hardcoded `False` (no parental-verification flow exists — no mail backend), so do **not** gate on it; gate on `is_minor`. Likes/skips stay open to minors deliberately. Future and >120-year-old `dob` are rejected (the bound uses `timedelta` arithmetic, not `date.replace(year=...)`, which raises on 29 Feb).
 | `COMPLIANCE_OFFICER_NAME` | Chief Compliance Officer name (IT Rules 2021 Rule 4(1)(b)). Served by `/legal/compliance/`. Default: `EchoFlow Compliance Officer`. |
 | `COMPLIANCE_OFFICER_EMAIL` | CCO email. Default: `compliance@echoflow.in`. |
 | `GRIEVANCE_OFFICER_NAME` | Grievance Officer name (IT Rules 2021 Rule 4(1)(a)). Default: `EchoFlow Grievance Officer`. |
@@ -439,14 +520,40 @@ POST /webhooks/revenuecat/    # Webhook endpoint (Phase 2 — HMAC verified when
 - **HLS output**: Stored under `media/hls/{clip_id}/` on local disk. Not S3-backed yet. `cleanup_orphan_hls` Celery task (daily 03:00 UTC) prunes directories older than 1 day that are not in the `AudioClip` table — bounded to 1000 keys/run.
 
 ## Scraping / Ingestion
-```bash
-# Management command
-python manage.py scrape_audio --source=wikimedia --limit=3 --clip-length=30
 
-# Celery task
-python -c "from backend.app.tasks import scrape_and_import; scrape_and_import.delay('internet_archive', limit=5)"
+The third-party scraper/import subsystem was removed for the MVP. Do not add
+scraper credentials, commands, Celery tasks, or optional scraper imports back
+without a new licensing and operator-review decision. The upload path owns the
+rights-policy table and persists `is_noncommercial` / `requires_share_alike`
+from the user's declared licence.
+
+### Seeding media for local development
+The scraper being broken does not block local media work — upload files instead.
+**See [docs/EXPLAIN/operations/01-audio-upload-guide.md](docs/EXPLAIN/operations/01-audio-upload-guide.md)**
+for the full guide. The essentials:
+
+```bash
+# Recommended: backend/scripts/seed_clips.py drives the real HTTP API
+# (POST /clips/ -> POST /clips/{id}/approve-moderation/ -> process_audio_to_hls),
+# one clip at a time. Do NOT hand-write AudioClip rows: approve-moderation is the
+# only enqueue trigger, so a seeder that skips it produces a state the pipeline
+# never creates and makes "the feed works" unfalsifiable.
+python3 backend/scripts/seed_clips.py --dry-run   # validate the manifest, upload nothing
+python3 backend/scripts/seed_clips.py             # upload + approve + wait for ready
+python3 backend/scripts/seed_clips.py --resume    # skip already-uploaded tracks
+
+# Then refill the feed so the new clips reach GET /feed/:
+docker compose -f docker-compose.local.yml --env-file .env.local \
+  exec web_local python manage.py shell -c \
+  "from backend.app.tasks import refill_user_feed; print(refill_user_feed(<user_id>))"
 ```
-Sources: wikimedia, internet_archive, freesound (needs `FREESOUND_API_KEY`), kaggle (needs `SCRAPER_KAGGLE_LOCAL_PATH`). Respects `robots.txt`. Allowed licenses configurable via `SCRAPER_ALLOW_LICENSES`. Source connectors live in `ai_ml/scrapers/sources/`; the `scrape_audio` management command + `scrape_and_import` Celery task remain in `backend/app/`.
+
+Two traps the guide covers in full: `POST /clips/` enqueues **nothing**
+(`finalize_upload` deliberately does not, because the task opens with an
+`if not clip.moderation_approved: return` gate) — skip `approve-moderation` and
+the clip sits at `processing` for ever; and `GET /feed/` is a **destructive
+`lpop`**, so each call drains up to 10 ids and re-requesting a page you already
+got returns the *next* ten. Buffer client-side; re-run the refill instead.
 
 ## Frontend (sample only)
 ```bash
@@ -583,11 +690,22 @@ REVENUECAT_SYNC_INTERVAL_MINUTES=360    # 6 hours
 
 ## Testing & Linting
 - Test framework: **pytest** + `pytest-django`, installed in the `api` image. Run via `docker compose exec web pytest …` — see [Running Tests](#running-tests) for the full command set.
-- Test files live under `backend/app/tests/` (24 files: `test_adversarial_pass3.py`, `test_auth_regulatory.py`, `test_counter_store.py`, `test_db_router.py`, `test_feed_pool.py`, `test_hls_token.py`, `test_https_termination.py`, `test_integration_concurrency.py`, `test_integration_pgvector.py`, `test_metrics_endpoint.py`, `test_metrics.py`, `test_observability_tui.py`, `test_orphan_cleanup.py`, `test_scraper.py`, `test_security_and_validation.py`, `test_sentry.py`, `test_services_comments.py`, `test_services_follows.py`, `test_services_interactions.py`, `test_services_shares.py`, `test_services_uploads.py`, `test_settings.py`, `test_smoke.py`, `test_system_health.py`, `test_task_publisher.py`).
+- Test files live under `backend/app/tests/` (36 files: `test_adversarial_pass3.py`, `test_auth_regulatory.py`, `test_content_moderation.py`, `test_counter_store.py`, `test_db_router.py`, `test_erasure.py`, `test_feed_license_filter.py`, `test_feed_pool.py`, `test_group_c.py`, `test_hls_token.py`, `test_https_termination.py`, `test_integration_concurrency.py`, `test_integration_pgvector.py`, `test_metrics_endpoint.py`, `test_metrics.py`, `test_mobile_contract.py`, `test_observability_tui.py`, `test_orphan_cleanup.py`, `test_redis_url_precedence.py`, `test_reports.py`, `test_revenuecat.py`, `test_scraper_licensing.py`, `test_security_and_validation.py`, `test_sentry.py`, `test_services_comments.py`, `test_services_follows.py`, `test_services_interactions.py`, `test_services_shares.py`, `test_services_uploads.py`, `test_settings.py`, `test_share_pipeline.py`, `test_suggestions_category_filter.py`, `test_smoke.py`, `test_system_health.py`, `test_task_publisher.py`, `test_throttling.py`). The 8 `test_scraper*` files were deleted 2026-09-29 as orphaned — see the count note below.
 - All tests run against PostgreSQL in Docker. No SQLite fallback.
 - No linting/formatter config (no `.eslintrc` at root, no `pyproject.toml`, no `ruff.toml`).
 - CI: `.github/workflows/django.yml` runs migrations + the test suite via Docker. Blocks merges on failure.
-- **Current count: 275 passed, 6 skipped, 0 failed.** Skipped = 1 ffmpeg-environmental (`test_scraper.py::test_normalizer_trims_to_max_seconds` is conditionally skipped when ffmpeg is missing on the host) + 5 live-nginx-environmental (`TestLiveNginxTerminator` requires the full `docker compose up` stack). The 6th previously-running test, `test_scraper.py::test_uploader_creates_audioclip`, was the only one in that group that ever ran in a previous configuration; it now passes after the import fix (see "Recent fixes" below).
+- **Current count (2026-09-30): 1257 passed, 0 failed, 7 skipped, 1 xfailed.** Measured on the local stack after `a10fe14` + `f399073`, and confirmed **twice** — once with the container's `DJANGO_DEBUG=True` and once with `DJANGO_DEBUG=False`, because the compose literal was removed and the suite must not depend on it any more (see "Never gate a security guard on `DJANGO_DEBUG`" below). No `--ignore` flags are needed.
+  - The 1 xfail is deliberate and load-bearing: `test_feed_and_comments_gates.py::TestCrossClipParentIsUnenforced` pins a real defect (`Comment.parent` is client-supplied and never checked against `parent.clip`, so a reply can be filed under one clip and read under another). The fix belongs in `services/comments.py` or the serializer; `strict=True` so it flips to a failure the moment someone fixes it.
+  - **There are currently ZERO failing tests.** The `test_task_publisher.py::TestFlushTelemetryInvalidation` trio is green. **Two independent defects had to be fixed, in sequence** — an earlier entry in this file credited only the first, and a later one credited only the second. Both are needed to explain the history:
+    1. **The patch target was inert** (fixed in `cc1b69f`). The tests patched `tasks.cache`, which `flush_telemetry_stream` never reads — it builds its own client via `redis_lib.from_url(settings.CACHES['default']['LOCATION'])` at `tasks.py:663`, inside the function. The patch succeeded while doing nothing, so the task dialled the real Redis, found `stream:interaction.events` empty, and returned `"No events to flush."` before `bulk_create` or the invalidation loop. Every assertion below the `with` block was vacuous. `cc1b69f` retargeted the patch to `redis.from_url`, which is the seam the code actually reads.
+    2. **Redis was corrupt** (fixed by `redis-check-aof --fix`, same day). With the patch correctly targeted, the trio was *still* red: `echoflow_redis_cache_local` crash-looped on `Bad file format reading the append only file`, so `cache.delete` inside `invalidate_user_vectors_cache` raised, the task's `try/except` swallowed it, the key survived, and `assert cache.get(user_key) is None` failed. After the repair they pass, confirmed across two consecutive full runs.
+  - **The lesson that matters more than either fix: "pre-existing failure" was doing too much work, in both directions.** Stashing my own changes proved only that *I* had not caused a failure, not that the failure was real — and an infrastructure outage that turns every cache assertion red survives that check indefinitely. Equally, a plausible root-cause story survives just as long: the `tasks.cache` analysis was *correct* and did not explain the failures I was looking at, because a second cause was underneath it. **Before diagnosing, confirm the container is healthy (`docker ps` for `Restarting`), and be suspicious of any failure that touches the cache. When a fix lands and the symptom persists, suspect a second cause before declaring the first story complete.**
+  - **7 skipped** = 6 live-nginx-environmental (`TestLiveNginxTerminator` and friends need the full `docker compose up` stack, not the local one) + 1 Pillow-can't-encode-XBM skip in `test_avatar_upload.py`.
+  - **Never patch a module-level name a function does not read.** `patch.object` succeeding proves the *name exists*, not that it is *used*. Grep the function body for the name before trusting a patch.
+  - The previous count was **37 failed**, and AGENTS.md described them as "network/API-key dependent". **That was wrong** — none of them touched the network. They were orphaned tests left behind by `5c9c2d6 "removed scraper"`, which deleted 10 files / 407 lines including all of `ai_ml/scrapers/sources/` but touched **0** test files. The tests asserted against modules that no longer existed (`musopen`, `openverse`, `librivox`, `pixabay`, `podcast_index`, `bbc_sound_effects`, `free_music_archive`, `loc_national_jukebox`, `usgov_audio`, `youtube`, `youtube_shorts`, `state`, and the symbols `downloader.DownloadError` / `download_with_retries` / `normalizer.split_into_segments` / `uploader.save_clip_segments`). 8 test files were deleted 2026-09-29 on that basis; `test_feed_license_filter.py` was **repaired** instead of deleted because it guards a live security property.
+  - **⚠ The same removal broke production code, not just tests.** `ai_ml/scrapers/base.py` no longer defines `normalize_license`, `license_features`, `license_allows_commercial`, `is_noncommercial_license`, `is_share_alike_license` or `resolve_podcast_rss` (0 definitions anywhere in the tree), yet both `backend/app/management/commands/scrape_audio.py:39` and `backend/app/tasks.py:925` (`scrape_and_import`) still import them from `ai_ml.scrapers.base`. **`scrape_audio` therefore fails at import time** — the documented scraping entry point in this file is dead until the license helpers are restored or the scraper is deleted properly. `scrape_audio.py` additionally calls `downloader.download_with_retries` (:441), `uploader.save_clip_segments` (:450) and catches `downloader.DownloadError` (:500), none of which exist any more. It also imports `ai_ml.scrapers.state` (:44) and `ai_ml.scrapers.log` (:45), two whole modules (~479 lines) that must be restored too — the 6 helpers alone are **not** enough to make it import. **⚠ The tree has TWO distinct removal commits and AGENTS.md previously credited the wrong one:** `5c9c2d6` deleted a *stripped* 10-file/407-line copy whose `base.py` never had the helpers; the real 355-line `base.py` was deleted by `aacd759`, which **also added `ai_ml/scrapers/` to `.gitignore:28` and `.dockerignore:42,57`**. Consequence: the copies on disk are **stale residue, not HEAD content**, they are invisible to git, and `.dockerignore` means they ship in **no** image — so `scrape_audio` cannot run in any container even with the imports fixed. Any restore must un-ignore the directory.
+  - The **A3 licensing gate is unaffected** and still enforced: `views/feed.py` and `services/entitlements.py::is_license_restricted` read the DB columns `is_noncommercial` / `requires_share_alike`, not the missing scraper helpers. Only the scraper's ability to *classify* a license is broken. Mobile Phase 2 does not touch the scraper.
+  - Still worth the discipline: compare failure **sets** across >=2 runs against a stashed baseline rather than trusting a total. Verified 2026-09-29: two consecutive runs produced byte-identical failure sets, so the numbers above are stable.
 - **Root cause of 178 `auth_group does not exist` errors:** The old conftest.py used a SQLite override hack that bypassed real migrations. The fix was to make Docker/Postgres the only test environment. The new `conftest.py` auto-creates `echoflow_test` DB, installs pgvector on `template1`, and handles session teardown.
 - **docker-compose.test.yml** — test-only stack (db, redis, minio, web). No nginx, no celery workers. Run with: `docker compose -f docker-compose.yml -f docker-compose.test.yml up --build -d` then `docker compose exec -e PYTHONPATH=/app web pytest backend/app/tests/ --tb=short`.
 - **Recent fixes (2026-09-07):**
@@ -595,6 +713,7 @@ REVENUECAT_SYNC_INTERVAL_MINUTES=360    # 6 hours
   - **`ai_ml/scrapers/uploader.py:17`** (fixed) — was `from ..models import AudioClip` (a relative import left over from when the scraper lived at `backend/app/scrapers/uploader.py`); changed to the absolute `from backend.app.models import AudioClip` to match the pattern used by every other `ai_ml/` file. Was causing `ImportError: cannot import name 'AudioClip' from 'ai_ml.models'` in `test_scraper.py::test_uploader_creates_audioclip`.
   - **`docker/postgres-init/`** (new directory) — three init SQL scripts that run on the main `db` service's first startup: `00-init-pgvector.sql` installs the extension in `POSTGRES_DB` (echoflow_db) so Django migrations can find it; `01-init-pgvector-template1.sql` runs `\c template1` then installs the extension on the template (CRITICAL — must run after `00-` so `template1` has vector before `02-` runs); `02-echoflow-test-db.sql` runs `CREATE DATABASE echoflow_test OWNER echoflow` (idempotent via `\gexec` + `WHERE NOT EXISTS` guard). Filename ordering is load-bearing — see "Postgres init scripts" below.
   - **`docker-compose.yml:11-22`** (modified) — the `db` service now mounts `./docker/postgres-init` (instead of just the old `docker/test/postgres-init/init-pgvector.sql` single file) at `/docker-entrypoint-initdb.d:ro`. The single-file mount only installed vector in `echoflow_db`; the directory mount provisions both `echoflow_db` (main) and `echoflow_test` (dev) with pgvector on a fresh data volume. The separate `docker-compose.test.yml` still uses `./docker/test/postgres-init` for its own dedicated test-db container (clean isolation from dev data).
+- **Audit records the proxy IP, not the client (fixed 2026-09-29)**: nginx is the only entrypoint, so `REMOTE_ADDR` is the nginx container's address. `CorrelationIdMiddleware` used `REMOTE_ADDR or X-Forwarded-For` — the `or` fallback could never fire behind the terminator, so every `AuditLog` row recorded `172.29.0.x`; `ConsentAudit` used `REMOTE_ADDR` alone. Verified live: `AuditLog.ip_address` held `172.29.0.13`. Both now use `EchoFlow/client_ip.py::get_client_ip`, which prefers `X-Real-IP` (nginx **sets** it from `$remote_addr`, so it cannot be spoofed through the terminator). Do **not** put `X-Forwarded-For` first: nginx uses `$proxy_add_x_forwarded_for`, which *appends*, so the first entry is whatever the client sent.
 - **Postgres init scripts:** the main `db` service runs `docker/postgres-init/*.sql` in alphabetical order on first startup of a fresh data volume. The load-bearing order is `00-` (default DB) → `01-` (template1) → `02-` (create test db). If you change a filename, re-read the dependency comments in each file or you will silently break `CREATE DATABASE` for `echoflow_test` (vector extension is required on the source template). Wipe the volume (`docker volume rm echoflow_postgres_data`) if you change an init script — init scripts only run on a fresh data directory.
 - **HNSW index EXPLAIN test gotcha:** `SET LOCAL enable_seqscan = OFF` requires an active transaction. Wrap it in `transaction.atomic()` to ensure it takes effect. Also verify the index type via `pg_am.amname` as a primary check (not just the EXPLAIN plan, which may choose Seq Scan for small tables).
 - **S3 storage in tests:** Use `default_storage.exists(clip.original_file.name)` instead of `os.path.exists(clip.original_file.path)` — `.path` raises `NotImplementedError` on S3 storage backends (MinIO).
@@ -663,11 +782,22 @@ Keep entries concise. Link to docs instead of inlining long explanations.
 - Comment count on `AudioClip` is denormalized and updated in `Comment.save()/delete()` — not via signals.
 - `UserInteraction` uses `F()` expressions for atomic counter increments on likes/shares/skips.
 - **Self-signed dev cert (`docker/certs/localhost.crt`) is in the repo on purpose** so a fresh clone works. For prod, replace with Let's Encrypt material and `nginx -s reload` — the cert is bind-mounted, so no rebuild is needed. **Do NOT push the dev key to a public registry in any fork that re-publishes the image**; revocation is the only fix.
-- **HLS token cookies**: The `ef_hls_token` cookie must have `SameSite=Lax` (not `Strict`) so it's sent on top-level navigation from `app.echo-flow.in` to `media.echo-flow.in` (SameSite=Lax permits cookies on same-site top-level navigations, but blocks cross-site). `Secure` requires HTTPS on both `api.echo-flow.in` and `media.echo-flow.in`. In dev, `Domain` attribute must be empty (localhost doesn't support domain cookies). See `docs/EXPLAIN/storage/04-hls-token-protection.md`.
+- **HLS token cookies**: The `ef_hls_token` cookie must have `SameSite=Lax` (not `Strict`) so it's sent on top-level navigation from `app.echoflow.in` to `media.echoflow.in` (SameSite=Lax permits cookies on same-site top-level navigations, but blocks cross-site). `Secure` requires HTTPS on both `api.echoflow.in` and `media.echoflow.in`. In dev, `Domain` attribute must be empty (localhost doesn't support domain cookies). See `docs/EXPLAIN/storage/04-hls-token-protection.md`.
 - **HLS token secret sync**: In production, `MEDIA_TOKEN_SECRET` must be **identical** in the VPS `.env` (Django issuance) and the Cloudflare Worker secret (`npx wrangler secret put MEDIA_TOKEN_SECRET`). If these diverge, all HLS playback returns 403.
-- **RFC 3986 §5.2.2 — Signed URLs don't work for HLS**: The master playlist references variant playlists and segments via relative paths. RFC 3986 §5.2.2 strips query strings during relative-reference resolution, so signed URLs (which rely on query parameters) fail on the second and subsequent HLS requests. **Signed cookies are the only viable token mechanism for HLS.** This applies to any multi-file streaming protocol (HLS, DASH, Smooth Streaming).
+- **RFC 3986 §5.2.2 — Signed URLs don't work for HLS**: The master playlist references variant playlists and segments via relative paths. RFC 3986 §5.2.2 strips query strings during relative-reference resolution, so signed URLs (which rely on query parameters) fail on the second and subsequent HLS requests. **Signed cookies (or an equivalent per-prefix credential) are the only viable token mechanism for HLS.** This applies to any multi-file streaming protocol (HLS, DASH, Smooth Streaming).
 - **fetch `credentials: 'include'` for Set-Cookie**: When using `fetch()` to call an endpoint that sets an HttpOnly cookie via `Set-Cookie`, the fetch request **must** include `credentials: 'include'` (or `'same-origin'`). Without it, the browser silently discards the Set-Cookie header. This is a common gotcha when building token-issuance endpoints.
-- **HLS token endpoint returns Set-Cookie, not JSON body**: The `/media/playback-token/<clip_id>/` endpoint sets the token as a cookie and returns `{"status": "ok"}`. The frontend must NOT read the token from the response body — it's set as an HttpOnly cookie and auto-sent by the browser on all `/hls/*` requests.
+- **HLS token has TWO transports — cookie (web) and header (native)**: `POST /media/playback-token/<clip_id>/` (POST, not GET — minting a credential must not be a safe/prefetchable/cacheable method) returns `{"status": "ok"}` and always sets the `ef_hls_token` cookie. A caller that also sends **`X-EchoFlow-Client: native`** additionally receives `"token"` in the body, and the Worker then accepts it as the **`X-EchoFlow-Media-Token`** request header (cookie-first precedence).
+  - **Web:** read nothing from the body. The cookie is HttpOnly and the browser attaches it to every `/hls/*` request.
+  - **Native (React Native / Expo):** send the header. AVPlayer does not read `NSHTTPCookieStorage` and ExoPlayer's `DefaultHttpDataSource` sends no `Cookie` header, so neither shares state with the app's HTTP client — and the cookie is `HttpOnly`+`Secure`, so the app cannot read it back to attach it manually. Attach the token via the player's per-source `headers` (expo-audio applies them to the manifest *and* every segment). See `docs/EXPLAIN/decisions/2026-09-28-native-media-auth-and-cgnat-throttling.md`.
+  - The body token is **opt-in** and the default body is unchanged, because `HttpOnly` exists to stop script from reading a bearer credential. Both transports carry the same HMAC string; signature, `exp` and per-clip scope are enforced identically.
+  - **Cookie-first precedence will fool you when testing with `requests`.** `playback-token` sets `ef_hls_token` with `path=/hls/`, so a `requests.Session` that has *ever* minted a token will silently attach the cookie to `/hls/*` and a "no token" probe returns **200/206, not 403**. That is the cookie working, not a bypass. To test the header transport, `session.cookies.clear()` first, or use a fresh session. Verified 2026-09-29: 403 (no credential) → 206 (cookie) → 403 (cleared) → 200 (header only).
+- **Bind-mounted source ≠ reloaded process**: the local stack bind-mounts the repo at `/app`, so a Python edit is on disk instantly — but gunicorn imported the module at startup and does not re-read it. Editing a view then curling the running stack exercises the OLD code, while pytest (fresh import) passes and `grep` in the container shows the new code. **Restart `web_local` before trusting any curl against a Python change.** `wrangler dev` does not have this problem.
+- **…and the three workers do not even see the edit** (2026-09-29): `celery_media_local` / `celery_feed_local` / `celery_beat_local` have **no `/app` bind mount at all** — they run the image baked at build time, so a `backend/` fix needs `docker build` or a `docker cp` **plus a restart** (the prefork parent holds the old bytecode; copying the file while it runs changes nothing). `web_local` and `celery_local` are bind-mounted and only need a restart. Check `docker inspect <svc> --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' | grep /app` before assuming an edit took effect.
+- **A stale `REDIS_BROKER_URL` in `.env.local` silently wins over compose's `REDIS_BROKER_HOST` (fixed 2026-09-29)**: the assignment was `os.getenv("REDIS_BROKER_URL", build_redis_url("REDIS_BROKER"))`, so an old URL in the env file beat the service name compose had just set — defeating the HOST/PORT split that exists *because* base64 Redis passwords break Kombo URL parsing. Symptom is nasty and misdiagnosable: the local stack publishes to a broker owned by the **other** compose project, two independent codebases race for the same `celery` queue, and a brand-new task dies with `NotRegistered` about half the time (measured **2/6**). It looks like "Celery never runs my task". `resolve_redis_url()` now prefers `{prefix}_HOST`; all three `.env.*.example` templates set exactly one form, so none of them change. If a new task mysteriously never fires, check this first.
+- **A stale `django-redis` connection 500s, it does not 503**: `ConnectionInterrupted` out of the throttle check turns `POST /auth/login/` into a 500 debug page. Transient, clears on retry — re-run before investigating.
+- **Never construct a media URL client-side**: use `hls_playlist_url` verbatim. Do not prefix the API base onto it — the HLS origin is the edge (`PUBLIC_HLS_ENDPOINT_URL`), often a different host and port from the API, and in `edge` style it is bucket-less. Both existing frontends did this and it is wrong; see `docs/FRONTEND-REQUIREMENTS.md` §4.7.
+- **IP-keyed throttling is wrong on a mobile network**: a carrier NAT gateway is thousands of callers. `POST /auth/token/refresh/` is keyed on the **verified `user_id` inside the refresh token** (`RefreshTokenRateThrottle`), not the address — otherwise 15-minute access tokens mean ~4 refreshes/hour/user and one cell exhausts its shared `anon` budget, logging out every subscriber. `POST /auth/register/` keeps an IP key (it is anonymous) but is sized at 200/hour and paired with a per-username limit at 3/hour.
+- **`throttle_scope` is load-bearing on any `ScopedRateThrottle` view**: `ScopedRateThrottle` reads its scope from the *view* at request time and **allows everything** when the view does not declare one. Listing the class without `throttle_scope` is a silent no-op — no error, no rate limit. `TestRefreshThrottleWiring` in `test_throttling.py` exists to catch exactly that.
 
 ## Docs
 - `docs/backend-architecture-audit.md` — production scaling analysis (S3, PgBouncer, Kafka, etc.)
@@ -769,9 +899,157 @@ Durable, repo-specific knowledge. Append a concise entry at the end of each sess
 **Open:**
 - **No cross-environment parity test**: the R2 backend (prod) and S3 backend (local) never see the same input. Token validation is shared code so the security boundary is covered; the storage fetch is not.
 - `docker-compose.test.yml` cannot start — `docker-compose.yml` references `minio/minio:RELEASE.2025-09-07T16-13-09Z`, which does not exist on Docker Hub. Blocks running the suite in the documented test stack.
-- 4 pre-existing failures unrelated to this work: `test_task_publisher.py::TestFlushTelemetryInvalidation` (3) and `test_feed_license_filter.py::test_fallback_excludes_nc_and_sa` (1). None of those files are in this branch's diff.
+- 4 failures at the time, unrelated to this work: `test_task_publisher.py::TestFlushTelemetryInvalidation` (3) and `test_feed_license_filter.py::test_fallback_excludes_nc_and_sa` (1). None of those files are in this branch's diff. Historical note: the 3 telemetry failures were the corrupt-Redis incident, not code.
 - 8 scraper test modules error on `ai_ml.scrapers.state`, deleted in `5c9c2d6 "removed scraper"` while `scrape_audio.py` and the tests still import it.
 - `celery_media_local` OOMs (2 GB limit, 12 GB host), so HLS output is not produced locally; fixtures are seeded into MinIO directly.
+
+---
+
+### 2026-09-28 — mobile-rebuild: native media auth + CGNAT throttling
+**Learned:**
+- `ef_hls_token` is unreachable for native players: AVPlayer/ExoPlayer have no shared cookie jar, and the cookie is `HttpOnly`+`Secure`. Fixed by an opt-in `X-EchoFlow-Client: native` body token + Worker `X-EchoFlow-Media-Token` header (cookie-first precedence — a page can set a header but cannot read the cookie). `docs/mobile-rebuild-plan.md` §2-3.
+- `ScopedRateThrottle` reads its scope from the **view** and allows *everything* when absent. Listing the class on a view with no `throttle_scope` silently unthrottles it — no error. `throttle_scope` is load-bearing.
+- simplejwt **stringifies** `user_id` (`tokens.py:228`), so `isinstance(x, int)` on the token subject always fails; accept `(str, int)` or the throttle silently falls back to IP keying.
+- `AnonRateThrottle` is fatal on mobile: 100/hour/IP behind a carrier NAT, and 15-min access tokens mean every user refreshes ~4x/hour → mass logout. Key refresh on the verified token subject, not the address.
+- `.env.vps.example` was missing `PUBLIC_HLS_ENDPOINT_URL`, so prod emitted bucket-prefixed HLS URLs the Worker 404s. Domain is `echoflow.in` (was split with `echo-flow.in` across 13 files).
+
+**Changed:**
+- `backend/app/throttling.py` (new), `views/media.py`, `views/auth.py`, `app/urls.py`, `settings.py`; `workers/hls-token-worker/src/{token,index}.ts`; `.env.vps.example`, 3 compose files; 11 docs.
+- New tests: `test_throttling.py` (26), `token.test.ts` (8), `TestNativeTokenTransport` (9).
+
+**Open:**
+- **No phone dev loop.** `PUBLIC_HLS_ENDPOINT_URL` is hardcoded to `localhost:19443` (a phone's `localhost` is the phone) and `docker/certs/localhost.crt` does not cover a LAN IP. Cert setup is manual per owner decision; runbook section not yet written.
+- Suite flakiness: `test_counter_store` / `test_revenuecat` / `test_services_interactions` fail non-deterministically under a contended stack and pass in isolation. Compare failure **sets** across >=2 runs vs a stashed baseline; a single run proves nothing.
+- Mobile app itself is **not started** — the rewrite plan is `docs/mobile-rebuild-plan.md` §8-17. Backend items still blocking feature parity are tabulated in §17.
+
+---
+
+### 2026-09-29 — mobile Phase 2: real-media seed + four latent bugs
+**Learned:**
+- **`celery_media_local`, `celery_feed_local` and `celery_beat_local` run a BAKED image with no `/app` bind mount** (only `web_local` and `celery_local` bind-mount the repo). Any `backend/` edit is invisible to them until a rebuild or a `docker cp`. This is the same trap as the existing "bind-mounted source ≠ reloaded process" note, one level worse: not a stale process, a stale *image*.
+- **A stale `REDIS_BROKER_URL` in `.env.local` (172.28.0.x) beat compose's `REDIS_BROKER_HOST`** because those three workers predate the 2026-09-29 `resolve_redis_url` fix. They published Celery tasks to a dead broker while `web_local` published to the live one — so uploads enqueued and then nothing ran. The 2026-09-29 fix is correct; it just had not reached the baked images. Fix: delete `REDIS_BROKER_URL` / `REDIS_CACHE_URL` from `.env.local` and let HOST/PORT win.
+- **Orphan containers from another project can silently consume your queue.** `echoflow_revnuecat-prod-celery_media-1` was up 23h on `-Q heavy_media` against the same broker, stealing every `process_audio_to_hls` task. It presented as "the worker receives 0 tasks". Check `docker ps -a | grep -v <your project>` and decode a `LINDEX` of the queue to see whose clip IDs are in there.
+- **`from ..services` in `backend/app/tasks.py` killed EVERY HLS encode** at the moderation step (`ModuleNotFoundError: backend.services`). `tasks.py` is at `backend/app/`, so it needs `.services`; only files a level deeper use `..services`. Nothing had HLS'd successfully before this.
+
+**Changed:**
+- `backend/app/tasks.py` (import), `backend/app/views/content.py` + `backend/EchoFlow/settings.py` + `backend/app/tests/test_throttling.py` (throttle scopes), `backend/scripts/seed_clips.py` (new), `docker-compose.local.yml` (media worker concurrency 2→1), 8 deleted orphaned `test_scraper*` files, `backend/app/tests/test_feed_license_filter.py` (repaired).
+- Commits: `7e39e52` (import), `936de67` (throttle scopes), `6b3da27` (seed + compose).
+- Decision: `docs/EXPLAIN/decisions/2026-09-29-clip-throttle-scopes.md`.
+
+**Open:**
+- **`scrape_audio` and the `scrape_and_import` task are dead at import time** — both import license helpers that no longer exist in `ai_ml/scrapers/base.py`. Not touched by mobile Phase 2; needs a decision (restore helpers or delete the scraper properly).
+- **`test_task_publisher.py::TestFlushTelemetryInvalidation` (3) — were red, now green, and never a code defect.** The long "inert patch target" analysis was wrong; the real cause was the corrupt-Redis incident. See Testing & Linting.
+- Media worker image still needs a rebuild for the `task.py` import fix to be permanent; currently `docker cp`'d in.
+
+---
+
+### 2026-09-29 — frontend-rebuild-pass-1 (harness, avatar bound, is_following)
+**Learned:**
+- **Read the model before "fixing" a validation gap.** `profile_picture` is `models.ImageField` (`models.py:55`), so DRF already runs Pillow's real `ImageField` decode — the avatar upload was never missing content checks, only a size cap. I wrote a magic-byte allowlist to mirror the audio path, then deleted it: strictly weaker than an actual decode. `_BLOCKED_MAGIC_SIGNATURES` exists for *audio* because audio has many valid headers; an avatar has three. Always check whether the framework already covers the layer.
+- **`ImageField` sets no size limit, and `DATA_UPLOAD_MAX_MEMORY_SIZE` does not apply** — uploads spool to temp files. That was the entire real gap in B1.
+- **Test fixtures must be the thing the test is about.** A flat-colour 1400×1400 PNG is **9 KB, not 6 MB** (needs incompressible random pixels to reach a byte cap), and a synthetic `\x89PNG` header tests Pillow's rejection of garbage rather than the size/extension rule. Assert the fixture's own size/content.
+- **Which DRF layer fires is not inferable from the error text** — a bad extension with non-image content reports `invalid_image`, not `invalid_extension`. Assert the outcome, or the test measures the wrong layer and passes for the wrong reason.
+- **Check `is_authenticated`, not truthiness, on `request.user`.** DRF hands unauthenticated requests a truthy `AnonymousUser`; `if viewer is None` raised `AttributeError: 'AnonymousUser' object has no attribute 'following'`.
+- **N+1 tests measure the whole serializer, not your field.** "0 queries over 10 clips" returned 20 — from pre-existing `creator_name` (FK walk, no `select_related`) and `is_liked` (my queryset skipped that annotation). Isolate your contribution: annotate the neighbours, then add a second test omitting only one of them. **Both N+1s are still live (P2, logged in `docs/frontend_rebuild_plan.md`).**
+- **A corrupt AOF makes every cache-backed test fail as a DNS error and silently masks real results.** `echoflow_redis_cache_local` crash-looped on `Bad file format reading the append only file`; `socket.gethostbyname` fails while the container restarts, so failures read as flaky-connection rather than infrastructure. `docker ps` → `Restarting` is the tell. Non-destructive fix: `docker run --rm -i -v <volume>:/data redis:7-alpine redis-check-aof --fix /data/appendonlydir/appendonly.aof.1.incr.aof` (answer `y`), then `docker compose rm -sf` + `up -d` the service.
+- **`GET /profile/me/` was a 500 for every user and no test covered it.** `UserInteraction.clip` declares no `related_name` (`models.py:256`), so the reverse accessor is `userinteraction`, and `get_liked_clips`' `interactions__*` filter raised `FieldError`. Found only because B2 added a field to a serializer that could not render. **Untested endpoints are broken endpoints — assert 200 on each, not just on the fields under test.**
+
+**Changed:** commits `4ed5cf5` (vitest/RTL harness, `strict`, ErrorBoundary), `9eebc1a` (avatar size+extension bound, B1), `21846fe` (`is_following`, B2 + the `userinteraction` fix). Plan: `docs/frontend_rebuild_plan.md`. Suite 586 → **702 passed, 0 failed, 7 skipped** after Block 0 (the `TestFlushTelemetryInvalidation` trio is green; it was never a code defect — see Testing & Linting).
+
+**Open:**
+- Commits 4–11 of the plan: fabricated-`receiver_id` share writes (live data corruption), `watch_time_ms` = media position (ranking exploit), dead auto-advance, and the `ef_session_expired` gap. **The share bug is the most urgent item in the repo.**
+- Two live N+1s on every feed page: `creator_name` needs `select_related('creator')`, `is_liked` needs the `user_has_liked` annotation. Neither is in the plan's commit list.
+
+---
+
+### 2026-09-29 — frontend-rebuild Block 0: four live Criticals closed
+**Learned:**
+- **A comment describing a method that does not exist is worse than no comment.** `CORS_URLS_REGEX = r'$.^'` disabled CORS for the entire API, justified by "the middleware will still apply CORS_ALLOWED_ORIGINS to all responses that flow through its `check_origin` method". `CorsMiddleware` has no `check_origin`; `is_enabled` is `re.match(...) or check_signal(...)` and `check_signal` fires a signal nothing subscribes to. Production is cross-origin by design (Pages `app.echoflow.in` → `api.echoflow.in`), so the deployed app could not have made a single browser request. **Same pattern as `ErrorBoundary.tsx:28`**, which claims it sits inside the providers when it sits outside. Grep for the symbol the comment names.
+- **An exact-match placeholder blocklist is not a guard.** The empty-only `MEDIA_TOKEN_SECRET` check let `change-me-to-a-long-random-string` — committed to this repo, shipped in all three env examples — become the production HMAC key. Substring matching plus a `<...>` template-marker rule is the shape that actually holds. A whitespace-only value is truthy and also slipped through.
+- **A share token is a 30-day media token.** `validatePlaybackToken` (worker `token.ts:106`) checks format/HMAC/version/expiry/scope and cannot tell a share token from a media one, and the token rides in the URL (`?s=`). So a **play-time** gate is bypassable: hand the raw token over and hit the edge directly. Mint-time refusal is the only load-bearing control.
+- **A `ShareEvent` is a capability, not a record.** `resolve_clip_access` grants `ACCESS_SHARED_WITH_ME` and returns *before* the licence check by design. So an unscoped `send_share` (it was `get_object_or_404(AudioClip, pk=pk)`, with **zero** tests) chained into the NC/SA bypass in two requests. Copy the feed's own predicate rather than writing a second "what is servable" filter — two of them drift.
+- **"Pre-existing failure" can be pure infrastructure.** The 3 `TestFlushTelemetryInvalidation` failures were the corrupt-AOF incident, not code; the long "inert patch target" analysis in this file was wrong. Stashing my changes proved *I* hadn't caused them, not that they were real. Check `docker ps` for `Restarting` before diagnosing anything cache-shaped.
+- **Changing `.env.local` does nothing until the container is recreated.** `up -d web_local` is required or every test reads a stale secret. Caught only because a green result looked wrong.
+
+**Changed:** `cfc5bc1` (CORS), `c897426` (placeholder secret), `3042f20` (A4 licence gate), `74c7ac9` (`send_share` scope), `fcc380d` (pricing-gap handover doc). New tests: `test_cors.py` (24), `TestPlaceholderSecretRejected` (18), 8 in `test_share_pipeline.py`, `test_share_send_endpoint.py` (14, the file that did not exist). Suite 614 → **702 passed, 0 failed, 7 skipped**.
+
+**Every new test was verified to FAIL against the unpatched code** (14/24, 13/18, 7/8, 7/14 respectively) by reverting the fix and re-running. A test that has never been seen red is not evidence.
+
+**Open:**
+- ~~`DJANGO_SECRET_KEY`, `DB_PASSWORD`, `REDIS_*_PASSWORD` ship the same placeholders and are **not** guarded~~ — **CLOSED 2026-09-30 in `a10fe14`.** The predicate moved to `backend/EchoFlow/secrets.py` (shared with `hls_token.py` instead of imported from it, which was a layering inversion) and now guards `DJANGO_SECRET_KEY` and both Redis passwords at settings-import time. Three bypasses exist and all three are documented: the exact-value `ECHOFLOW_ALLOW_PLACEHOLDER_SECRETS=1`, `DJANGO_DEBUG=true`, and `secrets.testing_enabled()`. `DB_PASSWORD` is still unguarded **by design** — `settings.py` never reads it (compose interpolation only), so there is nowhere to guard it; it is a compose-level concern.
+- `.env.example` has 9 duplicated keys; `GRAFANA_ADMIN_PASSWORD` appears 3× and last-wins downgrades `change-me-...` to `admin-password`.
+- `SENTRY_DSN` absent from `.env.vps.example`; `celery_beat_local` has `healthcheck: {disable: true}` so it reads `Up` forever while crash-looping.
+- `PUBLIC_HLS_ENDPOINT_URL` was unset locally, which silently routed HLS URLs to private MinIO past the validating edge. Now set — **the Worker must be running (`scripts/run-hls-worker-local.sh`) or nginx returns 502**, which is the correct, loud failure.
+- Unenforced free-tier duration/HD limits: `docs/EXPLAIN/decisions/2026-09-29-unenforced-subscription-limits.md`. AGENTS.md's "Enforcement points" list is wrong on this until commit 19.
+---
+
+### 2026-09-30 — backend hardening: rights flags, telemetry batch loss, throttle identity
+**Learned:**
+- **The rights gate read two columns the upload path could not set.** `is_license_restricted` (`entitlements.py:67`) is `bool(is_noncommercial or requires_share_alike)`, but `AudioUploadSerializer.Meta.fields` never listed either — they held the model default `False` forever, while `license_type` was writable, `ChoiceField`-validated, and read by nothing except a `logger.warning`. An NC recording declared correctly was served across all six surfaces. Fixed by deriving the booleans from the validated `license_type` in `create()`; the table is **transcribed** from `ai_ml/scrapers/base.py::license_features` rather than imported, because `ai_ml/scrapers/` is optional (`SCRAPER_ENABLED=False`) and has been deleted twice — an import there would turn a missing package into an `ImportError` on every request. A parity test re-derives both and fails on divergence.
+- **`bulk_create` without `ignore_conflicts` against a real `UNIQUE(user, clip, interaction_type)`** discarded up to 500 unrelated users' telemetry per 10s tick: one duplicate rolled back ~5 internal INSERTs inside one transaction, the `except` routed the whole read window to a DLQ that had **zero readers**, and the entries were `XACK`ed. One account, two requests — and `frontend/src/stores/player.tsx` fires a `view` every ~6s, so it fires *organically* (~50 duplicates per 300s clip). `ignore_conflicts` alone would have stopped the loss and left the data silently wrong (first heartbeat survives), so coalescing keeps the **last** event per triple and the flag is only belt-and-braces. Separately: the consumer client had no `decode_responses=True`, so `XREADGROUP` returned `bytes`, `fields.get('payload')` was `None`, and **production was losing 100% of telemetry** into the DLQ branch.
+- **Rate limiting was bypassable by rotating one header, and no amount of key-space hygiene fixes it.** `NUM_PROXIES` unset → DRF returns `''.join(xff.split())`, the *entire* client-supplied `X-Forwarded-For`, as the throttle identity; nginx appends, so a client prefix survives. A parallel audit blamed `allkeys-lru` evicting 24h dedup keys and proposed shortening the TTL — **that is a placebo**: the dedup key is written by the Celery consumer behind a 60/min throttle, and LRU evicts *coldest* first, which protects hot throttle keys. The bypass is at the identity layer, so no TTL or key-move touches it. Fixed with `TrustedProxyRateThrottle` delegating to the existing `client_ip.get_client_ip` (which the audit paths already used), plus `NUM_PROXIES: 1` as backstop.
+- **Never gate a security guard on `DJANGO_DEBUG`.** The placeholder-secret guard accepted any secret under `DEBUG=True`, and `docker-compose.local.yml` pinned `DJANGO_DEBUG=True` as a *literal* — unoverridable from any env file, and `conftest.py`'s `os.environ.setdefault` cannot override an exported value. So the suite's ability to run depended on a compose literal, and flipping it would have 301'd every test (`SECURE_SSL_REDIRECT` + Django's test client on `http://testserver/` with no `X-Forwarded-Proto`). Fixed with an explicit `ECHOFLOW_TESTING` gate — but note **`conftest.py` sets it too late**: pytest-django calls `django.setup()` during initial-conftest loading, *before* the rootdir conftest body runs. `secrets.testing_enabled()` therefore also recognises `"pytest" in sys.modules`, which is imported strictly earlier.
+- **`conftest.py`'s `clear_throttle_cache` does `cache.clear()` = `FLUSHDB` on the live dev Redis.** Every test file that requests it can wipe the shared dev cache mid-suite. Combined with `counter_store.drain()` being `KEYS clip:*` + `DEL`, whole-file results are untrustworthy when agents run concurrently — three runs of *identical* code produced three different failure sets. Give each concurrent agent its own `TEST_DB_NAME` (`conftest.py:59` is env-driven) and prefer an in-memory Redis in new tests.
+- **A cleanup block can silently defeat every later test.** `original = RefreshTokenRateThrottle.cache` … `finally: RefreshTokenRateThrottle.cache = original` — `cache` is *inherited*, so the restore installs a **new class attribute on the subclass**, permanently shadowing the parent. Fixtures patch `SimpleRateThrottle.cache`, which then no longer applies, and the throttle reads/writes the live dev Redis. Symptom: a test that passed alone and failed in-file with "0 of 4 allowed" because a real budget was already spent. Use `monkeypatch.setattr`, and a guard test asserting no throttle defines its own `cache`.
+- **A test asserting a syntactic shape will break on a correct change.** `TestProductionSslSettings` parsed settings.py's AST for a literal `if not DEBUG:` node, so adding `and not _ECHOfLOW_TESTING` errored 6 tests. The fix broadened the matcher to "gated on `not DEBUG`" *and* strengthened it: any extra conditions must be named like a test switch, so prod hardening can never be gated behind something a deployment could set.
+- **Three reports about this work were wrong, and checking cost less than acting on them.** "2 failing tests in `TestRecordSkip`" was stale (resolved by `20f6e7e`); "`SENTRY_DSN` absent from `.env.vps.example`" was false (present-and-empty at `:104`); "telemetry poisons the ranker" was backwards — `add_completion` is called unconditionally by `record_skip` and only on the tier-3 fallback by `record_telemetry`, so `register_skip` is the live path to the 30% term. Also: the feed refill threshold is **not** "`<15`" — there is no view-side threshold at all (`feed.py:77` refills only when empty) and the real one is `>=20` in `feed_tasks.py:96`.
+- **A scope-creep test file can be right about the problem and wrong to land.** An agent wrote 884 lines for a `GET /clips/{id}/resolve/` endpoint that did not exist, to make `${origin}/?clip=<id>` deep links work — sound reasoning, but a new public API is an architecture change needing approval. Quarantined while the rest landed; the other agent then implemented it as `resolve_clip` gated on `resolve_clip_access`. Three of its tests were wrong, not the endpoint: the url_name is `clips-resolve-clip` (DefaultRouter prefixes the basename), `_normalise` was handed a literal that never appears in the body, and the permission check used a bare view where per-action `initkwargs` are not applied — plus `isinstance` on permission **classes**, which is always False.
+
+**Changed:** `a10fe14` (rights-flag derivation + `resolve_clip`, 32 files), `f399073` (test-stack DEBUG literal + xfail promoted to assertion). Earlier in the same run: `c12f16b`, `a71a8c8`. Tests added: `test_upload_license_derivation`, `test_cover_image_url`, `test_telemetry_flush_integrity`, `test_throttle_identity_and_secrets`, `test_feed_and_comments_gates`, `test_ranking_exploit_cap`, `test_env_file_hygiene`, `test_clip_resolve`.
+
+**Open:**
+- `views/social.py:61` has the same missing-`is_active=True` defect that was fixed in `feed.py` at three sites, and `views/social.py` was owned by nobody. Unfixed.
+- The 30% ranking term is **mitigated, not fixed.** A per-`(user, clip)` cap of 3 samples/24h replaces 24,000/day, but the blend prior is still the constant `_COMPLETION_PRIOR_WEIGHT = 10` rather than a running count, so 3 samples/day still converges past 0.9 in ~9 days. The real fix is a persisted `AudioClip.completion_sample_count` + true-prior blend; needs a migration, **owner deferred it**.
+- The throttle/IP-fallback and `NUM_PROXIES` work does not cover the two `ScopedRateThrottle` views wired in `urls.py:27` and `:47` (bare `ScopedRateThrottle`, not `TrustedProxyRateThrottle`); `NUM_PROXIES: 1` is the only thing protecting them.
+- `docker/prometheus/prometheus.yml` scrapes `http://web:8005/metrics/` with no `X-Forwarded-Proto`; under `DEBUG=False` that 301s and the scrape dies. Already true in prod compose, now also local.
+- `celery_beat_local`, `celery_feed_local`, `celery_media_local` still run a **baked image with no `/app` mount** that predates `resolve_redis_url` (`grep -c 'def resolve_redis_url'` = 0 in all three, 1 on the host). `celery_beat_local` holds ESTABLISHED sockets to `172.28.0.2:6379` — a foreign broker that accepts the *local* password — while the local broker is `172.29.0.11`. **Still unidentified.** Rebuild + `--force-recreate` those three before trusting any result from this stack.
+- `.env.local` (gitignored) still carries the weak `GRAFANA_ADMIN_PASSWORD=admin-password` and a placeholder `DJANGO_SECRET_KEY` as the live secret. Fix by hand; both were corrected in the `*.example` templates.
+
+---
+
+### 2026-09-30 — Phase A: test-run Redis isolation
+**Learned:**
+- **`cache.clear()` was `FLUSHDB` of the live dev cache.** `clear_throttle_cache` needs a global clear (throttle keys are `throttle_*` with no shared prefix), so the fix had to be a *keyspace* change, not a narrower clear. `clear_throttle_cache`'s fail-loud retry behaviour is unchanged.
+- **The ordering trap is real and was demonstrated, not assumed.** pytest-django calls `django.setup()` from its own `pytest_load_initial_conftests`; `_pytest.config`'s impl of that hook is `trylast`, so the rootdir `conftest.py` body has not run. Measured: `os.environ['REDIS_CACHE_URL']=.../13` set in the conftest body left `settings.CACHES['default']['LOCATION']` at `.../0`. A `conftest.py` fix would have looked correct and done nothing.
+- **`allkeys-lru` is server-wide, so index isolation does not bound memory.** `redis_cache_local` is `maxmemory 1073741824` + `allkeys-lru`; a suite index cannot evict *or* be evicted independently of db0. Measured headroom is huge (1.87 MB used of 1 GB), so this is not a live risk, but it is not an isolation guarantee either.
+
+**Changed:** `backend/EchoFlow/settings.py` (`resolve_test_redis_cache_url` + `TEST_REDIS_CACHE_DB_DEFAULT=13`, gated on `testing_enabled()`), `backend/app/tests/test_env_file_hygiene.py` (two `_NOT_IN_ANY_TEMPLATE` entries). New: `backend/app/tests/test_redis_isolation.py` (16). No migration, no dependency, no conftest edit. Suite **1308 passed, 0 failed, 7 skipped, 1 xfailed** (measured with concurrent Phase-B work in the tree, so the count includes tests this change did not add; `test_redis_isolation.py` contributes 16).
+
+**Test-only env vars — deliberately in NO `.env` template** (a template entry would pin the *dev* stack to the suite's index, which is the defect):
+- `TEST_REDIS_CACHE_DB=14` — pick the index per run, so parallel agents get separate keyspaces. 1-15; **0 is refused** (that is the live index).
+- `TEST_REDIS_CACHE_URL=redis://…/3` — full-URL form, for a CI runner with its own Redis. Wins over the index.
+
+```bash
+docker compose exec -e PYTHONPATH=/app -e TEST_DB_NAME=echoflow_test_<unique> \
+  -e TEST_REDIS_CACHE_DB=14 web_local pytest backend/app/tests/ -q
+```
+`TEST_DB_NAME` alone is no longer sufficient for parallel agents — pick `TEST_REDIS_CACHE_DB` too, or the runs share throttle budgets.
+
+**Open:**
+- `test_telemetry_flush_integrity.py`'s `redis_scratch` fixture picks `14 + (os.getpid() % 2)` and **FLUSHes it**, so two concurrent runs of that file collide with each other. Measured: 3 failures in one concurrent agent, 1 in the other, while the rest of the suite was green. Pre-existing and independent of this change (it bypasses `CACHES` entirely); the fix is to widen or derive that scratch range per run.
+- The **broker** Redis is deliberately *not* retargeted. Every publish path a test can reach is stubbed (`services.uploads.publish`, `tasks.sync_revenuecat_entitlements`), `tasks.py`'s own `.delay()` only runs in a worker, and the one real Redis consumer (`flush_telemetry_stream`) builds its client from `CACHES['default']['LOCATION']`, so it is already isolated. Moving it would strand test-published tasks in a DB no worker reads and desync `celery inspect ping` (the compose healthcheck) from `views/system_health.py`.
+- `counter_store.drain()` (`KEYS clip:*` + DEL) still deletes **live** `clip:*` counters every 300 s via the `flush_counters_to_pg` beat task. That is production behaviour and arguably correct (the counters have been folded into Postgres), but it means "live counter keys survive" is not a property anyone can rely on.
+
+---
+
+### 2026-10-01 — mobile dev-client reconnect: code path vs data path
+**Learned:**
+- **The Expo dev client is not a one-shot consumer of Metro.** Every foreground return calls `BridgelessDevSupportManager.handleReloadJS()` and re-fetches the bundle, so a lost JS context is unrecoverable until Metro answers again — and the app cannot render its own error because rendering the error *is* the missing bundle. Symptom is the bare `DevLauncher` launcher, which reads as "can't detect the deployment server". Measured: `reactInstance is null` → `onWindowFocusChange(hasFocus=true)` → `Unable to load script`, present since 04:34 across four app PIDs.
+- **Code path and data path used different networks, which is why it looked half-alive.** API/HLS are the host LAN IP (`172.25.186.111`) and logged 282+118 requests from the phone (`172.25.186.229`) while Metro logged **zero** bundles — Metro was bound to loopback and a LAN dial to `:8081` was refused. Fix is `--host lan` + the LAN deep link, so the bundle never needs the tunnel.
+- **`adb reverse` rules are scoped to the ADB transport, not the device.** All three vanished while `adb devices` still said `device` and the adb server had been up for hours — a USB re-enumeration, logged by neither end.
+- **A bound port is not a healthy service.** A killed `workerd` sat `LISTEN`ing, completed the TCP handshake, and timed out `/healthz` after 6s with 0 bytes. Conflating the two states is what made my first supervisor worse than none: it reported green on broken audio, and when it did act it duplicated the service into `Address already in use` once per tick.
+- **Killing the top ancestor does not free the port.** `SIGKILL` on `npm exec wrangler` left `node`/`workerd` children re-parented to init, one still holding 8787, so every replacement lost the bind. `wrangler` respawns its own child; signal the **process group** and sweep descendants, then escalate to `SIGKILL`.
+- **`PUBLIC_HLS_ENDPOINT_URL` must stay `https://127.0.0.1:19443`.** It is not a "use LAN everywhere" setting: the web page (`https://127.0.0.1:5173`) and media must share a host for the `SameSite=Lax` `ef_hls_token` cookie. Moving it to the LAN address re-breaks web playback. Native clients are unaffected because they send `X-EchoFlow-Media-Token`.
+
+**Changed:** `scripts/mobile-dev-supervisor.sh` (new — supervises Metro + Worker + the three forwards, distinguishes bound/healthy/hung, process-group kill, per-service start cooldown, `--status`/`--once`), `docs/mobile/05-device-control-and-troubleshooting.md`.
+
+**Verified:** backgrounded the app 35s and returned to it — 0 load failures, Metro served the bundle over LAN, then live `GET /feed/` `200`s and playback to `0:53 / 2:29`. Killed Metro + Worker + all forwards at once; all three recovered within one 30s tick.
+
+**Open:**
+- **The supervisor is not supervised.** It dies with the shell unless launched `setsid nohup` — the exact failure class it fixes. A `systemd --user` unit is the obvious next step, not written.
+- Every start redirects to `/tmp/metro.log` and `/tmp/hls-worker.log` with `>`, so a restart **truncates** the previous log. Use `>>` if post-mortem continuity matters.
+- **Web playback is still unverified by me** (no browser here). `https://127.0.0.1:5173` serves correctly; the user has not confirmed audio.
+- `.env.local` / `frontend/.env` are gitignored, so the origins do not travel: a fresh clone needs `PUBLIC_HLS_ENDPOINT_URL`, `VITE_API_BASE_URL`, and the loopback CORS origins set by hand.
 
 ---
 
@@ -786,5 +1064,39 @@ Accumulated from user corrections. Append on your own when corrected.
 | DOs/DON'Ts → AGENTS.md, updated automatically on correction | Duplicating env-var tables across sections |
 | Link to docs instead of inlining | Asking permission to correct AGENTS.md after a user correction |
 | Record session learnings with `YYYY-MM-DD` slug format | Leaving entries unresolved indefinitely |
+| **Ask before committing when a finding contradicts the plan, or when a fix is broader than the plan's scope** | **Implementing a plan's premise without re-verifying it against the source** |
+| **Read the model/framework layer before adding a validation or guard** | **Adding a check that duplicates something DRF/Django already does** |
+| **Verify a pre-existing failure is pre-existing** (stash, re-run, compare the failure *set*) | **Reporting a green suite that ran on a partially broken stack** |
+| **Ask the user to decide when scope, risk, or a plan's premise is wrong** | **Silently widening or quietly narrowing an approved change** |
+| **Check `docker ps` for `Restarting` containers before trusting test results** | **Reading a DNS/connection error as test flakiness** |
+| **Assert fixture size/content, and isolate your own contribution in a query or error count** | **Asserting a total that other code also contributes to** |
 
-_(No user-corrected entries yet — add rows above as corrections come in.)_
+### Working agreement (owner correction, 2026-09-29)
+
+I make mistakes at a rate that this repo does not tolerate. In the first three
+commits of the frontend rebuild I: asserted a validation gap that the framework
+already covered (B1), wrote a query-count assertion that measured two
+pre-existing N+1s instead of my own field (B2), and reported a passing suite
+while a Redis container was crash-looping underneath it. All three were caught
+late and cost a debugging cycle each.
+
+Going forward:
+
+- **Verify the premise before implementing it.** When a plan asserts that
+  something is missing, read the model, the framework layer, or the
+  neighbouring code first. If reality differs, stop and say so rather than
+  building on the plan's description.
+- **Ask for a decision instead of guessing** whenever scope expands beyond the
+  approved plan, a fix is larger than planned, or two readings are plausible.
+  A question costs a reply; a wrong 3-commit sequence costs a revert and a
+  re-audit. Default to asking when the cost of being wrong exceeds the cost of
+  asking.
+- **Never report a result without confirming the harness was healthy.** Check
+  container status, and confirm a suspicious failure set is unchanged against a
+  stashed baseline before calling anything green.
+- **State uncertainty in the report, not just the conclusion.** "614 passed"
+  without "and by the way a cache container was down" is a misleading report
+  even when the number happens to be right.
+
+Being asked to double-check is not second-guessing; it is the correct
+response to a measured error rate.

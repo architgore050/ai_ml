@@ -39,7 +39,10 @@ cache
 # Frontend (built/served separately, not needed in backend images)
 frontend
 mobile
-ai_ml/scrapers
+# NOTE: ai_ml/scrapers is NOT excluded. It was, which meant scrape_audio
+# shipped in no image even once its imports were fixed. The scraper is gated
+# at runtime by SCRAPER_ENABLED (see settings.py); shipping the code is not
+# the same as running it.
 # NOTE: wheelhouse/ MUST stay in the build context — the Dockerfile COPYs it.
 
 # Docker
@@ -54,7 +57,6 @@ backend/scripts
 hidden folder
 .cache/pip/
 AGENTS.md
-ai_ml/scrapers
 mobile
 
 # Test artifacts

@@ -23,18 +23,13 @@ backend/media
 /--default-timeout=120
 *.venv
 /frontend/node_modules
-frontend/sample_frontend2
-frontend/sample_frontend
 *.vite
 backend/media/
-/frontend/sample_frontend2/node_modules
-#/frontend/old_frontend
-ai_ml/scrapers
-backend/app/tests/test_scraper.py
 mobile/package-lock.json
 frontend/package-lock.json
 backend/scratch/scraper_logs
-backend/scratch/scraper_logs
+mobile/coverage/
+#frontend/sample_frontend/.env
 
 # Docker specific
 .dockerenv

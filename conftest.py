@@ -12,14 +12,36 @@ inherits it — no migration hackery needed.
 """
 import os
 import sys
+import time
 from pathlib import Path
 
 # Set required env vars BEFORE django.setup() — settings.py reads them.
 os.environ.setdefault('DJANGO_SECRET_KEY', 'test-secret-key-not-for-prod')
-os.environ.setdefault('DJANGO_DEBUG', 'True')
 os.environ.setdefault('AWS_STORAGE_BUCKET_NAME', 'test-bucket')
 os.environ.setdefault('AWS_ACCESS_KEY_ID', 'test')
 os.environ.setdefault('AWS_SECRET_ACCESS_KEY', 'test')
+
+# ECHOFLOW_TESTING — the suite's opt-out from the production transport block in
+# settings.py (SECURE_SSL_REDIRECT, secure cookies, HSTS). Django's test client
+# drives the app over http://testserver/ with no X-Forwarded-Proto, so with
+# that block active every single request 301s.
+#
+# This used to be expressed as `os.environ.setdefault('DJANGO_DEBUG', 'True')`.
+# That stopped working the moment the container exported its own value:
+# setdefault() is a no-op when the key already exists, and
+# docker-compose.local.yml hardcoded DJANGO_DEBUG=True as an unoverridable
+# literal. The suite therefore only ran because of a literal in a compose file,
+# and it would have broken the next time that container was recreated. An
+# explicit flag cannot be set by accident and does not depend on which compose
+# invocation built the image.
+os.environ.setdefault('ECHOFLOW_TESTING', '1')
+
+# The narrow, documented placeholder-secret bypass (see EchoFlow/secrets.py).
+# The suite runs on the literal placeholder key above, so the startup guard
+# needs a reason to let it through. Using the dedicated flag rather than
+# DJANGO_DEBUG=true keeps the guard's blast radius explicit, and leaves
+# DJANGO_DEBUG reporting the container's real value.
+os.environ.setdefault('ECHOFLOW_ALLOW_PLACEHOLDER_SECRETS', '1')
 
 # RevenueCat test defaults (no real API calls in unit tests).
 os.environ.setdefault('REVENUECAT_SECRET_KEY', '')
@@ -143,6 +165,8 @@ _dju.config = _patched_config
 # wrapper's settings_dict. We patch it directly so the wrapper's
 # get_connection_params() returns the TEST_DB_* values.
 from django.db import connection as _default_connection
+from contextlib import contextmanager
+from django.test.utils import CaptureQueriesContext
 _orig_settings_dict = _default_connection.settings_dict
 _default_connection.settings_dict = {
     **_orig_settings_dict,
@@ -336,6 +360,59 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 # ---------------------------------------------------------------------------
+# Query-count assertion that excludes per-request middleware overhead
+# ---------------------------------------------------------------------------
+
+#: The audit table written by ``CorrelationIdMiddleware``'s ``finally`` block.
+AUDIT_LOG_TABLE = "app_auditlog"
+
+
+@contextmanager
+def assert_view_queries(num, connection=None):
+    """``assertNumQueries(num)``, minus the audit-log INSERT.
+
+    Why this exists
+    ---------------
+    ``CorrelationIdMiddleware`` writes one ``AuditLog`` row per request. It
+    passed ``user=<int>`` into a ``ForeignKey``, so the INSERT raised
+    ``ValueError`` on every authenticated request, the bare ``except``
+    swallowed it, and **no audit row was ever written** -- the audit table
+    recorded anonymous traffic and nothing else.
+
+    Fixing that (commit ``c12f16b``) made the write real. It now reaches
+    Postgres on every request, which added exactly one INSERT to every
+    ``assertNumQueries`` budget in the suite and broke 20 assertions.
+
+    Those 20 are measuring the **view**, not the middleware. In
+    ``test_tags_initialize_bounds.py`` the assertion is literally
+    ``assertNumQueries(0)``: the structural proof that a rejected payload
+    never reaches the ORM at all. Raising the budget to ``1`` would destroy
+    precisely the property it exists to pin -- and would re-break on the next
+    middleware change, because the coupling would still be there.
+
+    So the expected numbers stay exactly what they were: count the queries,
+    then subtract the audit write. The intent of every assertion is
+    preserved, and none of them is coupled to the middleware stack.
+
+    A budget is *not* a substitute for reading the failure message: the
+    message below lists the queries that were counted, excluding the audit
+    INSERT, so a regression names its own SQL.
+    """
+    conn = connection if connection is not None else _default_connection
+    with CaptureQueriesContext(conn) as ctx:
+        yield
+    captured = ctx.captured_queries
+    audit = [q for q in captured if AUDIT_LOG_TABLE in q["sql"]]
+    counted = [q for q in captured if AUDIT_LOG_TABLE not in q["sql"]]
+    detail = "\n".join(f"  {q['sql'][:200]}" for q in counted) or "  (none)"
+    assert len(counted) == num, (
+        f"Expected {num} view quer{'y' if num == 1 else 'ies'}, got "
+        f"{len(counted)} "
+        f"({len(audit)} middleware audit INSERT(s) excluded).\n{detail}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
@@ -409,3 +486,83 @@ def processing_clip(user):
     AudioClip.objects.filter(pk=clip.pk).update(created_at=old)
     clip.refresh_from_db()
     return clip
+
+
+# ---------------------------------------------------------------------------
+# Throttle-budget isolation
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def clear_throttle_cache():
+    """Reset DRF throttle counters around a test that makes many requests.
+
+    Why this exists
+    ---------------
+    The DRF throttle cache is real Redis (``settings.CACHES`` uses
+    ``django_redis.cache.RedisCache``), and nothing in this suite clears it.
+    So rate-limit budgets accumulate across the whole run *and persist between
+    runs*. The first symptom was a set of authorization tests that passed
+    alone and failed in a larger combined run: an unrelated file had already
+    consumed the shared ``user`` (1000/hour) budget, so the endpoint under
+    test answered 429. An authorization test must not be able to fail because
+    an unrelated test spent its rate limit.
+
+    Why a retry
+    -----------
+    Redis on a loaded dev host answers in 300-900ms and occasionally times
+    out. Skipping on the first ``RedisError`` therefore turned a transient
+    blip into a *silent loss of security coverage* — a test file that reported
+    "4 skipped" and nobody read. So: retry a few times, and only skip if
+    Redis is genuinely unreachable. If Redis is down, DRF throttling would
+    fail the requests anyway, so skipping is more honest than a cascade of
+    500s.
+
+    Usage: request it explicitly (``def test_x(self, clear_throttle_cache)``)
+    rather than applying it suite-wide, because most tests do not make enough
+    requests to care and the clear is not free.
+    """
+    from django.core.cache import cache
+    from redis.exceptions import RedisError
+
+    # Measured on the dev host: 300-930ms per Redis round trip, with
+    # occasional timeouts under load. Three tight retries was not enough —
+    # runs still reported "2 skipped" intermittently, which is the failure
+    # mode this fixture exists to remove.
+    def _clear(attempts=6, base_delay=0.5):
+        """Return True on success, or the last RedisError on giving up."""
+        last = None
+        for attempt in range(attempts):
+            try:
+                cache.clear()
+                return True
+            except RedisError as exc:
+                last = exc
+                time.sleep(base_delay * (attempt + 1))
+        return last
+
+    problem = _clear()
+    if problem is not True:
+        # FAIL, not skip.
+        #
+        # A skip here is a lie of convenience: the test asserts a security
+        # property (who may be issued a playback token, which share token
+        # unlocks which clip), and a skipped security test reads exactly like
+        # a passing one in a summary line. Measured evidence that this
+        # happened: a run reporting "27 passed, 4 skipped" that nobody read,
+        # where the 4 were share-token scope tests.
+        #
+        # A loud failure on a wedged Redis is the correct trade here. It is
+        # also honest: DRF touches the throttle cache on every one of these
+        # requests, so with Redis down the assertions are not merely
+        # unverified — the endpoints would not function. If this becomes a
+        # problem on a constrained CI runner, the fix is a faster Redis, not
+        # a quieter fixture.
+        pytest.fail(
+            "redis unavailable after retries; refusing to skip a test that "
+            f"asserts an authorization property (last error: {problem!r})"
+        )
+    yield
+    try:
+        cache.clear()
+    except RedisError:
+        pass

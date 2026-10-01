@@ -10,6 +10,14 @@
 # Key changes from docker-compose.yml:
 #   - Removed: pgbouncer, minio, minio-init, celery_media, prometheus, grafana
 #   - DATABASE_URL points directly to db:5432 (no pgbouncer)
+#   - DATABASE_URL is BUILT from DB_USER/DB_PASSWORD/DB_HOST/DB_PORT/DB_NAME,
+#     not passed through from the env file. It used to be
+#     `- DATABASE_URL=${DATABASE_URL}`, which required the operator to
+#     hand-maintain a full URL in .env *in addition to* the four DB_* values
+#     the db/redis services already read — two copies of the password that
+#     could diverge silently. docker compose does not expand ${...} inside an
+#     env file, so the URL has to be assembled here, in `environment:`, exactly
+#     as docker-compose.yml and docker-compose.local.yml already do.
 #   - AWS_S3_ENDPOINT_URL points to Cloudflare R2 (not MinIO)
 #   - nginx ports: only :80 and :443 (no :9443)
 #   - Custom docker network with fixed IPs for Tailscale subnet router
@@ -121,12 +129,12 @@ services:
     env_file:
       - .env
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_BROKER_URL=${REDIS_BROKER_URL:-redis://redis_broker:6379/0}
       - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis_cache:6379/0}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
       - DJANGO_DEBUG=${DJANGO_DEBUG:-False}
-      - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS:-api.echo-flow.in}
+      - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS:-api.echoflow.in}
       - GUNICORN_WORKERS=${GUNICORN_WORKERS:-2}
       - GUNICORN_THREADS=${GUNICORN_THREADS:-4}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
@@ -135,7 +143,20 @@ services:
       - AWS_S3_ENDPOINT_URL=${AWS_S3_ENDPOINT_URL}
       - AWS_S3_REGION_NAME=${AWS_S3_REGION_NAME:-auto}
       - AWS_S3_QUERYSTRING_EXPIRE=${AWS_S3_QUERYSTRING_EXPIRE:-3600}
-      - PUBLIC_MEDIA_ENDPOINT_URL=${PUBLIC_MEDIA_ENDPOINT_URL:-https://media.echo-flow.in}
+      - PUBLIC_MEDIA_ENDPOINT_URL=${PUBLIC_MEDIA_ENDPOINT_URL:-https://media.echoflow.in}
+      # HLS origin is the Worker edge, not the object store. Pinned here as
+      # well as in .env so that a stale or incomplete .env cannot silently
+      # fall back to bucket-prefixed URLs, which the Worker 404s: an edge
+      # fronting the bucket does not expose the bucket as a path segment, and
+      # the Worker rejects any path not starting with /hls/. See
+      # .env.vps.example and docs/EXPLAIN/storage/04-hls-token-protection.md.
+      - PUBLIC_HLS_ENDPOINT_URL=${PUBLIC_HLS_ENDPOINT_URL:-https://media.echoflow.in}
+      - HLS_URL_STYLE=${HLS_URL_STYLE:-edge}
+      # Required whenever the HLS origin is a different host from this API:
+      # a host-only cookie is never sent to media.echoflow.in, so every
+      # playback request would 403. Leave empty in dev (localhost rejects
+      # domain cookies).
+      - MEDIA_TOKEN_COOKIE_DOMAIN=${MEDIA_TOKEN_COOKIE_DOMAIN:-.echoflow.in}
       - SENTRY_DSN=${SENTRY_DSN:-}
       - SENTRY_ENV=${SENTRY_ENV:-production}
       - SENTRY_TRACES_SAMPLE_RATE=${SENTRY_TRACES_SAMPLE_RATE:-0.1}
@@ -206,7 +227,7 @@ services:
       start_period: 30s
       retries: 3
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_BROKER_URL=${REDIS_BROKER_URL:-redis://redis_broker:6379/0}
       - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis_cache:6379/0}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
@@ -258,7 +279,7 @@ services:
       start_period: 30s
       retries: 3
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_BROKER_URL=${REDIS_BROKER_URL:-redis://redis_broker:6379/0}
       - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis_cache:6379/0}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
@@ -308,7 +329,7 @@ services:
     env_file:
       - .env
     environment:
-      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
       - REDIS_BROKER_URL=${REDIS_BROKER_URL:-redis://redis_broker:6379/0}
       - REDIS_CACHE_URL=${REDIS_CACHE_URL:-redis://redis_cache:6379/0}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}

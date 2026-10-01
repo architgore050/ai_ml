@@ -4,9 +4,15 @@
 design) and [`../decisions/2026-09-28-local-hls-worker.md`](../decisions/2026-09-28-local-hls-worker.md)
 (why the local stack looks the way it does).
 
-The Worker validates the `ef_hls_token` cookie on every `/hls/*` request and
-only then fetches from object storage. In production that storage is R2 via
-a binding. Locally it is MinIO over signed HTTP.
+The Worker validates the playback token on every `/hls/*` request and only
+then fetches from object storage. In production that storage is R2 via a
+binding. Locally it is MinIO over signed HTTP.
+
+The token arrives two ways: as the `ef_hls_token` cookie (browsers) or as the
+`X-EchoFlow-Media-Token` header (native players, which have no cookie jar to
+share with their HTTP client). Same HMAC string either way; the edge reads
+the cookie first. See
+[`../decisions/2026-09-28-native-media-auth-and-cgnat-throttling.md`](../decisions/2026-09-28-native-media-auth-and-cgnat-throttling.md).
 
 ---
 
@@ -58,6 +64,47 @@ The consequence is that the Worker is reachable from anything that can route
 to this machine's LAN address while it runs. It holds no HLS data itself and
 refuses unauthenticated requests, so what is exposed is a validating proxy.
 Do not leave it running on a shared network.
+
+---
+
+## Before you trust a manual verification
+
+Two things will make a correct change look broken. Both bit during the
+2026-09-28 native-transport work.
+
+### 1. Restart the web service after changing Django code
+
+The source tree is bind-mounted (`/home/devansh/Code/EchoFlow` → `/app`), so
+a file edit is visible on disk **immediately** — but gunicorn imported the
+module when it started and will not re-read it. Editing a view, a serializer
+or `settings.py` and then curling the running stack exercises the **old**
+code.
+
+The symptom is maddeningly convincing: the unit tests pass (pytest imports
+fresh), `grep` inside the container shows the new code, and the live endpoint
+still returns the old shape.
+
+```bash
+docker compose -f docker-compose.local.yml --env-file .env.local restart web_local
+# wait for health, then verify
+curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:18443/health/
+```
+
+Rule of thumb: **if a change touches Python, restart `web_local` before
+trusting any curl against it.** The Worker does not have this problem —
+`wrangler dev` watches source files and reloads.
+
+### 2. A stale Redis connection returns 500, not 503
+
+`django-redis` raised `ConnectionInterrupted: Redis ConnectionError: Error 32
+while writing to socket. Broken pipe.` out of the **throttle** check, so
+`POST /auth/login/` returned a 500 with a Django debug page instead of a 503.
+It is transient — a pooled connection invalidated by something else (a
+`FLUSHALL` from another client, for instance) — and clears on retry.
+
+Do not read this as an application bug. Re-run the request before
+investigating; if it persists, check `redis_cache_local` with
+`redis-cli ... ping` and restart the service.
 
 ---
 
@@ -221,6 +268,39 @@ The cookie works across ports because cookies are host-scoped and ignore
 ports — both origins are `localhost`. In production they are different hosts
 (`api.` issuing for `media.`), which is why `MEDIA_TOKEN_COOKIE_DOMAIN` must
 be set to the shared parent domain there.
+
+### 8b. Verify the native header transport
+
+The cookie path cannot be exercised from a phone or a native player, so check
+the header path explicitly. Ask for the token as a native client, then send it
+back as a header:
+
+```bash
+curl -sk -H "Authorization: Bearer $JWT" \
+  -H 'X-EchoFlow-Client: native' \
+  "https://localhost:18443/media/playback-token/$CLIP/" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' > /tmp/tok
+# Without the X-EchoFlow-Client header the body is {"status": "ok"} and this
+# raises KeyError — that is the opt-in working, not a bug.
+
+curl -sk -o /dev/null -w '%{http_code}\n' \
+  -H "X-EchoFlow-Media-Token: $(cat /tmp/tok)" \
+  https://localhost:19443/hls/$CLIP/master.m3u8                      # 200
+```
+
+Sanity checks on the gate:
+
+```bash
+# no credential at all                                            -> 403
+curl -sk -o /dev/null -w '%{http_code}\n' https://localhost:19443/hls/$CLIP/master.m3u8
+# a valid token for a DIFFERENT clip's path                        -> 403
+curl -sk -o /dev/null -w '%{http_code}\n' -H "X-EchoFlow-Media-Token: $(cat /tmp/tok)" \
+  https://localhost:19443/hls/00000000-0000-0000-0000-0000000000ff/master.m3u8
+# a token in the header does not override a bad cookie in the jar   -> 403
+curl -sk -o /dev/null -w '%{http_code}\n' -b /tmp/jar \
+  -H "X-EchoFlow-Media-Token: $(cat /tmp/tok)" \
+  https://localhost:19443/hls/$CLIP/master.m3u8
+```
 
 ### 9. Feed serializer emits the edge URL
 

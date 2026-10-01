@@ -160,3 +160,46 @@ export function extractTokenFromCookie(cookieHeader: string | null): string | nu
   }
   return null;
 }
+
+/**
+ * Header a native player uses to present the token, because a native HTTP
+ * stack has no browser cookie jar.
+ *
+ * Must stay in sync with `NATIVE_CLIENT_HEADER` / the header the API tells
+ * the client to send — see backend/app/views/media.py::_token_response_body.
+ */
+export const MEDIA_TOKEN_HEADER = "X-EchoFlow-Media-Token";
+
+/**
+ * Extract the playback token from a request, whichever transport carried it.
+ *
+ * TWO TRANSPORTS, ONE CREDENTIAL.
+ *
+ * 1. Cookie — the web path. `ef_hls_token` is HttpOnly and set by the API
+ *    origin, so a browser attaches it to every /hls/* request automatically
+ *    and no script can read it.
+ *
+ * 2. `X-EchoFlow-Media-Token` — the native path. AVPlayer (iOS) does not read
+ *    `NSHTTPCookieStorage`, and ExoPlayer's `DefaultHttpDataSource` (Android)
+ *    sends no `Cookie` header at all, so a React Native client cannot get a
+ *    cookie attached to a media request even if it wanted to. It receives the
+ *    same token from `GET /media/playback-token/<id>/` in the JSON body and
+ *    replays it here as a per-source header.
+ *
+ * PRECEDENCE IS COOKIE-FIRST, deliberately. A web page's own script cannot
+ * read the HttpOnly cookie, but it *can* set an arbitrary request header, so
+ * making the header authoritative would let any script on `app.echoflow.in`
+ * override which credential the edge validates. Falling through to the header
+ * only when there is no cookie keeps the web path byte-identical to its
+ * previous behaviour and adds native as strictly the otherwise-unauthenticated
+ * case.
+ *
+ * Security is unchanged either way: both carriers deliver the same HMAC
+ * string, and `validatePlaybackToken` still enforces signature, version,
+ * `exp` and per-clip path scope.
+ */
+export function extractTokenFromRequest(request: Request): string | null {
+  const fromCookie = extractTokenFromCookie(request.headers.get("Cookie"));
+  if (fromCookie) return fromCookie;
+  return request.headers.get(MEDIA_TOKEN_HEADER);
+}

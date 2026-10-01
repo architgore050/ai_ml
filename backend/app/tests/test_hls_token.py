@@ -17,9 +17,23 @@ import json
 import time
 
 import pytest
+from redis.exceptions import RedisError
 
 
 pytestmark = pytest.mark.django_db
+
+
+@pytest.fixture(autouse=True)
+def _isolate_throttles(clear_throttle_cache):
+    """Reset DRF throttle counters. See conftest.clear_throttle_cache.
+
+    Autouse because the authorization assertions below make authenticated
+    requests whose budget is shared with every other test in the process, and
+    a Redis-backed budget that persists between runs can otherwise fail these
+    tests for reasons unrelated to the code.
+    """
+    yield
+
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +484,7 @@ class TestPlaybackTokenView:
     def test_issues_the_cookie_with_the_contract_attributes(
         self, authed, ready_clip, settings
     ):
-        response = authed.get(self.url(ready_clip.id))
+        response = authed.post(self.url(ready_clip.id))
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
 
@@ -488,11 +502,11 @@ class TestPlaybackTokenView:
 
     def test_max_age_tracks_media_token_ttl_seconds(self, authed, ready_clip, settings):
         settings.MEDIA_TOKEN_TTL_SECONDS = 60
-        response = authed.get(self.url(ready_clip.id))
+        response = authed.post(self.url(ready_clip.id))
         assert response.cookies["ef_hls_token"]["max-age"] == 60
 
         settings.MEDIA_TOKEN_TTL_SECONDS = 1800
-        response = authed.get(self.url(ready_clip.id))
+        response = authed.post(self.url(ready_clip.id))
         assert response.cookies["ef_hls_token"]["max-age"] == 1800
 
     def test_domain_is_set_when_media_token_cookie_domain_is(
@@ -501,7 +515,7 @@ class TestPlaybackTokenView:
         # Required in production when the media origin is a different host
         # from the API; without it the cookie is host-only and never sent.
         settings.MEDIA_TOKEN_COOKIE_DOMAIN = ".echoflow.in"
-        response = authed.get(self.url(ready_clip.id))
+        response = authed.post(self.url(ready_clip.id))
         assert response.cookies["ef_hls_token"]["domain"] == ".echoflow.in"
 
     def test_issued_cookie_validates_against_the_request_path(
@@ -511,7 +525,7 @@ class TestPlaybackTokenView:
         clip's own path and rejected for a different clip's."""
         from backend.app.services.hls_token import validate_playback_token
 
-        response = authed.get(self.url(ready_clip.id))
+        response = authed.post(self.url(ready_clip.id))
         token = response.cookies["ef_hls_token"].value
 
         assert validate_playback_token(
@@ -524,20 +538,20 @@ class TestPlaybackTokenView:
     def test_requires_authentication(self, user, token_secret, token_ttl, ready_clip):
         from rest_framework.test import APIClient
 
-        response = APIClient().get(self.url(ready_clip.id))
+        response = APIClient().post(self.url(ready_clip.id))
         assert response.status_code in (401, 403)
 
     def test_unknown_clip_is_404(self, authed, token_secret, token_ttl):
         import uuid
 
-        response = authed.get(self.url(uuid.uuid4()))
+        response = authed.post(self.url(uuid.uuid4()))
         assert response.status_code == 404
 
     def test_unmoderated_clip_is_403(self, authed, ready_clip, token_secret, token_ttl):
         ready_clip.moderation_approved = False
         ready_clip.save(update_fields=["moderation_approved"])
 
-        response = authed.get(self.url(ready_clip.id))
+        response = authed.post(self.url(ready_clip.id))
         assert response.status_code == 403
         assert "ef_hls_token" not in response.cookies
 
@@ -554,6 +568,618 @@ class TestPlaybackTokenView:
         )
         assert clip.hls_playlist_url is None
 
-        response = authed.get(self.url(clip.id))
+        response = authed.post(self.url(clip.id))
         assert response.status_code == 409
         assert "ef_hls_token" not in response.cookies
+
+
+# ---------------------------------------------------------------------------
+# Native transport
+#
+# A React Native client cannot use the cookie. AVPlayer (iOS) does not read
+# NSHTTPCookieStorage, and ExoPlayer's DefaultHttpDataSource (Android) sends
+# no Cookie header at all. The token is also HttpOnly and Secure, so the app
+# cannot read it back out of the cookie jar either. Without a second
+# transport there is no way for a mobile client to present a credential.
+#
+# These tests pin the opt-in: the token appears in the body ONLY for a caller
+# that declares itself native, the cookie is still set either way, and the
+# body token is the same credential the edge already validates.
+# ---------------------------------------------------------------------------
+
+# Passed as WSGI extra kwargs, NOT as APIClient's second positional argument:
+# that position is `data`, which for a GET becomes the query string, so
+# `client.get(url, HEADERS)` silently sends `?HTTP_X_ECHOFLOW_CLIENT=native`
+# and the view never sees a header at all.
+NATIVE_HEADERS = {"HTTP_X_ECHOFLOW_CLIENT": "native"}
+
+
+class TestNativeTokenTransport:
+    @pytest.fixture
+    def user(self, django_user_model):
+        return django_user_model.objects.create_user(
+            username="native", email="native@example.com", password="pw-probe-123"
+        )
+
+    @pytest.fixture
+    def ready_clip(self, user):
+        from backend.app.models import AudioClip
+
+        return AudioClip.objects.create(
+            creator=user,
+            title="native probe",
+            moderation_approved=True,
+            status="ready",
+            hls_playlist_url="hls/00000000-0000-0000-0000-00000000000a/master.m3u8",
+        )
+
+    @pytest.fixture
+    def authed(self, user, token_secret, token_ttl):
+        from rest_framework.test import APIClient
+
+        client = APIClient()
+        client.force_authenticate(user=user)
+        return client
+
+    def url(self, clip_id):
+        return f"/media/playback-token/{clip_id}/"
+
+    def test_native_client_receives_the_token_in_the_body(self, authed, ready_clip):
+        response = authed.post(self.url(ready_clip.id), **NATIVE_HEADERS)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body.get("token"), "native client was not given the token value"
+
+    def test_body_token_is_the_same_credential_as_the_cookie(
+        self, authed, ready_clip
+    ):
+        """The two transports must not diverge.
+
+        If these ever differ, a client that reads the body but the edge
+        validates something else would 403 on every segment — and a client
+        that reads the cookie but validates the body would 403 too. Pinning
+        equality is what makes the two interchangeable.
+        """
+        response = authed.post(self.url(ready_clip.id), **NATIVE_HEADERS)
+
+        assert response.json()["token"] == response.cookies["ef_hls_token"].value
+
+    def test_body_token_validates_against_the_clips_own_path(self, authed, ready_clip):
+        """End of the gate for the native transport: the body token must be
+        accepted by the same validator the Worker uses, for this clip's path
+        and rejected for a different clip's."""
+        from backend.app.services.hls_token import validate_playback_token
+
+        token = authed.post(self.url(ready_clip.id), **NATIVE_HEADERS).json()["token"]
+
+        assert validate_playback_token(
+            token, "/hls/00000000-0000-0000-0000-00000000000a/master.m3u8"
+        ) is not None
+        assert validate_playback_token(
+            token, "/hls/00000000-0000-0000-0000-00000000000b/master.m3u8"
+        ) is None
+
+    def test_non_native_client_does_not_receive_the_token_in_the_body(
+        self, authed, ready_clip
+    ):
+        """The default is unchanged. A bearer credential must not start
+        appearing in response bodies for callers that did not ask for it —
+        that is what HttpOnly is for."""
+        response = authed.post(self.url(ready_clip.id))
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        assert "token" not in response.json()
+        # The cookie is still issued, so the web path is untouched.
+        assert "ef_hls_token" in response.cookies
+
+    @pytest.mark.parametrize(
+        "header_value",
+        ["web", "NATIVE", "native ", "ios", "", "browser-native"],
+    )
+    def test_only_the_exact_native_value_opts_in(
+        self, authed, ready_clip, header_value
+    ):
+        """The match is exact and case-sensitive.
+
+        A prefix or case variant must not opt in, otherwise a client whose
+        header handling is sloppy receives a credential in a body it may log.
+        """
+        response = authed.get(
+            self.url(ready_clip.id), **{"HTTP_X_ECHOFLOW_CLIENT": header_value}
+        )
+        assert "token" not in response.json(), f"{header_value!r} was treated as native"
+
+    def test_native_client_still_gets_the_cookie(self, authed, ready_clip):
+        """Opting into the body must not remove the cookie. A native client
+        is allowed to use either; giving it both keeps the web contract
+        intact and makes the change additive rather than a replacement."""
+        response = authed.post(self.url(ready_clip.id), **NATIVE_HEADERS)
+
+        cookie = response.cookies["ef_hls_token"]
+        assert cookie["httponly"] is True
+        assert cookie["secure"] is True
+        assert cookie["samesite"] == "Lax"
+        assert cookie["path"] == "/hls/"
+
+    def test_native_flag_does_not_bypass_moderation(self, authed, ready_clip):
+        """The header is a transport opt-in, not a privilege. An unmoderated
+        clip must stay a 403 for a native caller exactly as for a browser,
+        and must carry neither a token nor a cookie."""
+        ready_clip.moderation_approved = False
+        ready_clip.save(update_fields=["moderation_approved"])
+
+        response = authed.post(self.url(ready_clip.id), **NATIVE_HEADERS)
+
+        assert response.status_code == 403
+        assert "token" not in response.json()
+        assert "ef_hls_token" not in response.cookies
+
+    def test_native_flag_does_not_bypass_authentication(self, ready_clip, token_secret, token_ttl):
+        from rest_framework.test import APIClient
+
+        response = APIClient().post(self.url(ready_clip.id), **NATIVE_HEADERS)
+        assert response.status_code in (401, 403)
+        assert "token" not in response.json()
+
+
+# ---------------------------------------------------------------------------
+# Entitlement: who may be issued a playback token at all
+# ---------------------------------------------------------------------------
+
+class TestPlaybackTokenEntitlement:
+    """PlaybackTokenView must not authorize on `moderation_approved` alone.
+
+    FastFeedViewSet also filters is_noncommercial=False and
+    requires_share_alike=False. Before resolve_clip_access() existed the
+    token endpoint applied neither, so any authenticated user could mint a
+    token for an NC/SA clip the feed never serves. These tests pin the
+    licensing predicate specifically, because that is the part that was
+    actually exploitable.
+    """
+
+    @pytest.fixture
+    def viewer(self, django_user_model):
+        return django_user_model.objects.create_user(
+            username="viewer", email="viewer@example.com", password="pw-probe-123"
+        )
+
+    @pytest.fixture
+    def author(self, django_user_model):
+        return django_user_model.objects.create_user(
+            username="author", email="author@example.com", password="pw-probe-123"
+        )
+
+    @pytest.fixture
+    def authed(self, viewer, token_secret, token_ttl):
+        from rest_framework.test import APIClient
+
+        client = APIClient()
+        client.force_authenticate(user=viewer)
+        return client
+
+    def make_clip(self, author, **kwargs):
+        from backend.app.models import AudioClip
+
+        defaults = dict(
+            creator=author,
+            title="probe",
+            moderation_approved=True,
+            status="ready",
+            hls_playlist_url="hls/00000000-0000-0000-0000-000000000009/master.m3u8",
+        )
+        defaults.update(kwargs)
+        return AudioClip.objects.create(**defaults)
+
+    def url(self, clip_id):
+        return f"/media/playback-token/{clip_id}/"
+
+    # --- the licensing bypass -------------------------------------------
+
+    @pytest.mark.parametrize("field", ["is_noncommercial", "requires_share_alike"])
+    def test_license_restricted_clip_is_refused_to_a_stranger(
+        self, authed, author, field
+    ):
+        clip = self.make_clip(author, **{field: True})
+        response = authed.post(self.url(clip.id))
+        assert response.status_code == 403
+        # The response must not tell an unauthorised caller which license
+        # the clip carries.
+        assert "noncommercial" not in response.json()["detail"].lower()
+        assert "share_alike" not in response.json()["detail"].lower()
+        assert "token" not in response.json()
+
+    @pytest.mark.parametrize("field", ["is_noncommercial", "requires_share_alike"])
+    def test_owner_may_still_play_their_own_restricted_clip(
+        self, author, token_secret, token_ttl, field
+    ):
+        """NC/SA restrict redistribution; the uploader must hear their own clip."""
+        from rest_framework.test import APIClient
+
+        clip = self.make_clip(author, **{field: True})
+        client = APIClient()
+        client.force_authenticate(user=author)
+        assert client.post(self.url(clip.id)).status_code == 200
+
+    def test_interaction_does_not_launder_a_restricted_clip(
+        self, authed, author, viewer
+    ):
+        """A prior interaction is not a licence to redistribute NC/SA audio."""
+        from backend.app.models import UserInteraction
+
+        clip = self.make_clip(author, is_noncommercial=True)
+        UserInteraction.objects.create(
+            user=viewer,
+            clip=clip,
+            interaction_type="view",
+        )
+        assert authed.post(self.url(clip.id)).status_code == 403
+
+    def test_in_app_share_grants_access_to_a_restricted_clip(
+        self, authed, author, viewer
+    ):
+        from backend.app.models import ShareEvent
+
+        clip = self.make_clip(author, is_noncommercial=True)
+        ShareEvent.objects.create(sender=author, receiver=viewer, clip=clip)
+        assert authed.post(self.url(clip.id)).status_code == 200
+
+    # --- the other access paths ----------------------------------------
+
+    def test_following_the_author_allows_a_license_clean_clip(
+        self, authed, author, viewer
+    ):
+        clip = self.make_clip(author)
+        viewer.following.add(author)
+        assert authed.post(self.url(clip.id)).status_code == 200
+
+    def test_unmoderated_clip_is_refused_even_to_its_owner(
+        self, author, token_secret, token_ttl
+    ):
+        """Existing behaviour preserved: nobody gets a token pre-approval."""
+        from rest_framework.test import APIClient
+
+        clip = self.make_clip(author, moderation_approved=False)
+        client = APIClient()
+        client.force_authenticate(user=author)
+        assert client.post(self.url(clip.id)).status_code == 403
+
+    def test_license_clean_clip_without_any_relationship_is_allowed(
+        self, authed, author
+    ):
+        """Documents the accepted v1 residual, and guards the feed path.
+
+        resolve_clip_access is a licensing gate, not a privacy gate: a
+        moderated, license-clean clip is playable by any authenticated user.
+        That is required, not merely tolerated — feed_pool.py builds both
+        halves of the feed from AudioClip.objects.filter(status='ready')
+        with no creator/following scoping, so most feed clips come from
+        authors the user has no relationship with. Denying those would 403
+        the primary playback path.
+        """
+        assert authed.post(self.url(self.make_clip(author).id)).status_code == 200
+
+    def test_license_restriction_still_applies_when_the_feed_itself_is_empty(
+        self, authed, author
+    ):
+        """The predicate is on the clip, not on feed state.
+
+        Regression guard for the original bug, which was that feed filters
+        were assumed to be the gate. If feed state ever leaks into this
+        decision, a cold/empty feed would make restricted clips playable.
+        """
+        clip = self.make_clip(author, is_noncommercial=True)
+        response = authed.post(self.url(clip.id))
+        assert response.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for resolve_clip_access itself
+# ---------------------------------------------------------------------------
+
+class TestResolveClipAccess:
+    @pytest.fixture
+    def viewer(self, django_user_model):
+        return django_user_model.objects.create_user(
+            username="v", email="v@example.com", password="pw-probe-123"
+        )
+
+    @pytest.fixture
+    def author(self, django_user_model):
+        return django_user_model.objects.create_user(
+            username="a", email="a@example.com", password="pw-probe-123"
+        )
+
+    def clip(self, author, **kwargs):
+        from backend.app.models import AudioClip
+
+        defaults = dict(
+            creator=author,
+            title="t",
+            moderation_approved=True,
+            status="ready",
+            hls_playlist_url="hls/x/master.m3u8",
+        )
+        defaults.update(kwargs)
+        return AudioClip.objects.create(**defaults)
+
+    def test_unmoderated_short_circuits_before_ownership(self, viewer, author):
+        """Owner check must not rescue an unmoderated clip."""
+        from backend.app.services.entitlements import (
+            DENY_NOT_MODERATED,
+            resolve_clip_access,
+        )
+
+        clip = self.clip(author, moderation_approved=False)
+        assert resolve_clip_access(author, clip) == (False, DENY_NOT_MODERATED)
+
+    def test_owner_is_allowed(self, author):
+        from backend.app.services.entitlements import (
+            ACCESS_OWNER,
+            resolve_clip_access,
+        )
+
+        assert resolve_clip_access(author, self.clip(author)) == (True, ACCESS_OWNER)
+
+    def test_stranger_on_clean_clip_is_allowed_with_no_relationship(
+        self, viewer, author
+    ):
+        from backend.app.services.entitlements import (
+            ACCESS_PUBLIC_CLEAN,
+            resolve_clip_access,
+        )
+
+        # A clean clip is allowed outright. Denying it would break the feed,
+        # because feed_pool.py does not scope the pool to a social graph.
+        assert resolve_clip_access(viewer, self.clip(author)) == (
+            True,
+            ACCESS_PUBLIC_CLEAN,
+        )
+
+    def test_stranger_on_restricted_clip_is_denied_with_the_license_reason(
+        self, viewer, author
+    ):
+        from backend.app.services.entitlements import (
+            DENY_LICENSED,
+            resolve_clip_access,
+        )
+
+        clip = self.clip(author, requires_share_alike=True)
+        assert resolve_clip_access(viewer, clip) == (False, DENY_LICENSED)
+
+    def test_is_license_restricted_reads_both_flags(self, author):
+        from backend.app.services.entitlements import is_license_restricted
+
+        assert is_license_restricted(self.clip(author)) is False
+        assert is_license_restricted(self.clip(author, is_noncommercial=True)) is True
+        assert (
+            is_license_restricted(self.clip(author, requires_share_alike=True)) is True
+        )
+
+
+class TestPlaybackTokenMethodContract:
+    """The endpoint must be POST. GET was retired 2026-09-29.
+
+    Minting a credential must not be a safe method: a GET is CSRF-able (the
+    ef_hls_token cookie is SameSite=Lax), prefetchable by browsers and
+    proxies, and cacheable by intermediaries. Any of those mints tokens
+    nobody asked for and burns rate-limit budget.
+    """
+
+    @pytest.fixture
+    def viewer(self, django_user_model):
+        return django_user_model.objects.create_user(
+            username="viewer", email="viewer@example.com", password="pw-probe-123"
+        )
+
+    @pytest.fixture
+    def clip(self, viewer):
+        from backend.app.models import AudioClip
+
+        return AudioClip.objects.create(
+            creator=viewer,
+            title="probe",
+            moderation_approved=True,
+            status="ready",
+            hls_playlist_url="hls/00000000-0000-0000-0000-00000000000f/master.m3u8",
+        )
+
+    @pytest.fixture
+    def authed(self, viewer, token_secret, token_ttl):
+        from rest_framework.test import APIClient
+
+        client = APIClient()
+        client.force_authenticate(user=viewer)
+        return client
+
+    def test_get_is_rejected_and_explains_why(self, authed, clip):
+        response = authed.get(f"/media/playback-token/{clip.id}/")
+        assert response.status_code == 405
+        detail = response.json()["detail"]
+        # An old client needs to know to switch to POST, not to conclude the
+        # clip is unavailable.
+        assert "POST" in detail
+        # And it must not have leaked a token on the way out.
+        assert "ef_hls_token" not in response.cookies
+
+    def test_post_is_accepted(self, authed, clip):
+        response = authed.post(f"/media/playback-token/{clip.id}/")
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        assert "ef_hls_token" in response.cookies
+
+    def test_get_is_rejected_before_any_authorization_work(self, authed, clip):
+        """A 405 must not depend on the clip existing.
+
+        If GET fell through to the entitlement check, a 403 vs 405 would
+        leak whether a given clip UUID is real to an unauthorized caller.
+        """
+        import uuid
+
+        response = authed.get(f"/media/playback-token/{uuid.uuid4()}/")
+        assert response.status_code == 405
+
+
+class TestPlaybackTokenThrottleScope:
+    """A3: the view must declare a scope, or ScopedRateThrottle allows all.
+
+    This is the failure mode AGENTS.md warns about: ScopedRateThrottle reads
+    its scope from the *view* at request time and allows everything when the
+    view does not declare one. The class was listed but had no scope, so the
+    endpoint was silently unthrottled and drew from the shared user bucket.
+    """
+
+    def test_the_view_declares_a_scope(self):
+        from backend.app.views.media import PlaybackTokenView
+
+        assert PlaybackTokenView.throttle_scope == 'playback_token'
+
+    def test_the_scope_has_a_configured_rate(self, settings):
+        from backend.app.views.media import PlaybackTokenView
+
+        rates = settings.REST_FRAMEWORK['DEFAULT_THROTTLE_RATES']
+        assert PlaybackTokenView.throttle_scope in rates
+
+    def test_the_endpoint_is_actually_rate_limited(
+        self, django_user_model, token_secret, token_ttl, settings
+    ):
+        from rest_framework.test import APIClient
+        from backend.app.models import AudioClip
+
+        settings.REST_FRAMEWORK['DEFAULT_THROTTLE_RATES']['playback_token'] = '3/min'
+        user = django_user_model.objects.create_user(
+            username="throttled", email="throttled@example.com", password="pw-probe-123"
+        )
+        clip = AudioClip.objects.create(
+            creator=user,
+            title="probe",
+            moderation_approved=True,
+            status="ready",
+            hls_playlist_url="hls/00000000-0000-0000-0000-00000000000e/master.m3u8",
+        )
+        client = APIClient()
+        client.force_authenticate(user=user)
+
+        codes = []
+        for _ in range(6):
+            try:
+                codes.append(
+                    client.post(f"/media/playback-token/{clip.id}/").status_code
+                )
+            except RedisError as exc:
+                pytest.skip(f"redis unavailable in this environment: {exc}")
+
+        # Without a scope every one of these would be 200.
+        assert 429 in codes, f"endpoint was not throttled: {codes}"
+
+
+# ---------------------------------------------------------------------------
+# Placeholder-secret guard
+# ---------------------------------------------------------------------------
+class TestPlaceholderSecretRejected:
+    """A placeholder MEDIA_TOKEN_SECRET is a total compromise, so it must be
+    rejected exactly like a missing one.
+
+    Every env example in this repo ships
+    `MEDIA_TOKEN_SECRET=change-me-to-a-long-random-string`. The previous
+    guard raised only on the empty string, so `cp .env.vps.example .env`
+    followed by a deploy produced a publicly-known HMAC key that is committed
+    to this repository. Anyone able to read the repo could then mint a valid
+    `{"c": "hls/<any_clip>", ...}` token and stream any clip.
+    """
+
+    # The literal value shipped in .env.example, .env.vps.example and
+    # .env.laptop.example. Read from the files when possible so a change to
+    # an example fails this test rather than silently weakening the guard.
+    EXAMPLE_FILES = ('.env.example', '.env.vps.example', '.env.laptop.example')
+
+    def _example_values(self):
+        from pathlib import Path
+        import re
+        found = {}
+        for name in self.EXAMPLE_FILES:
+            p = Path(__file__).resolve().parents[3] / name
+            if not p.exists():
+                continue
+            m = re.search(
+                r'^MEDIA_TOKEN_SECRET=(.*)$',
+                p.read_text(),
+                re.MULTILINE,
+            )
+            if m:
+                found[name] = m.group(1).strip()
+        return found
+
+    def test_shipped_example_placeholder_is_rejected(self, settings):
+        from backend.app.services.hls_token import is_placeholder_secret
+
+        values = self._example_values()
+        assert values, (
+            "Could not read MEDIA_TOKEN_SECRET from any example env file — "
+            "this test would silently stop guarding the real value."
+        )
+        for name, value in values.items():
+            assert is_placeholder_secret(value), (
+                f"{name} ships MEDIA_TOKEN_SECRET={value!r}, which the guard "
+                "does NOT treat as a placeholder. Deploying a copy of this "
+                "file unchanged would leave a publicly-known HMAC key in "
+                "production. Either fix the guard or change the example to "
+                "an obviously-invalid value like <generate-me>."
+            )
+
+    @pytest.mark.parametrize('value', [
+        '',
+        '   ',
+        'change-me-to-a-long-random-string',
+        'change-me',
+        'CHANGEME',
+        'your-secret-here',
+        'replace-me',
+        'placeholder',
+        'not-for-prod',
+        'change_me_something',
+        '<same-as-vps>',
+        '<generate-me>',
+    ])
+    def test_placeholder_families_are_rejected(self, settings, value):
+        from backend.app.services.hls_token import _get_secret
+        settings.MEDIA_TOKEN_SECRET = value
+        with pytest.raises(RuntimeError, match='MEDIA_TOKEN_SECRET'):
+            _get_secret()
+
+    @pytest.mark.parametrize('value', [
+        'test-secret-key-for-unit-tests',
+        'unit-test-secret',
+        'x2P5IuWsPOaBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789',
+    ])
+    def test_real_looking_secrets_are_accepted(self, settings, value):
+        """Guards against a guard that is so aggressive it breaks every
+        environment, including the fixtures the rest of this file uses."""
+        from backend.app.services.hls_token import _get_secret
+        settings.MEDIA_TOKEN_SECRET = value
+        assert _get_secret() == value.encode('utf-8')
+
+    def test_token_generation_refuses_a_placeholder(self, settings):
+        """The exploit surface. Minting must fail, not silently produce a
+        token anyone can forge."""
+        from backend.app.services import hls_token
+        settings.MEDIA_TOKEN_SECRET = 'change-me-to-a-long-random-string'
+        with pytest.raises(RuntimeError, match='placeholder'):
+            hls_token.generate_playback_token(1, 'hls/abc/master.m3u8')
+
+    def test_error_message_tells_the_operator_what_to_do(self, settings):
+        from backend.app.services.hls_token import _get_secret
+        settings.MEDIA_TOKEN_SECRET = 'change-me-to-a-long-random-string'
+        with pytest.raises(RuntimeError) as exc:
+            _get_secret()
+        message = str(exc.value)
+        assert 'token_urlsafe' in message, (
+            "The error must show the command that generates a real key; an "
+            "operator hitting this at deploy time should not have to guess."
+        )
+        assert 'wrangler' in message, (
+            "The error must mention the edge secret, because Django and the "
+            "validating Worker must hold the same value or every /hls/* "
+            "request 403s with a confusing error."
+        )

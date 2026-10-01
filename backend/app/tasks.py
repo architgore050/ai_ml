@@ -29,6 +29,74 @@ embedding_model = None
 kw_model = None
 _model_lock = threading.Lock()
 
+# Dead-letter stream for telemetry the consumer could not turn into rows.
+# Written by flush_telemetry_stream, read by `manage.py inspect_telemetry_dlq`.
+# Nothing replays it automatically: whether DLQ'd telemetry is trustworthy
+# is a product decision, not a pipeline detail.
+TELEMETRY_DLQ_KEY = 'stream:interaction.events:dlq'
+
+# Min idle time (ms) before XAUTOCLAIM will steal a stream entry from the
+# consumer that is holding it in its PEL. The consumer name is per-PID
+# (`celery-{os.getpid()}`), so a worker that dies between XREADGROUP and XACK
+# strands its window forever: the only read uses the '>' cursor, which by
+# definition never returns entries already delivered to *some* consumer.
+# 60s is ~6x the 10s beat interval, so an entry this worker is actively
+# writing is never stolen from under it.
+TELEMETRY_CLAIM_MIN_IDLE_MS = 60_000
+
+# Bound on the XAUTOCLAIM cursor sweep per tick. One sweep claims up to
+# max_events stranded entries; the rest are picked up on a later tick, which
+# keeps per-tick work bounded no matter how deep the PEL has grown.
+TELEMETRY_REAP_SWEEPS = 3
+
+
+def coalesce_telemetry_latest(pairs):
+    """Collapse a window of telemetry payloads to the LAST one per unique key.
+
+    ``UserInteraction`` has a real DB constraint on
+    ``(user, clip, interaction_type)`` (``Meta.unique_together``,
+    materialised by migrations/0001_initial.py). A read window routinely
+    holds several heartbeats for a single such triple — the player fires a
+    ``view`` roughly every 6s (frontend/src/stores/player.tsx), so one user
+    watching one 300s clip emits ~50 of them — and the constraint has no time
+    dimension, so exactly one can ever survive.
+
+    The LAST one is the right survivor: ``watch_time_ms`` is a "the user is
+    still watching at T" signal, so keeping the first heartbeat would pin the
+    row to the moment playback started and throw away the position the user
+    actually reached. Both transports (Redis Stream XREADGROUP/XAUTOCLAIM and
+    the legacy list LPOP) deliver in append order, so plain last-write-wins on
+    a dict *is* the algorithm.
+
+    ``pairs`` is a sequence of ``(token, event)``; ``token`` is the stream
+    entry id for the stream path and unused for the list path, and is carried
+    through so the caller can ACK/DLQ the entries it chose to drop.
+
+    Numeric fields are coerced here, not at the INSERT, so one event with
+    ``watch_time_ms: "abc"`` is rejected as malformed instead of raising
+    ``DataError`` and taking the whole batch down with it.
+
+    Returns ``(survivors, rejected)``: ``survivors`` maps the unique key to
+    ``(token, event, watch_time_ms, completion_rate)``; ``rejected`` is a list
+    of ``(token, exc)``.
+    """
+    survivors: dict[tuple[str, str, str], tuple] = {}
+    rejected: list[tuple] = []
+    for token, event in pairs:
+        try:
+            key = (
+                str(event['user_id']),
+                str(event['clip_id']),
+                str(event['action_type']),
+            )
+            watch_time_ms = int(event['watch_time_ms'])
+            completion_rate = float(event['completion_rate'])
+        except (KeyError, TypeError, ValueError) as exc:
+            rejected.append((token, exc))
+            continue
+        survivors[key] = (token, event, watch_time_ms, completion_rate)
+    return survivors, rejected
+
 
 def get_whisper_model():
     # DECISION: Use thread-safe double-checked locking instead of simple
@@ -127,10 +195,8 @@ def normalize_to_wav(input_file_path, sr=22050):
     This exists because librosa.load() tries soundfile (libsndfile) first and
     silently falls back to the deprecated `audioread` path — logging a
     UserWarning/FutureWarning — on any container/codec libsndfile can't
-    decode. Direct browser/file uploads hit this because, unlike the scraper
-    ingestion path (which already runs everything through
-    scrapers/normalizer.py), nothing normalizes user uploads before they're
-    handed to librosa. Doing one authoritative ffmpeg decode here removes the
+    decode. Direct browser/file uploads need one authoritative ffmpeg decode
+    before they are handed to librosa. Doing that here removes the
     audioread fallback entirely (so this doesn't silently start hard-failing
     when librosa 1.0 drops that fallback) and gives every downstream step
     (librosa, Whisper, ffmpeg HLS) the same known-good source file instead of
@@ -275,6 +341,7 @@ def _process_audio_to_hls_impl(self, clip_id, timer):
             model = get_whisper_model()
             segments, info = model.transcribe(normalized_path, beam_size=5)
             transcript_text = " ".join([segment.text for segment in segments]).strip()
+            clip.transcript_text = transcript_text
 
             # B. Semantic Vector via sentence-transformers
             if transcript_text:
@@ -295,30 +362,61 @@ def _process_audio_to_hls_impl(self, clip_id, timer):
                 clip.semantic_vector = [0.0] * 384
                 clip.tags = ["instrumental"]
 
-            # ISSUE-04: Run moderation checks on transcript (if exists) and tags.
-            # For v1, we compare transcript_text and tags against blocked phrases.
-            # If moderation fails, mark as rejected and stop HLS processing.
-            from ..services import content_moderation as moderation_svc
-            # The transcript_text variable is available in this scope.
-            transcript_approved, transcript_reason = moderation_svc.check_transcript_for_prohibited_content(transcript_text if 'transcript_text' in locals() else None)
+            # ISSUE-04: Run moderation checks on transcript and tags.
+            # For v1, we compare transcript_text and tags against blocked
+            # phrases. If moderation fails, mark as rejected and stop HLS
+            # processing.
+            #
+            # SEC-FIX (2026-09-29, B2a): this line previously read
+            #     check_transcript_for_prohibited_content(
+            #         transcript_text if 'transcript_text' in locals() else None)
+            # The locals() guard was dead code — transcript_text is assigned
+            # unconditionally 26 lines above on the same try-block, and
+            # transcribe() raising would have jumped to the except clause
+            # rather than reaching here. So the guard could only ever be
+            # True. Kept as a bare name so the actual value being checked is
+            # visible at the call site rather than hidden behind a
+            # conditional that reads as if the value might be missing.
+            # SECURITY: relative import is `.services`, not `..services`.
+            # This module is `backend.app.tasks`, so `..` resolves to
+            # `backend.services` (which does not exist) and raised
+            # ModuleNotFoundError at the moderation step — killing EVERY
+            # clip at the transcript check, so no clip ever reached HLS
+            # encoding. Files one level deeper (`backend/app/views/*.py`)
+            # correctly use `..services`; a module at `backend/app/` itself
+            # needs one dot.
+            from .services import content_moderation as moderation_svc
+            transcript_approved, transcript_reason = moderation_svc.check_transcript_for_prohibited_content(transcript_text)
             tags_approved, tags_reason = moderation_svc.check_tags_for_prohibited_content(clip.tags)
             if not transcript_approved:
                 logger.error("Moderation rejected clip %s (transcript): %s", clip_id, transcript_reason)
                 clip.moderation_approved = False
                 clip.status = 'rejected'
-                clip.save(update_fields=['moderation_approved', 'status', 'tags'])
+                clip.moderation_reason = transcript_reason or ''
+                clip.moderated_at = timezone.now()
+                clip.save(update_fields=[
+                    'moderation_approved', 'status', 'tags', 'transcript_text',
+                    'semantic_vector', 'moderation_reason', 'moderated_at',
+                ])
                 timer.set_outcome('moderation_rejected')
                 return
             if not tags_approved:
                 logger.error("Moderation rejected clip %s (tags): %s", clip_id, tags_reason)
                 clip.moderation_approved = False
                 clip.status = 'rejected'
-                clip.save(update_fields=['moderation_approved', 'status', 'tags'])
+                clip.moderation_reason = tags_reason or ''
+                clip.moderated_at = timezone.now()
+                clip.save(update_fields=[
+                    'moderation_approved', 'status', 'tags', 'transcript_text',
+                    'semantic_vector', 'moderation_reason', 'moderated_at',
+                ])
                 timer.set_outcome('moderation_rejected')
                 return
 
             # All moderation checks passed — set approved.
             clip.moderation_approved = True
+            clip.moderation_reason = ''
+            clip.moderated_at = timezone.now()
         except (OSError, ConnectionError):
             logger.exception("AI inference transient error for clip %s; re-raising for retry", clip_id)
             raise
@@ -573,41 +671,113 @@ def flush_telemetry_legacy(self, max_events=1000):
     if not events:
         return "No events to flush."
 
+    # Collapse to one row per (user, clip, action_type) — the DB has a hard
+    # unique_together on that triple, so a window holding two heartbeats for
+    # one pair used to raise IntegrityError on a bare bulk_create, with the
+    # events already LPOP'd and no try/except anywhere: the whole batch was
+    # destroyed on the Redis-degraded fallback path, i.e. exactly when the
+    # system can least afford to lose it.
+    coalesced, rejected = coalesce_telemetry_latest(
+        (None, event) for event in events
+    )
+    for _token, exc in rejected:
+        logger.warning("flush_telemetry_legacy: dropped malformed event (%s)", exc)
+
+    if not coalesced:
+        return "No valid events to flush."
+
     # N5 fix: batch the FK lookups with in_bulk instead of per-event .get().
     # Old: 2 queries per event = 2000 queries for max_events=1000.
     # New: 2 queries total (one per FK table) regardless of event count.
-    user_ids = {e['user_id'] for e in events}
-    clip_ids = {e['clip_id'] for e in events}
+    # The ids are cast per model first: the producer writes them as strings
+    # (services.interactions.record_telemetry stringifies both), and
+    # in_bulk keys its result by the model's real pk type, so passing the raw
+    # strings back in misses on every single event.
+    import uuid as _uuid
+    user_ids: set[int] = set()
+    clip_ids: set = set()
+    for (user_id, clip_id, _action_type), _payload in coalesced.items():
+        try:
+            user_ids.add(int(user_id))
+        except (TypeError, ValueError):
+            pass
+        try:
+            clip_ids.add(_uuid.UUID(str(clip_id)))
+        except (TypeError, ValueError, AttributeError):
+            pass
     try:
-        users_by_id = User.objects.in_bulk(user_ids)
-        clips_by_id = AudioClip.objects.in_bulk(clip_ids)
+        users_by_id = User.objects.in_bulk(user_ids) if user_ids else {}
+        clips_by_id = AudioClip.objects.in_bulk(clip_ids) if clip_ids else {}
     except Exception as exc:
-        logger.error("flush_telemetry_legacy: in_bulk failed (%s); dropping batch", exc)
-        return f"FK lookup failed: {exc}"
+        logger.error("flush_telemetry_legacy: in_bulk failed (%s); requeuing batch", exc)
+        requeued = _requeue_legacy_events(events, max_events)
+        return f"FK lookup failed: {exc}. Requeued {requeued} events."
 
     # Materialize to ORM objects in one bulk_create.
     interactions = []
-    for e in events:
-        user = users_by_id.get(e['user_id'])
-        clip = clips_by_id.get(e['clip_id'])
+    survivors = []
+    for (user_id, clip_id, action_type), (_t, _e, watch_ms, completion) in coalesced.items():
+        try:
+            user = users_by_id.get(int(user_id))
+        except (TypeError, ValueError):
+            user = None
+        try:
+            clip = clips_by_id.get(_uuid.UUID(str(clip_id)))
+        except (TypeError, ValueError, AttributeError):
+            clip = None
         if user is None or clip is None:
-            # FK was deleted between XADD and now. Skip; ACKed-by-design
-            # (event is in the legacy queue, single attempt).
+            # FK was deleted between RPUSH and now. Skip; dropped by design
+            # (the list consumer makes a single attempt, there is no PEL and
+            # nothing to retry from, so requeueing would spin for ever).
             continue
         interactions.append(UserInteraction(
             user=user,
             clip=clip,
-            interaction_type=e['action_type'],
-            watch_time_ms=e['watch_time_ms'],
-            completion_rate=e['completion_rate'],
+            interaction_type=action_type,
+            watch_time_ms=watch_ms,
+            completion_rate=completion,
             is_active=True,
         ))
+        survivors.append(_e)
 
     if not interactions:
         return "No valid events to flush."
 
-    UserInteraction.objects.bulk_create(interactions, batch_size=500)
+    try:
+        UserInteraction.objects.bulk_create(
+            interactions, batch_size=500, ignore_conflicts=True,
+        )
+    except Exception as exc:
+        # bulk_create runs inside atomic(savepoint=False), so one bad row
+        # rolls back the whole batch. The list consumer has already LPOP'd
+        # these events and has no PEL, so the only way back is to push them
+        # onto the queue again.
+        logger.error("flush_telemetry_legacy: bulk_create failed (%s); requeuing", exc)
+        requeued = _requeue_legacy_events(survivors, max_events)
+        return (
+            f"bulk_create failed: {exc}. Requeued {requeued} events; "
+            f"0 rows written."
+        )
     return f"Flushed {len(interactions)} telemetry events to UserInteraction."
+
+
+def _requeue_legacy_events(events, max_events: int) -> int:
+    """RPUSH drained telemetry events back onto ``telemetry:queue``.
+
+    Bounded by ``max_events`` so a pathological requeue can never grow the
+    list past one tick's drain rate. Failure to requeue is logged, never
+    raised: the caller is already handling an exception and losing the return
+    value would be the worse outcome.
+    """
+    if not events:
+        return 0
+    import json as _json
+    payloads = [_json.dumps(e) for e in events[:max_events]]
+    try:
+        return int(cache.client.get_client().rpush('telemetry:queue', *payloads))
+    except Exception as exc:
+        logger.error("flush_telemetry_legacy: requeue failed (%s); events lost", exc)
+        return 0
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=10, retry_backoff=True)
@@ -629,6 +799,9 @@ def flush_telemetry_stream(self, max_events=500, block_ms=5000):
     be re-read on the next tick; SETNX returns False, the event is
     silently dropped, and the stream entry is XACK'd anyway. The DB
     already has the row from the prior run, so this is correct.
+    A consumer that crashes *before* the ACK is handled by the
+    XAUTOCLAIM sweep below instead, which is the only thing that can
+    rescue those entries given the per-PID consumer name.
     """
     import json
     import time
@@ -639,9 +812,14 @@ def flush_telemetry_stream(self, max_events=500, block_ms=5000):
     # timeout on xreadgroup (parent-process fork artifact). django_redis's
     # connection pool survives forks and may return a broken socket.
     # A fresh client guarantees a new TCP connection.
+    #
+    # decode_responses is load-bearing, not a convenience. Stream field
+    # names and values come back as bytes without it, so `fields.get(
+    # 'payload')` is always None and every single event takes the
+    # "empty payload" DLQ branch below: 100% telemetry loss, silently.
     from django.conf import settings as _s
     redis_url = _s.CACHES['default']['LOCATION']
-    client = redis_lib.from_url(redis_url, socket_keepalive=True)
+    client = redis_lib.from_url(redis_url, socket_keepalive=True, decode_responses=True)
     try:
         # Ensure the consumer group exists. MKSTREAM creates the stream on
         # first call; the try/except swallows the BUSYGROUP error on
@@ -652,6 +830,11 @@ def flush_telemetry_stream(self, max_events=500, block_ms=5000):
             pass  # BUSYGROUP — already exists.
 
         consumer_name = f"celery-{os.getpid()}"
+        # Reap the PEL BEFORE the '>' read. '>' only ever returns entries that
+        # have never been delivered to any consumer, so an entry stranded by a
+        # worker that died between XREADGROUP and XACK is invisible to it for
+        # ever. XAUTOCLAIM is the one command that can pull those back.
+        reaped = _reap_stale_pending(client, STREAM_KEY, CONSUMER_GROUP, consumer_name, max_events)
         # Non-blocking xreadgroup with retry loop. The blocking 'block'
         # parameter in xreadgroup raises "Timeout reading from socket" in
         # redis-py 8.x under Celery prefork (signal-interrupts the syscall).
@@ -674,14 +857,19 @@ def flush_telemetry_stream(self, max_events=500, block_ms=5000):
                 logger.warning("flush_telemetry_stream: xreadgroup failed: %s", exc)
                 return f"xreadgroup failed: {exc}"
 
-        if not response:
+        if not response and not reaped:
             return "No events to flush."
 
         # response shape: [(stream_name, [(entry_id, {fields}), ...])]
-        entries: list[tuple[str, dict]] = []
-        for _stream, items in response:
+        fresh_entries: list[tuple[str, dict]] = []
+        for _stream, items in response or []:
             for entry_id, fields in items:
-                entries.append((entry_id, fields))
+                fresh_entries.append((entry_id, fields))
+        # Reaped entries first, then the '>' window. Both are in ascending
+        # stream-id order, so the concatenation is the stream's real
+        # chronological order — which is what makes "last one wins" mean
+        # "most recent heartbeat wins" rather than an arbitrary pick.
+        entries: list[tuple[str, dict]] = reaped + fresh_entries
 
         dedup_ttl = 86400
         processed_ids: list[str] = []
@@ -689,10 +877,10 @@ def flush_telemetry_stream(self, max_events=500, block_ms=5000):
         # N5 fix: collect distinct FK ids FIRST, then resolve via in_bulk
         # once. Old code did User.objects.get() and AudioClip.objects.get()
         # per entry — 2 queries per event. New: 2 queries total.
-        pending_entries: list[tuple[str, dict, str, str]] = []
-        # pending_entries holds (entry_id, fields, user_id_str, clip_id_str) for
-        # entries that passed dedup. We accumulate the FK ids, batch-resolve,
-        # then materialize interactions in a second pass.
+        pending_entries: list[tuple[str, dict]] = []
+        # pending_entries holds (entry_id, event) for entries that passed
+        # dedup. We coalesce, batch-resolve the FKs, then materialize
+        # interactions in a second pass.
 
         for entry_id, fields in entries:
             try:
@@ -703,8 +891,12 @@ def flush_telemetry_stream(self, max_events=500, block_ms=5000):
                     dlq_ids.append(entry_id)
                     continue
                 event = json.loads(payload_raw)
-                user_id = event['user_id']
-                clip_id = event['clip_id']
+                # Presence check only — the values are not used here. A
+                # payload missing either id can never become a row, and it
+                # has to be rejected BEFORE the SETNX below so a poison
+                # event does not burn its own dedup key on the way to the DLQ.
+                event['user_id']
+                event['clip_id']
             except (KeyError, json.JSONDecodeError, TypeError) as exc:
                 logger.warning(
                     "flush_telemetry_stream: malformed event %s (%s); routing to DLQ",
@@ -727,7 +919,26 @@ def flush_telemetry_stream(self, max_events=500, block_ms=5000):
                 processed_ids.append(entry_id)
                 continue
 
-            pending_entries.append((entry_id, event, user_id, clip_id))
+            pending_entries.append((entry_id, event))
+
+        # Coalesce the write batch down to one row per (user, clip,
+        # interaction_type), keeping the LAST payload. See
+        # coalesce_telemetry_latest for why last-wins is the correct
+        # survivor and why the count of entries reaching the DB is not the
+        # count of entries read.
+        coalesced, rejected = coalesce_telemetry_latest(pending_entries)
+        for entry_id, exc in rejected:
+            logger.warning(
+                "flush_telemetry_stream: unusable event %s (%s); routing to DLQ",
+                entry_id, exc,
+            )
+            dlq_ids.append(entry_id)
+        rejected_ids = {entry_id for entry_id, _exc in rejected}
+        # Every entry that entered the write batch is ACK-eligible. Entries
+        # dropped by coalescing are ACK-only: they are strictly superseded by
+        # the survivor, so DLQ-ing them would just inflate the depth.
+        write_batch_ids = [eid for eid, _ev in pending_entries if eid not in rejected_ids]
+        processed_ids.extend(write_batch_ids)
 
         # Batch-resolve FKs once for all entries that survived dedup.
         # DECISION: the stream payload carries str IDs (Redis Stream field
@@ -739,11 +950,19 @@ def flush_telemetry_stream(self, max_events=500, block_ms=5000):
         # present. We cast to the correct type per field here. The
         # AudioClip.id cast goes through UUID() to handle the
         # BigAutoField vs UUIDField type difference.
+        #
+        # This resolution is also what makes ignore_conflicts=True safe: it
+        # compiles to ON CONFLICT DO NOTHING, which swallows *any* constraint
+        # violation, FK included. Because an unresolvable user/clip is dropped
+        # here — before the INSERT — a row can never be silently skipped for a
+        # reason that is actually data corruption. Without this filter the
+        # conflict clause would hide it.
         interactions: list[UserInteraction] = []
-        if pending_entries:
+        written_ids: list[str] = []
+        if coalesced:
             user_ids: set[int] = set()
             clip_ids: set = set()
-            for _entry_id, _event, user_id, clip_id in pending_entries:
+            for (user_id, clip_id, _action_type), _payload in coalesced.items():
                 try:
                     user_ids.add(int(user_id))
                 except (TypeError, ValueError):
@@ -758,17 +977,21 @@ def flush_telemetry_stream(self, max_events=500, block_ms=5000):
                 clips_by_id = AudioClip.objects.in_bulk(clip_ids) if clip_ids else {}
             except Exception as exc:
                 logger.error("flush_telemetry_stream: in_bulk failed (%s); routing all to DLQ", exc)
-                for entry_id, _event, _u, _c in pending_entries:
+                for entry_id, _ev, _w, _c in coalesced.values():
                     dlq_ids.append(entry_id)
+                    if entry_id in processed_ids:
+                        processed_ids.remove(entry_id)
             else:
                 import uuid as _uuid
-                for entry_id, event, user_id, clip_id in pending_entries:
+                for (uid_key, cid_key, action_type), (
+                    entry_id, _event, watch_ms, completion,
+                ) in coalesced.items():
                     try:
-                        user = users_by_id.get(int(user_id))
+                        user = users_by_id.get(int(uid_key))
                     except (TypeError, ValueError):
                         user = None
                     try:
-                        clip = clips_by_id.get(_uuid.UUID(str(clip_id)))
+                        clip = clips_by_id.get(_uuid.UUID(str(cid_key)))
                     except (TypeError, ValueError, AttributeError):
                         clip = None
                     if user is None or clip is None:
@@ -776,27 +999,40 @@ def flush_telemetry_stream(self, max_events=500, block_ms=5000):
                             "flush_telemetry_stream: missing user/clip for %s; ACKing (data will be lost)",
                             entry_id,
                         )
-                        processed_ids.append(entry_id)
                         continue
                     interactions.append(UserInteraction(
                         user=user,
                         clip=clip,
-                        interaction_type=event['action_type'],
-                        watch_time_ms=event['watch_time_ms'],
-                        completion_rate=event['completion_rate'],
+                        interaction_type=action_type,
+                        watch_time_ms=watch_ms,
+                        completion_rate=completion,
                         is_active=True,
                     ))
-                    processed_ids.append(entry_id)
+                    written_ids.append(entry_id)
 
         if interactions:
             try:
-                UserInteraction.objects.bulk_create(interactions, batch_size=500)
+                # ignore_conflicts covers the races coalescing cannot see:
+                # a second worker whose window overlaps this one, and the
+                # synchronous writers (flush_counters_to_pg's update_or_create,
+                # record_like_toggle / record_share get_or_create) hitting the
+                # same triple. Without it, ONE of those rows aborts the whole
+                # savepoint-less transaction and takes up to 500 other
+                # accounts' telemetry down with it.
+                UserInteraction.objects.bulk_create(
+                    interactions, batch_size=500, ignore_conflicts=True,
+                )
             except Exception as exc:
-                logger.error("flush_telemetry_stream: bulk_create failed (%s); routing all to DLQ", exc)
-                for entry_id, _ in entries:
-                    if entry_id not in processed_ids:
-                        dlq_ids.append(entry_id)
-                    else:
+                logger.error("flush_telemetry_stream: bulk_create failed (%s); routing the write batch to DLQ", exc)
+                # Route ONLY what we tried to write. The old code walked the
+                # raw read window and *removed* the id from processed_ids
+                # when it found it there, which (a) re-classified events that
+                # had been correctly deduped into Postgres as failures and
+                # DLQ'd a lie, and (b) left every id already in processed_ids
+                # un-ACKed and un-DLQ'd — stranded in the PEL for ever.
+                for entry_id in written_ids:
+                    dlq_ids.append(entry_id)
+                    if entry_id in processed_ids:
                         processed_ids.remove(entry_id)
             else:
                 # A3 cache invalidation: bulk_create succeeded, so each
@@ -827,10 +1063,16 @@ def flush_telemetry_stream(self, max_events=500, block_ms=5000):
                                len(processed_ids), exc)
 
         # Move poison messages to DLQ so the main stream advances. Keep them
-        # observable (no AUTO-trim) so operators can XLEN the DLQ and triage.
+        # observable (no AUTO-trim) so operators can XLEN the DLQ and triage —
+        # `manage.py inspect_telemetry_dlq` is that triage. The DLQ records
+        # the source entry id, and XACK (not XDEL) leaves the payload
+        # retrievable from the main stream via XRANGE while it is under the
+        # 50k maxlen, so a DLQ entry is actionable for manual recovery.
+        # Nothing replays automatically: whether DLQ'd telemetry is
+        # trustworthy is a product decision.
         for entry_id in dlq_ids:
             try:
-                client.xadd('stream:interaction.events:dlq', {
+                client.xadd(TELEMETRY_DLQ_KEY, {
                     'original_id': entry_id,
                     'reason': 'malformed_or_duplicate',
                 })
@@ -844,6 +1086,56 @@ def flush_telemetry_stream(self, max_events=500, block_ms=5000):
         )
     finally:
         client.close()
+
+
+def _reap_stale_pending(client, stream_key, group, consumer_name, max_events):
+    """XAUTOCLAIM entries idle past TELEMETRY_CLAIM_MIN_IDLE_MS into this consumer.
+
+    Returns the claimed ``(entry_id, fields)`` pairs in ascending stream-id
+    order.
+
+    Why this has to exist: the consumer name is ``celery-{os.getpid()}``, and
+    the only read in the task uses the ``'>'`` cursor, which returns entries
+    that have never been delivered to *any* member of the group. A worker
+    killed between XREADGROUP and XACK therefore strands its window in the
+    PEL for ever — no amount of re-reading recovers it. XAUTOCLAIM is the one
+    command that transfers ownership of an already-delivered entry, so it is
+    the only reaper for a per-PID consumer name.
+
+    The idle threshold is what keeps this from stealing work in flight: an
+    entry this tick is about to write is only milliseconds old, well under
+    TELEMETRY_CLAIM_MIN_IDLE_MS (60s, ~6x the 10s beat interval).
+
+    Failure is non-fatal by design — a Redis hiccup here must not stop the
+    ``'>'`` read from draining new events.
+    """
+    reaped: list[tuple[str, dict]] = []
+    start_id = '0-0'
+    for _sweep in range(TELEMETRY_REAP_SWEEPS):
+        try:
+            reply = client.xautoclaim(
+                stream_key, group, consumer_name, TELEMETRY_CLAIM_MIN_IDLE_MS,
+                start_id, count=max_events,
+            )
+        except Exception as exc:
+            logger.warning("flush_telemetry_stream: xautoclaim failed: %s", exc)
+            break
+        # A reply that is not the documented [next_cursor, entries, deleted]
+        # triple means we are not talking to the server we think we are; stop
+        # rather than spin on an uninterpretable cursor.
+        if not isinstance(reply, (list, tuple)) or len(reply) < 2:
+            logger.warning("flush_telemetry_stream: unexpected xautoclaim reply: %r", reply)
+            break
+        next_id, claimed = reply[0], reply[1]
+        if not claimed:
+            break
+        reaped.extend(claimed)
+        # '0-0' is Redis's end-of-PEL sentinel. Compare as text so a
+        # bytes-decoding client behaves the same as a decoding one.
+        if not isinstance(next_id, (str, bytes)) or str(next_id) in ('0-0', "b'0-0'"):
+            break
+        start_id = next_id
+    return reaped
 
 
 @shared_task
@@ -884,117 +1176,6 @@ def cleanup_stuck_processing(threshold_minutes=15, max_per_run=50):
     if give_up:
         return f"Re-enqueued {re_enqueued}, gave up on {give_up} (>{int(give_up_threshold.total_seconds() // 60)}m) clips."
     return f"Re-enqueued {re_enqueued} stuck clips (threshold={threshold_minutes}m)."
-
-
-@shared_task(bind=True, max_retries=3, default_retry_delay=60, autoretry_for=RETRYABLE_ERRORS, retry_backoff=True, retry_backoff_max=600)
-def scrape_and_import(self, source_name, limit=5, clip_length=300, allow_nc=None, include_share_alike=None):
-    """Celery task wrapper to run a scraper source and import clips.
-
-    This task delegates to the source connectors and uses the local
-    downloader/normalizer/uploader to create `AudioClip` records and
-    then triggers `process_audio_to_hls` for each created clip.
-
-    License enforcement mirrors the management command (closes the gap noted
-    in docs/EXPLAIN/scraping/03-licensing-safety.md): items whose license
-    family does not permit commercial use are skipped unless allow_nc=True.
-    CC-BY-SA items are imported with requires_share_alike=True and
-    moderation_approved=False (model default), so they require operator
-    approval via /clips/{id}/approve-moderation/ before reaching feeds.
-    """
-    from ai_ml.scrapers.sources import SOURCES
-    from ai_ml.scrapers.base import (
-        normalize_license,
-        license_features,
-        license_allows_commercial,
-        is_share_alike_license,
-    )
-    from django.conf import settings as dj_settings
-    module = SOURCES.get(source_name)
-    if not module:
-        raise RuntimeError(f"Unknown source: {source_name}")
-
-    from django.contrib.auth import get_user_model
-    UserModel = get_user_model()
-    user = UserModel.objects.filter(is_superuser=True).first()
-    if not user:
-        user = UserModel.objects.create_user(username='scraper')
-        user.set_unusable_password()
-        user.save()
-
-    # Honor explicit overrides; else fall back to env-driven settings.
-    if allow_nc is None:
-        allow_nc = getattr(dj_settings, 'SCRAPER_ALLOW_NC', False)
-    if include_share_alike is None:
-        include_share_alike = getattr(dj_settings, 'SCRAPER_ALLOW_SHARE_ALIKE', False)
-
-    from ai_ml.scrapers import downloader, normalizer, uploader
-
-    items = module.fetch_audio(limit=limit)
-    imported = 0
-    skipped = 0
-    for item in items:
-        url = item.get('url')
-        title = item.get('title') or 'scraped audio'
-        page = item.get('page_url') or ''
-        lic_raw = item.get('license')
-        original_id = item.get('id')
-        family = normalize_license(lic_raw)
-        nc, sa = license_features(family)
-        nc = nc or bool(item.get('is_noncommercial'))
-        if not license_allows_commercial(family, allow_nc=allow_nc):
-            logger.info("scrape_and_import: skipping %s license=%s family=%s",
-                        url, lic_raw, family)
-            skipped += 1
-            continue
-        sa = sa or is_share_alike_license(family)
-
-        local_input = None
-        tmp_out = None
-        try:
-            if url.startswith('file://'):
-                local_input = url[len('file://'):]
-            else:
-                local_input = downloader.download_audio(url)
-
-            tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3').name
-            normalizer.normalize_and_trim(local_input, tmp_out, max_seconds=clip_length, target_format='mp3')
-
-            clip = uploader.save_clip(
-                user=user,
-                title=title,
-                source_name=source_name,
-                source_url=page,
-                license=lic_raw or 'unknown',
-                attribution_text=page,
-                local_file_path=tmp_out,
-                original_source_id=original_id,
-                is_noncommercial=nc,
-                requires_share_alike=sa,
-                license_family=family,
-            )
-
-            publish(process_audio_to_hls, str(clip.id))
-            imported += 1
-            logger.info("Imported clip %s from %s (family=%s nc=%s sa=%s)",
-                        clip.id, source_name, family, nc, sa)
-
-        except Exception as e:
-            logger.error("Failed to import %s: %s", url, e)
-
-        finally:
-            # local_input/tmp_out are always tempfile-backed local scratch
-            # paths here (never the durable store — see uploader.save_clip,
-            # which already writes through default_storage), so there's
-            # nothing to protect against deleting; clean up unconditionally.
-            for p in (local_input, tmp_out):
-                try:
-                    if p and os.path.exists(p):
-                        os.remove(p)
-                except Exception as e:
-                    logger.error("Failed to clean up temp file %s: %s", p, e)
-
-    logger.info("scrape_and_import(%s): imported=%d skipped=%d allow_nc=%s sa=%s",
-                source_name, imported, skipped, allow_nc, include_share_alike)
 
 
 # ---------------------------------------------------------------------------
@@ -1284,6 +1465,15 @@ def _apply_counter_deltas(
     return applied
 
 
+# Weight standing in for prior completion evidence when blending
+# avg_completion_rate in _apply_completion_deltas. The flusher drains Redis
+# counters and has no count of how many samples produced the value already on
+# the row, so this stands in for it: 10 means a clip is treated as if it
+# already had ten observations. Raising it damps a single beat more; lowering
+# it makes the metric track recent behaviour more closely. Must be > 0.
+_COMPLETION_PRIOR_WEIGHT = 10
+
+
 def _apply_completion_deltas(
     completion_deltas: dict[tuple[str, str], dict[str, float]],
     batch_size: int,
@@ -1315,9 +1505,37 @@ def _apply_completion_deltas(
     for clip_id, total_count in list(per_clip_count.items())[:batch_size]:
         if total_count <= 0:
             continue
-        mean = per_clip_sum[clip_id] / total_count
+        total_sum = per_clip_sum[clip_id]
+        mean = total_sum / total_count
         try:
-            AudioClip.objects.filter(pk=clip_id).update(avg_completion_rate=mean)
+            # SECURITY: blend, do not replace.
+            #
+            # This was `.update(avg_completion_rate=mean)` — a full replace
+            # with only the samples drained in *this* beat. One sample was
+            # therefore the entire global value, so a single completion
+            # sample pinned a clip's score until enough other samples
+            # averaged it back down. Combined with the client-controlled
+            # divisor in services.interactions.record_skip (fixed in the same
+            # commit) a single tap of "Next" could set the term that is 30% of
+            # the recommendation composite (feed_pool.py:152, :225).
+            #
+            # The blend is expressed with F() so it stays a single UPDATE
+            # with no read, preserving the "batched UPDATEs that touch only
+            # the dirty clip set" property from the metrics rewrite. The
+            # weight stands in for the prior evidence the flusher does not
+            # have a count for, and bounds how far one beat can move the
+            # value: with a weight of 10, one sample moves it by at most
+            # 1/11 of the distance to that sample.
+            #
+            # Averaging is a deliberate trade: the metric is no longer a
+            # pure mean over all samples ever seen, and a clip whose real
+            # completion has changed will now converge rather than snap.
+            AudioClip.objects.filter(pk=clip_id).update(
+                avg_completion_rate=(
+                    (F('avg_completion_rate') * _COMPLETION_PRIOR_WEIGHT + total_sum)
+                    / (_COMPLETION_PRIOR_WEIGHT + total_count)
+                )
+            )
             applied += 1
         except Exception as exc:
             logger.warning(
@@ -1529,3 +1747,36 @@ def _materialize_user_interaction_rows(
     return written
 
 
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=120, retry_backoff=True)
+def execute_data_erasure(self, user_id: int):
+    """Erase one user's personal data and anonymise what the law requires kept.
+
+    B3 (2026-09-29). Reached from ``POST /data-subject/erasure/`` once the
+    30-day cooling-off has passed; the endpoint previously marked the request
+    ``completed`` and reported "Data erasure process initiated" while deleting
+    nothing.
+
+    Routed to the ``default`` queue, not ``heavy_media``: this is a row-count
+    sweep plus object-storage deletes, with no ML model and no ffmpeg. See
+    the rationale for a task rather than request-path work in
+    ``services/erasure.py``.
+
+    Idempotent on ``user_id`` — a redelivery after a partial failure finds no
+    user and returns ``already_erased`` rather than raising, because a retry
+    that raises forever would page someone for work that is already done.
+
+    SECURITY: the report is logged, not returned to the client. It contains
+    row counts, which are a fingerprint of the subject's activity.
+    """
+    from .services.erasure import execute_erasure
+
+    try:
+        report = execute_erasure(int(user_id))
+    except Exception as exc:
+        # Retry rather than swallowing. A partial delete that reports success
+        # is precisely the failure this task exists to remove.
+        logger.error("execute_data_erasure failed for user %s: %s", user_id, exc)
+        raise self.retry(exc=exc)
+    return report

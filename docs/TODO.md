@@ -64,7 +64,7 @@ HLS TOKEN PROTECTION (short-lived play tokens)
     - [ ] Bind Worker to R2 bucket (HLS_BUCKET) in wrangler.toml
     - [ ] Set MEDIA_TOKEN_SECRET as Worker secret (npx wrangler secret put)
       (must match .env.vps example)
-    - [ ] Route media.echo-flow.in/* → Worker (Cloudflare dashboard)
+    - [ ] Route media.echoflow.in/* → Worker (Cloudflare dashboard)
     - [ ] Remove R2 bucket policy PublicRead on hls/*
     - [ ] Deploy + verify: anonymous HLS request → 403, token-bearing request → 200
   - Option B (dev — nginx + njs) [deferred after Option A ships]:

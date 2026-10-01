@@ -1,21 +1,58 @@
 # Rate Limiting
 
-## Current Configuration (`settings.py:324-331`)
+> **Partially historical.** The sections *Critical Gaps* and *Recommended
+> Improvements* below are an early architecture audit (pre-`ScopedRateThrottle`
+> scopes) and are kept for the record. Most of what they list as missing —
+> per-endpoint scopes, telemetry caps, Redis-backed counting — has since
+> shipped. **The accurate current state is the three sections immediately
+> below.** Read those, not the audit.
+>
+> The CGNAT problem — IP-keyed throttling applied to a mobile network, where
+> one carrier NAT gateway is thousands of callers — was found and fixed on
+> 2026-09-28 and is **not** visible in the historical sections at all. See
+> `../decisions/2026-09-28-native-media-auth-and-cgnat-throttling.md`.
+
+## Current Configuration (`backend/EchoFlow/settings.py`, `DEFAULT_THROTTLE_RATES`)
 
 ```python
 REST_FRAMEWORK = {
     'DEFAULT_THROTTLE_CLASSES': [
         'rest_framework.throttling.AnonRateThrottle',
         'rest_framework.throttling.UserRateThrottle',
+        'rest_framework.throttling.ScopedRateThrottle',
     ],
     'DEFAULT_THROTTLE_RATES': {
-        'anon': '100/hour',
-        'user': '1000/hour',
+        'anon':              '100/hour',
+        'user':             '1000/hour',
+        'telemetry':          '60/min',    # log_telemetry — the abuse vector
+        'upload':             '20/hour',   # /clips/ (storage DoS guard)
+        'register':          '200/hour',   # /auth/register/ (per IP)
+        'register_username':   '3/hour',   # /auth/register/ (per username)
+        'login':              '10/min',
+        'token_refresh':     '120/hour',   # /auth/token/refresh/ (per verified subject)
+        'comment':            '60/hour',
+        'share_send':        '100/hour',
+        'share_poll':       '1000/hour',
+        'interaction':        '60/min',
+        'legal':              '30/hour',
+        'grievance':          '10/hour',
+        'data_subject':        5/hour,
+        'subscription_sync':   '10/hour',
+        # A3 (2026-09-29): POST /media/playback-token/<id>/. The view had
+        # NO throttle_scope, and ScopedRateThrottle allows everything when a
+        # view declares none — so the endpoint was silently unthrottled and
+        # fell through to the shared `user` (1000/hour) bucket, which a
+        # scrolling feed burns at ~1 token per clip. Keyed on the
+        # authenticated user, so it is NAT-safe.
+        'playback_token':      '300/min',
     },
 }
 ```
 
----
+> `ScopedRateThrottle` is a **silent no-op** on a view that declares no
+> `throttle_scope` — it reads the scope from the view at request time and
+> allows everything. Listing the class without the attribute disables
+> throttling with no error. See §Throttle Classes below.
 
 ## Throttle Classes
 
@@ -23,15 +60,51 @@ REST_FRAMEWORK = {
 - **Scope:** `anon`
 - **Limit:** 100 requests/hour
 - **Identification:** Client IP address
-- **Applies to:** Unauthenticated requests (login, register)
+- **Applies to:** `AllowAny` endpoints not overriding `throttle_classes`
+- **⚠️ Not appropriate for a mobile API.** A carrier NAT gateway is
+  thousands of subscribers behind one address, so they share one bucket.
 
 ### UserRateThrottle
 - **Scope:** `user`
 - **Limit:** 1000 requests/hour
 - **Identification:** Authenticated user ID
-- **Applies to:** All authenticated endpoints
+- **Applies to:** All authenticated endpoints. **One shared budget** — feed,
+  telemetry, comments and tokens all draw from it.
 
----
+### ScopedRateThrottle
+- **Scopes:** the table above
+- **Identification:** the view's `throttle_scope`, keyed by IP or user
+- **⚠️ Requires `throttle_scope` on the view.** Absent, it allows everything.
+  `RegisterView` and `ThrottledTokenRefreshView` both declare it, and
+  `backend/app/tests/test_throttling.py::TestRefreshThrottleWiring` asserts it
+  because a wiring mistake raises nothing.
+
+### RefreshTokenRateThrottle (`backend/app/throttling.py`)
+- **Scope:** `token_refresh`, 120/hour
+- **Identification:** the **verified `user_id` inside the refresh token**,
+  falling back to the caller's IP only when no usable token is presented
+- **Why:** `/auth/token/refresh/` is the endpoint most broken by IP keying.
+  Access tokens live 15 minutes, so every active user refreshes ~4x/hour. On
+  `anon` (100/hour/IP) a single cell exhausts the shared budget within
+  minutes and **every subscriber on it is logged out**, with no server error
+  — each response was a correct 401.
+- **Verification is mandatory.** `RefreshToken(raw)` checks the signature and
+  expiry. Decoding the payload alone would let an attacker flip `user_id` in
+  a stolen token and mint a fresh bucket per forged subject.
+- **The subject is a `str`, not an `int`** — simplejwt does
+  `user_id = str(user_id)` before writing the payload. An int-only guard
+  silently falls back to IP keying for every real token.
+
+### RegisterUsernameRateThrottle (`backend/app/throttling.py`)
+- **Scope:** `register_username`, 3/hour
+- **Identification:** the lower-cased username in the request body, falling
+  back to IP when absent
+- **Why:** registration is anonymous, so the IP key cannot be removed. This
+  is the second axis that bounds what an IP key cannot express — one host
+  cycling through accounts, and repeated re-registration to squat or reclaim
+  a handle. Lower-casing can only merge buckets, never fan an attacker out.
+- **Applies alongside** `register` (200/hour, per IP), which is sized to let
+  a carrier NAT onboard normally.
 
 ## Implementation Details
 
@@ -44,15 +117,30 @@ REST_FRAMEWORK = {
 ```
 throttle_{scope}_{ident}
 # e.g., throttle_user_123, throttle_anon_192.168.1.1
+#      throttle_token_refresh_user:7   (verified subject)
+#      throttle_register_username_username:alice
 ```
+
+> The custom classes use `user:` / `ip:` / `username:` prefixes so a key's
+> origin is readable in Redis. `bool` subjects are rejected explicitly —
+> `isinstance(True, int)` is `True` in Python, and a container reaching the
+> key would raise from a Memcached/Redis backend and turn an ordinary
+> authenticated request into a 500.
+
+### Testing note
+Throttle tests run against a private `LocMemCache`, not the shared Redis the
+Celery workers use. `SimpleRateThrottle.cache` is bound to the Django default
+cache at import, so 120 sequential round-trips intermittently blew through
+django-redis' socket timeout and failed for reasons unrelated to the
+throttle. Counting is pure logic; it does not need shared infrastructure.
 
 ### Response Headers
 ```
-X-RateLimit-Limit: 1000
-X-RateLimit-Remaining: 999
-X-RateLimit-Reset: 1705315200
 Retry-After: 3600  (on 429)
 ```
+> DRF does **not** emit `X-RateLimit-Limit` / `-Remaining` / `-Reset`. The
+> three-header set shown in the historical section below is not implemented
+> and should not be relied on by any client.
 
 ### 429 Response
 ```json
@@ -65,15 +153,24 @@ Retry-After: 3600  (on 429)
 
 ## Current Limits Analysis
 
-| Endpoint | Auth | Limit | Risk |
-|----------|------|-------|------|
-| `/auth/login/` | Anon | 100/hr | Low (brute force) |
-| `/auth/register/` | Anon | 100/hr | Low |
-| `/feed/` | User | 1000/hr | **High** (feed spam) |
-| `/interactions/*/log-telemetry/` | User | 1000/hr | **Critical** (telemetry spam) |
-| `/clips/` | User | 1000/hr | Medium (upload spam) |
+| Endpoint | Auth | Scope | Limit | Key | Risk |
+|----------|------|-------|-------|-----|------|
+| `/auth/token/refresh/` | anon | `token_refresh` | 120/hr | verified user_id | Low (was **critical**: mass logout on CGNAT) |
+| `/auth/register/` | anon | `register` + `register_username` | 200/hr IP, 3/hr username | IP + username | Low (was **critical**: capped signup behind CGNAT) |
+| `/auth/login/` | anon | `login` | 10/min | IP | Low (brute force) |
+| `/interactions/*/log-telemetry/` | user | `telemetry` | 60/min | user | **Critical** (engagement-fraud vector) |
+| `/clips/` | user | `upload` | 20/hr | user | Medium (storage DoS) |
+| `/comments/` | user | `comment` | 60/hr | user | Low |
+| `/share/*/send-share/` | user | `share_send` | 100/hr | user | Low |
+| `/share/inbox/` | user | `share_poll` | 1000/hr | user | Low (30s polling) |
+| `/feed/` | user | `user` | 1000/hr | user | Medium — **shared** with every other authed call |
+| `/legal/`, `/grievance/`, `/data-subject/` | mixed | `legal` / `grievance` / `data_subject` | 30/hr, 10/hr, 5/hr | IP | Low |
+| `/media/playback-token/<id>/` | user | `playback_token` | 300/min | user | Low (was **unthrottled** — see A3) |
 
----
+> `/legal/`, `/grievance/` and `/data-subject/` keep IP-keyed limits by
+> design: they are user-initiated, low-frequency and low-volume, so sharing
+> a bucket across a cell is correct there rather than a bug.
+
 
 ## Critical Gaps (Architecture Audit)
 

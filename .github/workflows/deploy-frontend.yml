@@ -1,0 +1,136 @@
+# =============================================================================
+# EchoFlow — Frontend build, test and deploy to Cloudflare Pages
+#
+# The frontend is NOT served by docker-compose.vps.yml. It is a static Vite
+# bundle hosted on Cloudflare Pages, because the architecture already assumes
+# it: the HLS Worker's ALLOWED_ORIGINS, the Django CORS allowlist and
+# PUBLIC_APP_BASE_URL all name app.echoflow.in (see workers/hls-token-worker/
+# src/index.ts, backend/EchoFlow/settings.py, .env.vps.example).
+#
+# WHAT THIS DOES NOT COVER
+#   The Django backend. There is deliberately no backend test workflow — it
+#   is not needed as of now. The suite is run locally via
+#   `docker compose exec web_local pytest backend/app/tests/` before a release,
+#   not by this pipeline. Do not read a green run here as "the backend is
+#   verified"; it verifies the frontend only.
+#
+# REQUIRED SECRETS (Settings -> Secrets)
+#   CLOUDFLARE_API_TOKEN   Token with "Cloudflare Pages: Edit" permission,
+#                          scoped to this one account.
+#   CLOUDFLARE_ACCOUNT_ID  The account that owns the Pages project.
+#
+# REQUIRED VARIABLES (Settings -> Secrets and variables -> Variables)
+#   CLOUDFLARE_PAGES_PROJECT   The Pages project name, e.g. echoflow-app.
+#   VITE_API_BASE_URL          https://api.echoflow.in
+#
+#   VITE_API_BASE_URL is BUILD-TIME. It is the only import.meta.env read in
+#   the entire frontend (frontend/src/api/client.ts:20) and it falls back to
+#   http://localhost:18000 when unset. Ship a bundle without it and the app
+#   is dead on arrival: an https page fetching http://localhost is blocked as
+#   mixed content, with no error in CI and no build warning.
+#
+# SPA FALLBACK
+#   frontend/public/_redirects carries `/* /index.html 200`, which is what
+#   makes hard refreshes and shared `?clip=<id>` links work. It is committed,
+#   not configured in the Pages dashboard, so the fallback travels with the
+#   code and cannot drift from it.
+# =============================================================================
+
+name: Deploy Frontend to Cloudflare Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/deploy-frontend.yml'
+  # Manual run is how the FIRST deploy happens: this repo has never been on
+  # Pages, and main is still 82 commits behind feat/frontend-mvp, so there is
+  # nothing to trigger on until the merge lands.
+  workflow_dispatch:
+
+# Two pushes in quick succession must not race each other into the Pages
+# project; the later commit wins and the earlier upload is discarded.
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    name: Build, test and deploy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Matches .github/workflows/deploy-hls-worker.yml:25 so the two
+          # pipelines do not disagree about the runtime.
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        # `ci`, not `install`: this installs exactly what the lockfile pins and
+        # fails loudly if package.json and package-lock.json have drifted. That
+        # is the behaviour you want before a production deploy. If it fails
+        # with "lock file out of sync", run `npm install` locally and commit
+        # the updated lockfile.
+        run: npm ci
+
+      # Both run before the deploy so a type error or a broken component can
+      # never reach production. These are the same commands as
+      # `npm run lint` / `npm test` locally (tsc --noEmit, vitest run).
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 7
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # --commit-dirty=false: `git status` is clean here, and making wrangler
+          # fail on a dirty tree would only add a way for this step to break.
+          command: >
+            pages deploy dist
+            --project-name=${{ vars.CLOUDFLARE_PAGES_PROJECT }}
+            --branch=${{ github.ref_name }}
+            --commit-hash=${{ github.sha }}
+            --commit-message="${{ github.event.head_commit.message || 'manual deploy' }}"
+
+      - name: Summary
+        run: |
+          echo "### Deployed to Cloudflare Pages" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- project: \`${{ vars.CLOUDFLARE_PAGES_PROJECT }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- branch:  \`${{ github.ref_name }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- commit:  \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Verify the SPA fallback and the API origin before calling it done:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "curl -sI https://app.echoflow.in/feed | head -1      # expect 200, not 404" >> "$GITHUB_STEP_SUMMARY"
+          echo "curl -s  https://app.echoflow.in/feed | grep -c 'id=\"root\"'   # expect 1" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

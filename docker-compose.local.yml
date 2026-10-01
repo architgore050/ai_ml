@@ -6,6 +6,30 @@
 # and the laptop media worker (docker-compose.laptop.yml) simultaneously.
 #
 # Usage: docker compose -f docker-compose.local.yml up -d
+#
+#   ALWAYS pass --env-file .env.local:
+#     docker compose -f docker-compose.local.yml --env-file .env.local up -d
+#   The ${...} interpolations below resolve from the shell environment and
+#   from that --env-file, NOT from each service's `env_file:`. Omitting it
+#   silently targets a different DB password than the volume was created with.
+# =============================================================================
+#
+# DJANGO_DEBUG is interpolated, never a literal. A literal in `environment:`
+# wins over `env_file:` and cannot be overridden by .env.local at all — which
+# is why this file used to pin DJANGO_DEBUG=True in five places regardless of
+# what the operator wrote. That disabled the whole `if not DEBUG:` block
+# (SECURE_SSL_REDIRECT, HSTS, secure cookies) AND silently disabled Sentry in
+# every process, because backend/EchoFlow/sentry.py:26 also gates on
+# DJANGO_DEBUG != 'true'.
+#
+# Consequence of the fix: local now enforces SECURE_SSL_REDIRECT, so plain
+# HTTP to the app 301s. The paths that must keep working are already covered:
+#   - the web_local healthcheck sends X-Forwarded-Proto: https
+#   - docker/nginx.local.conf sets X-Forwarded-Proto https on the Django hop
+# Direct hits on the published 18000:8000 escape hatch must send that header
+# too, or go through nginx. Enforced by
+# backend/app/tests/test_env_file_hygiene.py and (for the healthcheck header)
+# test_https_termination.py::test_in_container_healthcheck_must_send_forwarded_proto.
 # =============================================================================
 
 services:
@@ -209,8 +233,8 @@ services:
       - REDIS_CACHE_PORT=6379
       - REDIS_CACHE_PASSWORD=${REDIS_CACHE_PASSWORD}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
-      - DJANGO_DEBUG=True
-      - DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1
+      - DJANGO_DEBUG=${DJANGO_DEBUG:-False}
+      - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS}
       - GUNICORN_WORKERS=2
       - GUNICORN_THREADS=2
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
@@ -219,7 +243,7 @@ services:
       - AWS_S3_ENDPOINT_URL=http://minio-local:9000
       - AWS_S3_REGION_NAME=auto
       - AWS_S3_QUERYSTRING_EXPIRE=3600
-      - PUBLIC_MEDIA_ENDPOINT_URL=http://localhost:19000
+      - PUBLIC_MEDIA_ENDPOINT_URL=${PUBLIC_MEDIA_ENDPOINT_URL}
       # Browser-facing HLS origin: the nginx :9443 listener (published as
       # 19443), which routes /hls/* to the HLS token Worker. Setting it also
       # flips HLS_URL_STYLE to "edge", which is what makes the emitted URLs
@@ -227,7 +251,7 @@ services:
       # as a path segment, and the Worker rejects any path not starting
       # /hls/. Left unset, HLS URLs keep the bucket-prefixed MinIO form and
       # would 404 at the Worker.
-      - PUBLIC_HLS_ENDPOINT_URL=https://localhost:19443
+      - PUBLIC_HLS_ENDPOINT_URL=${PUBLIC_HLS_ENDPOINT_URL}
       # Must match the Worker's MEDIA_TOKEN_SECRET. The run script
       # (scripts/run-hls-worker-local.sh) generates the Worker's .dev.vars from
       # this same value so the two cannot drift.
@@ -243,6 +267,11 @@ services:
       - .:/app
     ports:
       - "18000:8000"
+    networks:
+      default:
+        aliases:
+          # Keep the shared Prometheus configuration addressable locally.
+          - web
     depends_on:
       db_local:
         condition: service_healthy
@@ -290,7 +319,7 @@ services:
       - REDIS_CACHE_PORT=6379
       - REDIS_CACHE_PASSWORD=${REDIS_CACHE_PASSWORD}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
-      - DJANGO_DEBUG=True
+      - DJANGO_DEBUG=${DJANGO_DEBUG:-False}
       - SENTRY_DSN=${SENTRY_DSN:-}
       - SENTRY_ENV=development
     healthcheck:
@@ -326,7 +355,7 @@ services:
       - REDIS_CACHE_PORT=6379
       - REDIS_CACHE_PASSWORD=${REDIS_CACHE_PASSWORD}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
-      - DJANGO_DEBUG=True
+      - DJANGO_DEBUG=${DJANGO_DEBUG:-False}
       - SENTRY_DSN=${SENTRY_DSN:-}
       - SENTRY_ENV=development
     healthcheck:
@@ -348,9 +377,17 @@ services:
         - hf_token
     container_name: echoflow_celery_media_local
     restart: unless-stopped
+    # --concurrency=1, not 2 (2026-09-29): with --pool=prefork each child
+    # process loads its OWN copy of the ML models on first task
+    # (faster_whisper 'base' int8 ~75MB + all-MiniLM-L6-v2 ~90MB + KeyBERT's
+    # default MiniLM ~90MB), then holds an ffmpeg subprocess and a decoded
+    # librosa array for the whole track. Two children × that working set
+    # exceeds the 2G limit below on a 12GB host that is also running a
+    # desktop, which is the OOM AGENTS.md records for this service.
+    # One child halves the peak and still saturates a queue this size.
     command: >
       sh -c "set -e && python wait_for_db.py &&
-              celery -A backend.EchoFlow worker -Q heavy_media --pool=prefork --concurrency=2 --loglevel=info"
+              celery -A backend.EchoFlow worker -Q heavy_media --pool=prefork --concurrency=1 --loglevel=info"
     env_file:
       - .env.local
     depends_on:
@@ -369,7 +406,7 @@ services:
       - REDIS_CACHE_PORT=6379
       - REDIS_CACHE_PASSWORD=${REDIS_CACHE_PASSWORD}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
-      - DJANGO_DEBUG=True
+      - DJANGO_DEBUG=${DJANGO_DEBUG:-False}
       - SENTRY_DSN=${SENTRY_DSN:-}
       - SENTRY_ENV=development
       - HF_HOME=/home/appuser/.cache/huggingface
@@ -388,7 +425,7 @@ services:
       - AWS_S3_ENDPOINT_URL=http://minio-local:9000
       - AWS_S3_REGION_NAME=auto
       - AWS_S3_QUERYSTRING_EXPIRE=3600
-      - PUBLIC_MEDIA_ENDPOINT_URL=http://localhost:19000
+      - PUBLIC_MEDIA_ENDPOINT_URL=${PUBLIC_MEDIA_ENDPOINT_URL}
     deploy:
       resources:
         limits:
@@ -427,7 +464,7 @@ services:
       - REDIS_CACHE_PORT=6379
       - REDIS_CACHE_PASSWORD=${REDIS_CACHE_PASSWORD}
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY}
-      - DJANGO_DEBUG=True
+      - DJANGO_DEBUG=${DJANGO_DEBUG:-False}
       - SENTRY_DSN=${SENTRY_DSN:-}
       - SENTRY_ENV=development
     healthcheck:
@@ -554,4 +591,3 @@ volumes:
 secrets:
   hf_token:
     environment: HF_TOKEN
-

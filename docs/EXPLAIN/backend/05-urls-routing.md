@@ -43,6 +43,19 @@ from .views import (
     TagsViewSet, SuggestionViewSet, RegisterView, ProfileViewSet
 )
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from .throttling import RefreshTokenRateThrottle
+
+# Both token endpoints are rate-limited, and both declare `throttle_scope` on
+# the VIEW — `ScopedRateThrottle` reads it there and allows everything when
+# it is absent, so omitting the attribute is a silent no-op.
+class ThrottledTokenObtainPairView(TokenObtainPairView):
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'login'
+
+class ThrottledTokenRefreshView(TokenRefreshView):
+    throttle_classes = [RefreshTokenRateThrottle]  # keyed on the verified subject
+    throttle_scope = 'token_refresh'
+
 
 router = DefaultRouter()
 router.register(r'feed', FastFeedViewSet, basename='feed')
@@ -59,7 +72,7 @@ urlpatterns = [
     path('', include(router.urls)),
     path('auth/login/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('auth/register/', RegisterView.as_view(), name='register'),
-    path('auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('auth/token/refresh/', ThrottledTokenRefreshView.as_view(), name='token_refresh'),
     # NOTE: no /media/ route — media served via S3/MinIO signed URLs
 ]
 ```
@@ -71,9 +84,9 @@ urlpatterns = [
 ### Authentication
 | Method | Endpoint | View | Auth |
 |--------|----------|------|------|
-| POST | `/auth/register/` | `RegisterView` | Public |
+| POST | `/auth/register/` | `RegisterView` (200/hr per IP + 3/hr per username) | Public |
 | POST | `/auth/login/` | `TokenObtainPairView` | Public |
-| POST | `/auth/token/refresh/` | `TokenRefreshView` | Public |
+| POST | `/auth/token/refresh/` | `ThrottledTokenRefreshView` | Public |
 
 ### Clips (AudioUploadViewSet)
 | Method | Endpoint | Action | Auth |

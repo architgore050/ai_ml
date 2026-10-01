@@ -43,6 +43,9 @@ class TestRegisterSerializerRegulatory:
             'password': 'testpass123',
             'consent_accepted': True,
             'terms_version': 'v1.0',
+            # B1 (2026-09-29): dob is required. An adult DOB keeps this test
+            # on the adult path so it stays a pure consent-audit assertion.
+            'dob': '1990-01-01',
         })
         assert resp.status_code == 201
         from backend.app.models import ConsentAudit, User

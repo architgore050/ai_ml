@@ -9,7 +9,7 @@ from rest_framework.response import Response
 from ..models import AudioClip, UserInteraction
 from ..serializers import (
     FeedClipSerializer, OwnProfileSerializer, PublicProfileSerializer,
-    ProfileUpdateSerializer,
+    ProfileUpdateSerializer, following_annotation,
 )
 from ._pagination import FeedCursorPagination
 
@@ -65,8 +65,29 @@ class ProfileViewSet(viewsets.ViewSet):
         )
         clips = (
             AudioClip.objects
-            .filter(creator=target, status='ready')
+            # SECURITY: Same gate as every other clip-listing path —
+            # /feed/ (feed.py:111+115), its degraded fallback (:135+137) and
+            # /suggestions/ (:183-187). This queryset was `creator` +
+            # status='ready' only, which made it the sole endpoint in the
+            # codebase that published NonCommercial, ShareAlike and
+            # unapproved clips. The A4 licence work closed that gap
+            # everywhere else; this was the partial fix.
+            #
+            # `status='ready'` is NOT a substitute for moderation_approved:
+            # process_audio_to_hls sets status='ready' after the worker-side
+            # check, so a retry can leave a clip ready while
+            # moderation_approved reads False. The two flags are independent.
+            .filter(
+                creator=target,
+                status='ready',
+                moderation_approved=True,
+                is_noncommercial=False,
+                requires_share_alike=False,
+            )
             .annotate(user_has_liked=Exists(user_like_subquery))
+            # B2: annotate alongside user_has_liked so the whole page of clips
+            # costs one follow query, not one per clip.
+            .annotate(**following_annotation(request.user))
             .order_by('-created_at')
         )
         paginator = FeedCursorPagination()

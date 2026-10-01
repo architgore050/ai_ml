@@ -28,6 +28,9 @@ class TestRegister:
             'password': 'secure-pwd-1234',
             'consent_accepted': True,
             'terms_version': 'v1.0',
+            # B1 (2026-09-29): dob is required (was optional, so a client
+            # could dodge the age gate by omission).
+            'dob': '1990-01-01',
         }, format='json')
         assert r.status_code == 201, r.data
 

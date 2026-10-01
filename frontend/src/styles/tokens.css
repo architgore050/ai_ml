@@ -1,0 +1,413 @@
+/* EchoFlow design tokens.
+ *
+ * Ported verbatim from sample_frontend2/src/styles/globals.css (preserved in
+ * git as 20451d3) — the only real design system in the repo. Material-3-shaped
+ * scale: midnight surfaces, terracotta brand, sage secondary, honey-gold
+ * tertiary. `docs/EXPLAIN/frontend/` and the old audit docs do not carry these
+ * values, so this file is the source of truth.
+ *
+ * Differences from the original, all deliberate:
+ *   - the three `@tailwind base/components/utilities` directives are gone.
+ *     index.css uses Tailwind 4's `@import "tailwindcss"`, which generates
+ *     its own layers; the original directives were never processed there.
+ *   - the `@layer base` / `@layer components` wrappers are gone. They were
+ *     ranking every rule below unlayered inline styles and only worked by
+ *     accident, because the tokens and @keyframes had no unlayered rival.
+ *
+ * Component styles are now authored as Tailwind utilities against these
+ * variables (e.g. `bg-[var(--surface-container)]`), not inline style objects.
+ */
+
+:root {
+  /* Surfaces — midnight */
+  --surface: #121416;
+  --surface-dim: #121416;
+  --surface-bright: #38393c;
+  --surface-container-lowest: #0c0e10;
+  --surface-container-low: #1a1c1e;
+  --surface-container: #1e2022;
+  --surface-container-high: #282a2c;
+  --surface-container-highest: #333537;
+  --surface-variant: #333537;
+
+  /* On-surface */
+  --on-surface: #e2e2e5;
+  --on-surface-variant: #d5c3b9;
+  --outline: #9d8e84;
+  --outline-variant: #51443d;
+
+  /* Brand
+   *
+   * CONTRAST — read before using `--terracotta` (or `--accent`, which aliases
+   * it) for anything:
+   *
+   *   - NEVER white on terracotta. `#ffffff` on `#e8a87c` measures 2.03:1 —
+   *     worse than the `#FF6321` the components hardcode today, where white is
+   *     2.98:1. As a *fill*, terracotta requires near-black text: `#0A0A0A` on
+   *     `#e8a87c` is 9.73:1.
+   *   - The app is disciplined about `text-black` on brand fills, so this is a
+   *     prospective hazard rather than a live failure. It is recorded because
+   *     the migration from `#FF6321` to this token is deliberately deferred,
+   *     and the reason for the deferral is that the migration is
+   *     contrast-positive for every pattern currently in use.
+   *   - As *text* it passes everywhere: 9.73:1 on `#0A0A0A` (the feed root at
+   *     `App.tsx:64`), 9.08:1 on `--background`.
+   *   - `ErrorBoundary` pairs `--accent` with `--on-error`, which measures
+   *     6.44:1 here against 4.40:1 for `#FF6321` — the migration repairs a
+   *     live AA failure there.
+   */
+  --terracotta: #e8a87c;
+  --accent: var(--terracotta);
+  --accent-hover: #d4956a;
+  --sage: #aad0b1;
+  --secondary: var(--sage);
+  --honey-gold: #f1ce6d;
+  --tertiary: #f1ce6d;
+
+  /* Semantic */
+  --error: #ffb4ab;
+  --danger: var(--error);
+  --on-error: #690005;
+  --background: #121416;
+  --on-background: #e2e2e5;
+  --surface-overlay: rgba(18, 20, 22, 0.6);
+  --accent-soft: rgba(232, 168, 124, 0.12);
+  --accent-glow: rgba(232, 168, 124, 0.25);
+  --success: var(--sage);
+  --success-soft: rgba(170, 208, 177, 0.12);
+  --text-primary: var(--on-surface);
+  --text-secondary: var(--on-surface-variant);
+  --text-tertiary: var(--outline);
+  /* CONTRAST — `--border` is a *non-text* token, so the bar is 3:1 (WCAG
+   * 1.4.11), not 4.5:1. `--outline-variant` measures 2.12:1 on `#0A0A0A` and
+   * 1.97:1 on `--background`, so decorative borders drawn from it are a live
+   * 1.4.11 failure. `--border-strong` (→ `--outline`) clears 6.26:1.
+   *
+   * NOT changed here. Raising it means lightening every border in the app, and
+   * the value to pick is a design decision, not an accessibility patch — the
+   * same reasoning that keeps `--tap-target`'s 64px from being applied blind.
+   * Recorded so the next pass starts from the measurement. */
+  --border: var(--outline-variant);
+  --border-strong: var(--outline);
+
+  /* Focus indicator. White, matching the ring `BottomNav` already draws on its
+   * brand-filled "Create" tab: `#FF6321` fills that tab in both states, so a
+   * brand-coloured ring would be invisible on it. Measured 19.8:1 on `#0A0A0A`. */
+  --focus-ring: #ffffff;
+
+  /* Typography */
+  --font-display: 'Lexend', system-ui, -apple-system, sans-serif;
+  --font-body: 'Lexend', system-ui, -apple-system, sans-serif;
+
+  /* Shapes */
+  --radius-sm: 0.5rem;
+  --radius-md: 1.5rem;
+  --radius-lg: 2rem;
+  --radius-xl: 3rem;
+  --radius-full: 9999px;
+
+  /* Layout */
+  --margin-mobile: 20px;
+  --gutter-md: 16px;
+  --interaction-stack: 24px;
+  /* Previously referenced by nothing at all, which is why nine controls sit
+   * below the WCAG 2.2 AA 2.5.8 floor of 24px. Now wired to `.tap-target`.
+   *
+   * 64px is a design target, not a compliance floor: 2.5.8 (AA) asks for 24px
+   * and 2.5.5 (AAA) for 44px. Applying it reflows every compact control row —
+   * the ReelCard transport, the comment footer, the mini player's three
+   * buttons — so it is applied per-site, not globally. See the utility. */
+  --tap-target: 64px;
+  --content-max: 470px;
+  --nav-clearance: 100px;
+
+  /* Motion */
+  --transition: 0.2s ease;
+  --ease-pop: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-slide: cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+/* DEAD AND UNSAFE — this block is unreachable and would break the app if it
+ * were reached. `data-theme` is set nowhere in `src/` (nothing reads or writes
+ * it), and enabling it would not theme the app: every component hardcodes
+ * `#0A0A0A` (the root div at `App.tsx:64`), `#111111` (card surfaces) and
+ * `#F5F5F5` (body text), so a full-viewport near-black root div would sit on
+ * top of the light palette. It would break, not work.
+ *
+ * It is also missing a darkened `--accent`, which is the reason it cannot be
+ * rescued by flipping the attribute: terracotta as text on this block's
+ * `--background` measures 1.80:1, and 1.75:1 on `--surface-container`.
+ *
+ * Recommendation: DELETE this block. Reviving a light theme is a migration of
+ * all nine hardcoded-colour component files plus a design pass on the brand
+ * colour, which is a feature — not something to smuggle in on an
+ * accessibility pass. Left in place, annotated, so the next person who reaches
+ * for the attribute finds the measurement instead of shipping a black screen. */
+[data-theme="light"] {
+  --surface: #f5f0eb;
+  --surface-dim: #ede7e0;
+  --surface-bright: #ffffff;
+  --surface-container-lowest: #ffffff;
+  --surface-container-low: #f9f5f0;
+  --surface-container: #f2ede6;
+  --surface-container-high: #eae4dc;
+  --surface-container-highest: #e2dcd4;
+  --surface-variant: #e2d8cf;
+  --on-surface: #2f3133;
+  --on-surface-variant: #5c4f47;
+  --outline: #8e7f75;
+  --outline-variant: #c0b2a8;
+  --background: #f5f0eb;
+  --on-background: #2f3133;
+  --accent-soft: rgba(232, 168, 124, 0.1);
+  --accent-glow: rgba(232, 168, 124, 0.2);
+  --success-soft: rgba(44, 78, 54, 0.1);
+  --surface-overlay: rgba(245, 240, 235, 0.6);
+  --border: var(--outline-variant);
+  --border-strong: var(--outline);
+}
+
+html {
+  font-size: 16px;
+  scroll-behavior: smooth;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: var(--font-body);
+  color: var(--text-primary);
+  background: var(--background);
+  min-height: 100vh;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--outline-variant);
+  border-radius: var(--radius-full);
+}
+
+/* Category colours. `AudioClip.category` is a free-text CharField
+ * (models.py, no choices), so this is a branded-subset lookup with a neutral
+ * fallback rather than a closed enum — the 6 legacy categories already in the
+ * DB and any scraped clip both render neutral rather than mis-colouring.
+ * `/suggestions/?category=` matches by exact string, so the keys here must
+ * stay byte-identical to the values stored. */
+:root {
+  --cat-instrumental: #00e5a0;
+  --cat-funny: #f59e0b;
+  --cat-news: #60a5fa;
+  --cat-science: #8b5cf6;
+  --cat-music: #ff6b35;
+  --cat-neutral: var(--outline);
+}
+
+@keyframes shimmer {
+  0% { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
+}
+@keyframes popIn {
+  0% { transform: scale(0.8); opacity: 0; }
+  70% { transform: scale(1.05); }
+  100% { transform: scale(1); opacity: 1; }
+}
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes slideUp {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+@keyframes waveBar {
+  0%, 100% { transform: scaleY(0.25); }
+  50% { transform: scaleY(1); }
+}
+@keyframes ripple {
+  0% { transform: scale(1); opacity: 0.6; }
+  100% { transform: scale(2.5); opacity: 0; }
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes toastIn {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+.skeleton {
+  background: linear-gradient(90deg, var(--surface-container) 25%, var(--surface-container-high) 50%, var(--surface-container) 75%);
+  background-size: 800px 100%;
+  animation: shimmer 1.4s infinite linear;
+  border-radius: var(--radius-sm);
+}
+.glass {
+  background: var(--surface-overlay);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+.pop-in { animation: popIn 0.35s var(--ease-pop) forwards; }
+.fade-up { animation: fadeUp 0.3s ease forwards; }
+.slide-up { animation: slideUp 0.32s var(--ease-slide) forwards; }
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+/* ---------------------------------------------------------------------------
+ * Focus indicator (WCAG 2.2 2.4.7 Focus Visible, AA)
+ *
+ * The app carried 11 `focus:outline-none` declarations, which delete the
+ * browser's focus ring outright, and until now nothing anywhere replaced it.
+ * The files that removed theirs are relying on this rule.
+ *
+ * Scoped to genuinely interactive elements rather than `:focus-visible` alone:
+ * an unqualified rule also matches a `tabindex="-1"` container that was focused
+ * programmatically, which would draw an outline around a whole dialog the
+ * moment focus moved into it.
+ *
+ * `outline` rather than `box-shadow`/`ring` so it follows the element's border
+ * radius, survives `overflow: hidden` on an ancestor better than a shadow does,
+ * and — critically — cannot be removed by a later `focus-visible:ring-*` utility
+ * that a component happens to declare. `BottomNav`'s "Create" tab keeps its
+ * white `focus-visible:ring-2`; this outline is additive to it, and both are
+ * white, so the tab still reads.
+ *
+ * `outline-offset: 2px` puts the indicator in the page background rather than
+ * on the control's own fill. That matters for the brand-filled tabs: a ring
+ * drawn *on* `#FF6321` in white would be 2.98:1, while white offset onto the
+ * `#0A0A0A` page behind it is 19.8:1.
+ *
+ * LOAD-BEARING: this rule has to stay *unlayered*. Five `focus:outline-none`
+ * utilities survive in components this pass did not own — `Profile.tsx:725`,
+ * `:830`, `:854`, `CommentSheet.tsx:699`, `ShareModal.tsx:352` — and Tailwind
+ * emits `outline-none` inside `@layer utilities`. Unlayered normal declarations
+ * beat layered ones regardless of specificity, which is what lets this rule
+ * restore the ring under all five without editing them. Moving this file into a
+ * cascade layer would silently hand those five back their deleted focus ring, so
+ * it is verified in the built stylesheet by `npx vite build` + grep, not by
+ * jsdom.
+ * ------------------------------------------------------------------------- */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+summary:focus-visible,
+[role="button"]:focus-visible,
+[role="slider"]:focus-visible,
+[role="tab"]:focus-visible,
+[tabindex]:not([tabindex="-1"]):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------------------
+ * `.tap-target` — the minimum hit area, wired to the `--tap-target` token.
+ *
+ * This is the one line that can lift a whole family of controls over the
+ * WCAG 2.2 AA 2.5.8 floor (24x24 CSS px) at once, which matters because the
+ * controls that fail it are icon buttons with no text to give them size.
+ *
+ * Two constraints on its use, both from the token's value:
+ *   1. `--tap-target` is 64px, which is a design target rather than a
+ *      compliance floor. Inside a compact horizontal control row this reflows
+ *      the layout — the mini player's bar would go from ~60px to ~88px tall.
+ *      So it is a per-site decision, not a blanket class.
+ *   2. It is a *floor*, so a control that is deliberately larger keeps its own
+ *      size; only undersized controls grow.
+ *
+ * The app has no shared icon-button primitive — the controls that fail 2.5.8
+ * are hand-rolled in eight different files, which is why no single component
+ * edit can reach them and why this class has to.
+ * ------------------------------------------------------------------------- */
+.tap-target {
+  min-block-size: var(--tap-target);
+  min-inline-size: var(--tap-target);
+}
+
+/* ---------------------------------------------------------------------------
+ * Category colour utilities.
+ *
+ * The six `--cat-*` values were declared here and referenced nowhere, so every
+ * category chip in the app was painted from a hardcoded brand hex instead. Each
+ * utility below is the wiring.
+ *
+ * These set `color`, because that is how the chips render the category: a short
+ * label in the category's colour on the clip surface. Measured against the
+ * darkest surface any of them land on, `#0A0A0A`:
+ *
+ *   --cat-instrumental 11.99:1   --cat-funny   9.22:1   --cat-news    7.79:1
+ *   --cat-science       4.68:1   --cat-music   6.98:1   --cat-neutral 6.26:1
+ *
+ * `--cat-science` is the tightest and clears 4.5:1 by 0.18; against
+ * `--surface-container` (`#1e2022`) it drops to 4.15:1 and would need a
+ * lightened value. Recorded so that is not discovered as a bug report.
+ *
+ * The class names are the lookup keys, and `/suggestions/?category=` matches by
+ * exact string, so they must stay byte-identical to the values stored.
+ * ------------------------------------------------------------------------- */
+.cat-instrumental { color: var(--cat-instrumental); }
+.cat-funny { color: var(--cat-funny); }
+.cat-news { color: var(--cat-news); }
+.cat-science { color: var(--cat-science); }
+.cat-music { color: var(--cat-music); }
+.cat-neutral { color: var(--cat-neutral); }
+
+/* ---------------------------------------------------------------------------
+ * Reduced motion (WCAG 2.2 2.3.3 Animation from Interactions is AAA, but 2.2.2
+ * Pause/Stop/Hide is AA and the feed's auto-advance has no stop control).
+ *
+ * There was no media query of any kind in `src/` before this block. What it has
+ * to neutralise:
+ *   - `html { scroll-behavior: smooth }`, ungated, which affects every scroll in
+ *     the app including the feed's `scrollIntoView({ behavior: "smooth" })`
+ *     auto-advance. This is the motion a user is most likely to be bothered by
+ *     and the only one with no opt-out anywhere.
+ *   - `.skeleton`'s `shimmer 1.4s infinite linear` — the one genuinely
+ *     unbounded animation in the stylesheet.
+ *   - Tailwind's `animate-pulse` (the brand dot, the upload success screen) and
+ *     `animate-spin` (three loading spinners), which are emitted by the
+ *     utility layer and therefore cannot be edited here one at a time.
+ *
+ * Scoped to the universal selector inside the query, with `!important`, because
+ * the Tailwind utilities live in a cascade layer and an unlayered rule of equal
+ * specificity would lose to them. This is the standard reset for the problem.
+ *
+ * `0.01ms` rather than `0s` deliberately: some code waits on `transitionend` /
+ * `animationend`, and a zero duration can leave a listener that never fires.
+ * `animation-iteration-count: 1` is what actually *stops* the animations —
+ * shortening the duration alone would leave `animate-pulse` running fast for
+ * ever instead of removing it.
+ *
+ * What this does NOT do, and cannot: the player's 60 fps `requestAnimationFrame`
+ * loop in `stores/player.tsx` re-renders the whole card tree on every tick,
+ * including while paused. That is a JS loop, not a CSS animation, so no media
+ * query reaches it. It needs a guard on `isPlaying`.
+ * ------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}

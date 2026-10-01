@@ -15,11 +15,35 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # key per process would silently break session/CSRF/signature
 # verification across the gunicorn + Celery fleet — every worker would
 # have a different key.
+#
+# DECISION (placeholder guard): also fail on a *documentation* placeholder.
+# `if not SECRET_KEY` only catches the empty string, and every tracked env
+# template ships `DJANGO_SECRET_KEY=change-me-to-a-long-random-string`
+# (.env.example, .env.vps.example) or `<same-as-vps>` (.env.laptop.example).
+# An operator who copies an example and deploys it unchanged gets a key that
+# is public knowledge in this repository, which breaks session and CSRF
+# signing, password-reset tokens, and every `django.core.signing.Signer` use.
+#
+# The predicate and the escape hatch live in `EchoFlow/secrets.py` so that
+# `app/services/hls_token.py` and this module share one vocabulary instead of
+# one importing the other. See that module's docstring for the two documented
+# bypasses (`ECHOFLOW_ALLOW_PLACEHOLDER_SECRETS=1` and `DJANGO_DEBUG=true`)
+# and for the false positives the substring rule accepts on purpose.
+from backend.EchoFlow.secrets import require_real_secret, testing_enabled
+
 SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY')
 if not SECRET_KEY:
     raise ImproperlyConfigured(
         "DJANGO_SECRET_KEY is not set. Application cannot start without it."
     )
+SECRET_KEY = require_real_secret(
+    "DJANGO_SECRET_KEY",
+    SECRET_KEY,
+    purpose="Django's signing key (sessions, CSRF, password resets)",
+    generate=(
+        'python -c "import secrets; print(secrets.token_urlsafe(64))"'
+    ),
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DJANGO_DEBUG', 'False').lower() == 'true'
@@ -32,17 +56,40 @@ CORS_ALLOWED_ORIGINS = os.environ.get('DJANGO_CORS_ALLOWED_ORIGINS', 'http://loc
 # to False on line 63, making the env var dead code. Removed for clarity.
 CORS_ALLOW_ALL_ORIGINS = False
 
-# N14 fix: CORS_URLS_REGEX was r'^.*$' which sent CORS headers to
-# every URL (including /admin/, /auth/, /metrics/). The actual security
-# boundary is CORS_ALLOWED_ORIGINS, but the wide regex serves no
-# purpose. The /media/ Django route was removed when S3Storage was
-# adopted (per docs/stateful-media-storage-at-scale.md and
-# media_urls.py:18-37 — playback URLs come from signed S3 URLs, not
-# from a Django route). Set to an empty regex (never matches) so
-# django-cors-headers never applies CORS via the regex path. The
-# middleware will still apply CORS_ALLOWED_ORIGINS to all responses
-# that flow through its check_origin method.
-CORS_URLS_REGEX = r'$.^'  # matches nothing (negative lookahead on start)
+# CORS: match every path EXCEPT /admin/ and /metrics/, which no browser
+# origin legitimately calls.
+#
+# HISTORY — this was previously r'$.^' ("match nothing"), on the reasoning
+# that the origin allowlist would still be applied "to all responses that
+# flow through its check_origin method". That method does not exist.
+# django-cors-headers 4.9.0 gates the entire middleware on
+#     is_enabled = re.match(CORS_URLS_REGEX, path_info) or check_signal(req)
+# and check_signal() only fires the `check_request_enabled` signal, to which
+# nothing in this repo subscribes. So the regex matched nothing, is_enabled
+# was always False, and NO response ever carried Access-Control-*.
+# In production the frontend is a separate origin by design
+# (Cloudflare Pages app.echoflow.in -> API api.echoflow.in), so every
+# browser request was rejected at preflight and the deployed app could not
+# function at all.
+#
+# The regex is NOT the security boundary and must not be treated as one.
+# CORS_ALLOWED_ORIGINS (above) is: a response only gets
+# Access-Control-Allow-Origin when the request's Origin is allowlisted, and
+# CORS_ALLOW_ALL_ORIGINS is False. Sending headers to a non-allowlisted
+# origin is inert — that origin's JS cannot read them.
+#
+# Note /auth/ is deliberately NOT excluded, despite an earlier comment
+# suggesting it. Login and token refresh are cross-origin browser calls; the
+# same is true of /media/playback-token/ for the HLS cookie handshake.
+CORS_URLS_REGEX = r'^(?!/(admin|metrics)/).*$'
+
+# Required for the HLS handshake: the playback-token endpoint sets the
+# HttpOnly `ef_hls_token` cookie and the client sends
+# `credentials: 'include'` (see frontend/src/api/client.ts getPlaybackToken).
+# Without this the browser drops the Set-Cookie and every /hls/* request 403s
+# even with a valid token. Safe alongside the allowlist: the library echoes
+# the specific allowlisted origin, never `*`.
+CORS_ALLOW_CREDENTIALS = True
 
 CORS_ALLOW_METHODS = [
     'GET',
@@ -66,6 +113,10 @@ CORS_ALLOW_HEADERS = [
 CORS_EXPOSE_HEADERS = [
     'Content-Range',   # ← browser needs this to know segment boundaries
     'Accept-Ranges',
+    # ← the client is required to honour 429 backoff. DRF sends this on every
+    #   throttle response; without exposing it the browser hides it from JS
+    #   on a cross-origin request and the client cannot back off.
+    'Retry-After',
 ]
 
 # Application definition
@@ -201,6 +252,46 @@ if DATABASES['default'].get('ENGINE', '').endswith('postgresql'):
     )
     DATABASES['default']['OPTIONS']['connect_timeout'] = 10
 
+# DECISION (placeholder guard): the *effective* database password is guarded
+# here, and the earlier claim that it was not reachable in-process was wrong.
+#
+# `settings.py` does not read the `DB_PASSWORD` env var — it builds DATABASES
+# with `dj_database_url.config(DATABASE_URL)`, and every compose file builds
+# `DATABASE_URL` *from* `DB_PASSWORD`::
+#
+#     DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+#
+# so the value the process actually authenticates with is
+# `DATABASES['default']['PASSWORD']`. Checking the env var NAME was checking
+# the wrong thing: the name is genuinely absent from this module, and the
+# secret is not. It is checked here rather than at the top of the file
+# because this is the first point at which the value exists.
+#
+# `.env.example` and `.env.vps.example` ship `DB_PASSWORD=change-me-strong-password`
+# and `.env.laptop.example` ships `DB_PASSWORD=<same-as-vps>`, both committed to
+# this repository in plain text, so a deployment that copies a template
+# unchanged hands anyone who has read the repo the whole database: every user
+# row, every password hash, and the DPDP §8(5) erasure records.
+#
+# An EMPTY password is not a placeholder failure and is deliberately not
+# treated as one. There is no `if not SECRET_KEY` raise above for the same
+# reason: bare-metal development against a local Postgres that trusts the
+# socket, or a `DATABASE_URL` with no credential at all, is a legitimate
+# configuration. What is rejected is a value that looks like documentation.
+# `require_real_secret` applies the same two documented bypasses as
+# `DJANGO_SECRET_KEY` and the Redis passwords — see `EchoFlow/secrets.py`.
+_DB_PASSWORD = DATABASES['default'].get('PASSWORD')
+if _DB_PASSWORD:
+    DATABASES['default']['PASSWORD'] = require_real_secret(
+        "DB_PASSWORD",
+        _DB_PASSWORD,
+        purpose=(
+            "the PostgreSQL server (every table, every user row, password "
+            "hashes and the DPDP §8(5) erasure records)"
+        ),
+        generate='python -c "import secrets; print(secrets.token_urlsafe(32))"',
+    )
+
 # DECISION: optional 'read' connection for routing pure reads to a
 # PostgreSQL streaming replica. See backend/app/db_routers.py and
 # docs/EXPLAIN/database/05-read-replica-design.md. The replica is not
@@ -244,16 +335,117 @@ REDIS_URL = os.getenv("REDIS_URL", REDIS_URL_DEFAULT)
 
 # Build Redis URL from components if full URL not provided
 def build_redis_url(prefix: str) -> str:
-    """Build Redis URL from individual components."""
+    """Build Redis URL from individual components.
+
+    Components exist at all because Redis passwords in this repo are base64
+    and contain `+`, `/` and `=`, which break Kombo's URL parsing. So
+    `{prefix}_HOST` / `_PORT` / `_PASSWORD` are the compose-managed form and
+    the URL is assembled (and password-encoded) here.
+
+    DECISION (fail closed on a missing credential): the old code was
+
+        if host and password:
+            return f"redis://:{quote(password)}@{host}:{port}/0"
+        return REDIS_URL
+
+    so `HOST` set with a blank `PASSWORD` silently returned `REDIS_URL` —
+    whose default is the *unauthenticated* `redis://localhost:6379/1`. That
+    is a fail-open on a credential: no log, no warning, and it lands on a
+    different server than the one that was configured. A known password is
+    better than no password and an operator error, so this now raises.
+
+    The legitimate password-less case — neither `HOST` nor `PASSWORD` set,
+    which is bare-metal `redis-server` on localhost — is untouched and still
+    falls back to `REDIS_URL`.
+    """
+    from urllib.parse import quote
+
     host = os.getenv(f"{prefix}_HOST")
     port = os.getenv(f"{prefix}_PORT", "6379")
-    password = os.getenv(f"{prefix}_PASSWORD")
+    # `not password` misses whitespace-only, which is truthy and would produce
+    # a URL with an empty credential — a silent fail-open again.
+    password = (os.getenv(f"{prefix}_PASSWORD") or "").strip()
+    if host and not password:
+        raise ImproperlyConfigured(
+            f"{prefix}_HOST is set to {host!r} but {prefix}_PASSWORD is empty. "
+            f"Refusing to fall back to REDIS_URL ({REDIS_URL!r}), which is "
+            f"usually an unauthenticated local Redis: that would be a "
+            f"fail-open on a credential — silent, and pointed at a different "
+            f"server than the one you configured. Either set {prefix}_PASSWORD "
+            f"to the value in the Redis service's config, or unset "
+            f"{prefix}_HOST as well to use the single-Redis REDIS_URL form "
+            f"for non-Docker development."
+        )
     if host and password:
+        # DECISION (placeholder guard): a non-empty password is not
+        # automatically a real one. `.env.vps.example` ships
+        # `REDIS_BROKER_PASSWORD=change-me-strong-password` and
+        # `.env.laptop.example` ships `<same-as-vps>` for both, so a copied
+        # template would otherwise give anyone who has read this repository
+        # full access to the broker (arbitrary task injection) and the cache.
+        # Reusing `require_real_secret` keeps one vocabulary across
+        # DJANGO_SECRET_KEY, MEDIA_TOKEN_SECRET and these two.
+        password = require_real_secret(
+            f"{prefix}_PASSWORD",
+            password,
+            purpose=(
+                f"the {prefix.lower()} Redis service (task injection and "
+                f"cache/session contents)"
+            ),
+            generate=(
+                f"python -c \"import secrets; "
+                f"print(secrets.token_urlsafe(32))\""
+            ),
+        )
         # URL-encode the password to handle special characters
-        from urllib.parse import quote
         encoded_password = quote(password, safe='')
         return f"redis://:{encoded_password}@{host}:{port}/0"
     return REDIS_URL
+
+
+def resolve_redis_url(prefix: str) -> str:
+    """Resolve a Redis URL, with an explicit and non-obvious precedence.
+
+    DECISION (2026-09-29): ``{prefix}_HOST`` wins over ``{prefix}_URL``.
+
+    This inverts what the code did before, and the reason is that the old
+    order was actively wrong. Every compose service sets::
+
+        REDIS_BROKER_HOST: redis_broker_local
+        REDIS_BROKER_PORT: 6379
+
+    deliberately, because Redis passwords here contain base64 characters
+    (``+``, ``/``, ``=``) that break Kombo URL parsing — that split exists
+    precisely so the password is URL-encoded at use time. But the
+    assignment read::
+
+        REDIS_BROKER_URL = os.getenv("REDIS_BROKER_URL", build_redis_url("REDIS_BROKER"))
+
+    so a *stale* ``REDIS_BROKER_URL`` left in ``.env.local`` silently
+    overrode the host compose had just specified, defeating the split.
+
+    Consequence found the hard way: the local stack was publishing to a
+    broker belonging to a *different* compose project, so two independent
+    codebases raced for the same ``celery`` queue. Six identical task
+    publishes gave 2 SUCCESS and 4 NotRegistered — the foreign worker wins
+    the coin flip and rejects task names it does not know. That presents as
+    "my new Celery task never runs", which is a very misleading symptom for
+    a stale env var.
+
+    All three shipped env templates set exactly one form, so this changes
+    nothing for them:
+      * ``.env.example``         — neither, relies on HOST/PORT
+      * ``.env.vps.example``     — URL only, no HOST
+      * ``.env.laptop.example``  — URL only, no HOST
+
+    Order: HOST/PORT (compose-managed) > URL (hand-written templates) >
+    ``REDIS_URL`` (single-Redis non-Docker dev).
+    """
+    if os.getenv(f"{prefix}_HOST"):
+        built = build_redis_url(prefix)
+        if built != REDIS_URL:
+            return built
+    return os.getenv(f"{prefix}_URL") or REDIS_URL
 
 # DECISION: Two Redis URLs in Docker (broker vs cache) so a feed-queue spike
 # can't evict queued Celery tasks and vice versa. In Docker compose the broker
@@ -261,8 +453,109 @@ def build_redis_url(prefix: str) -> str:
 # cache with `allkeys-lru` (feed queues evictable since refill is idempotent).
 # Non-Docker dev collapses both to REDIS_URL — a single Redis on localhost is
 # fine for one developer.
-REDIS_BROKER_URL = os.getenv("REDIS_BROKER_URL", build_redis_url("REDIS_BROKER"))
-REDIS_CACHE_URL = os.getenv("REDIS_CACHE_URL", build_redis_url("REDIS_CACHE"))
+REDIS_BROKER_URL = resolve_redis_url("REDIS_BROKER")
+REDIS_CACHE_URL = resolve_redis_url("REDIS_CACHE")
+
+
+# DECISION (2026-09-30): under the test suite the cache moves to its own Redis
+# database index, so a test run cannot destroy live development state.
+#
+# `django_redis.cache.RedisCache.clear()` is FLUSHDB, not a prefix scan, and
+# conftest's `clear_throttle_cache` calls it precisely so one file's rate-limit
+# spend cannot fail another. Against the default index that is a FLUSHDB of the
+# *live* cache: throttle budgets, `user_feed:*` queues, `user_vectors:*` and
+# every `clip:*` counter go together. `counter_store.drain()` (`KEYS clip:*` +
+# `DEL`) is a second door into that same shared keyspace, so two concurrent
+# runs delete each other's state even without a flush. Postgres is already
+# isolated per run by TEST_DB_NAME, which is what made this read as flakiness
+# rather than as a gap: three runs of identical, unmodified code produced three
+# different failure sets.
+#
+# WHY IT LIVES HERE AND NOT IN conftest.py: pytest-django calls
+# `django.setup()` from its own `pytest_load_initial_conftests`, while
+# `_pytest.config`'s implementation of that same hook is `trylast`, so the
+# rootdir conftest's module body has not run yet. An `os.environ[...]` assigned
+# there cannot reach CACHES — this module is imported *inside*
+# `django.setup()`. `backend/app/tests/test_redis_isolation.py` pins both
+# halves of that claim (the env var does work; a late one provably does not).
+#
+# The gate is `testing_enabled()`, the signal `secrets.py` already uses: true
+# under pytest, or with `ECHOFLOW_TESTING=1`. Neither is set by any compose
+# file, so gunicorn and all four Celery services keep the configured index.
+#
+# Precedence, all read from the process environment at settings-import time so
+# that `docker compose exec -e TEST_REDIS_CACHE_DB=14` works:
+#   TEST_REDIS_CACHE_URL  a full URL, for a CI runner with its own Redis
+#   TEST_REDIS_CACHE_DB   the index alone, which keeps the base64 password
+#                         (it contains `+`, `/` and `=`) out of the command line
+#   default               TEST_REDIS_CACHE_DB_DEFAULT
+#
+# Index 0 is refused rather than honoured: in every stack it *is* the live
+# cache, so accepting it would be the defect rather than an escape from it.
+# The default is 13 because 0 is the live cache and 14/15 are FLUSHed by the
+# `redis_scratch` fixture in `test_telemetry_flush_integrity.py`; the server
+# ships `databases 16`, so 1-13 are unclaimed.
+TEST_REDIS_CACHE_DB_DEFAULT = 13
+
+
+def resolve_test_redis_cache_url(resolved: str) -> str:
+    """Point a resolved cache URL at this test run's own Redis database.
+
+    ``resolved`` is the cache URL as the *process* would use it in production;
+    only the database path component is replaced, so the host and the
+    percent-encoded credential compose supplied are carried through untouched.
+    That is deliberate — an index swap must not become a different server,
+    because `tasks.flush_telemetry_stream` builds its own client from
+    `CACHES['default']['LOCATION']` and the end-to-end tests need real Redis.
+
+    Splitting the URL with ``str.rpartition('/')`` would be wrong: in
+    ``redis://host:6379`` the last ``/`` precedes the *port*.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    override = (os.getenv("TEST_REDIS_CACHE_URL") or "").strip()
+    if override:
+        return override
+
+    raw = (os.getenv("TEST_REDIS_CACHE_DB") or "").strip()
+    if not raw:
+        index = TEST_REDIS_CACHE_DB_DEFAULT
+    else:
+        try:
+            index = int(raw)
+        except ValueError:
+            raise ImproperlyConfigured(
+                f"TEST_REDIS_CACHE_DB={raw!r} is not an integer database index. "
+                "A value that does not parse would leave the suite on the live "
+                "cache index, which is the failure this setting exists to "
+                "prevent. Redis here serves 16 databases: use 1-15."
+            )
+        if not 1 <= index <= 15:
+            raise ImproperlyConfigured(
+                f"TEST_REDIS_CACHE_DB={index} is out of range. Index 0 is the "
+                "live development cache in every stack, and flushing it is the "
+                "defect this setting exists to prevent. Redis here serves 16 "
+                "databases: use 1-15."
+            )
+
+    parts = urlsplit(resolved)
+    return urlunsplit(parts._replace(path=f"/{index}"))
+
+
+if testing_enabled():
+    REDIS_CACHE_URL = resolve_test_redis_cache_url(REDIS_CACHE_URL)
+
+# DECISION (2026-09-30): the *broker* is deliberately NOT retargeted for
+# tests, unlike the cache above. Nothing in the suite publishes to a real
+# broker — every reachable path is stubbed at the seam the code reads
+# (`services.uploads.publish`, `tasks.sync_revenuecat_entitlements`) and
+# `tasks.py`'s own `.delay()` only runs inside a worker. The one consumer that
+# does talk to a real Redis, `flush_telemetry_stream`, builds its client from
+# `CACHES['default']['LOCATION']`, i.e. the cache, so it is already isolated.
+# Moving the broker would put test-published tasks in a database no worker
+# reads (silent, unbounded accumulation) and would desynchronise
+# `celery inspect ping` (the compose worker healthcheck) and
+# `views/system_health.py` from the Redis the tests were writing to.
 
 # This is how you connect Redis to Django
 CACHES = {
@@ -307,59 +600,7 @@ CELERY_TASK_REJECT_ON_WORKER_LOST = True
 # at all.
 MEDIA_URL = '/media/'  # unused by S3Storage (which generates its own URLs);
                        # kept only because a few Django internals reference it
-SCRAPER_SCRATCH_DIR = os.path.join(BASE_DIR, 'scratch')  # LOCAL, ephemeral,
-    # per-container working space for downloading/decoding before upload to
-    # object storage — never shared, never durable, never assumed to be
-    # visible to any other container. tempfile-backed in code; this is the
-    # equivalent of /tmp, just kept off the root filesystem for size reasons.
-
-# Scraper defaults #############
-SCRAPER_SOURCES = [
-    'wikimedia', 'internet_archive', 'freesound', 'kaggle',
-    'openverse', 'librivox', 'free_music_archive',
-    # 'pixabay',          # DISABLED: needs SCRAPER_PIXABAY_API_KEY — uncomment once configured
-    # 'podcast_index',    # DISABLED: needs SCRAPER_PODCAST_INDEX_API_KEY + _SECRET — uncomment once configured
-    'podcast_rss', 'bbc_sound_effects',
-    'musopen', 'loc_national_jukebox', 'usgov_audio',
-]
-SCRAPER_USER_AGENT = os.getenv('SCRAPER_USER_AGENT', 'EchoFlowScraper/1.0')
-SCRAPER_CONTACT_EMAIL = os.getenv('SCRAPER_CONTACT_EMAIL', '')
-SCRAPER_TARGET_DIR = os.path.join(SCRAPER_SCRATCH_DIR, 'audio_scraper')  # local
-    # scratch space for raw downloads before scrapers upload to object
-    # storage via the model's FileField .save(), same as everything else
-SCRAPER_DEFAULT_CLIP_SECONDS = int(os.getenv('SCRAPER_DEFAULT_CLIP_SECONDS', '300'))
-SCRAPER_MAX_DOWNLOADS_PER_MIN = int(os.getenv('SCRAPER_MAX_DOWNLOADS_PER_MIN', '30'))
-SCRAPER_ALLOW_LICENSES = os.getenv('SCRAPER_ALLOW_LICENSES', 'CC0,CC-BY,CC-BY-SA,CC-BY-NC').split(',')
-# DECISION: Resumable scraper state lives in SCRAPER_SCRATCH_DIR by default
-# (a LOCAL directory on the web container — same convention as the
-# downloader's tmp scratch space). Override via env for testing.
-SCRAPER_STATE_DIR = os.getenv('SCRAPER_STATE_DIR', '') or None
-SCRAPER_LOG_DIR = os.getenv('SCRAPER_LOG_DIR', '') or None
-SCRAPER_DOWNLOAD_MAX_ATTEMPTS = int(os.getenv('SCRAPER_DOWNLOAD_MAX_ATTEMPTS', '3'))
-SCRAPER_DOWNLOAD_BACKOFF = float(os.getenv('SCRAPER_DOWNLOAD_BACKOFF', '2.0'))
-FREESOUND_API_KEY = os.getenv('FREESOUND_API_KEY', '')
-SCRAPER_KAGGLE_LOCAL_PATH = os.getenv('SCRAPER_KAGGLE_LOCAL_PATH', '')
-
-# DECISION: NC and SA gates default OFF. Operators opt-in by setting the env
-# vars. NC content is included in the catalog but excluded from feed queries
-# until SCRAPER_ALLOW_NC=True. CC-BY-SA content is imported with
-# requires_share_alike=True + moderation_approved=False until an operator
-# calls /clips/{id}/approve-moderation/ to opt-in each item.
-SCRAPER_ALLOW_NC = os.getenv('SCRAPER_ALLOW_NC', 'False').lower() in ('1', 'true', 'yes')
-SCRAPER_ALLOW_SHARE_ALIKE = os.getenv('SCRAPER_ALLOW_SHARE_ALIKE', 'False').lower() in ('1', 'true', 'yes')
-
-# DECISION: Connector-specific API keys are namespaced with SCRAPER_* to keep
-# the env surface consistent with existing SCRAPER_* settings. Sources that
-# require a key return [] + WARNING when absent (freesound pattern).
-SCRAPER_OPENVERSE_API_KEY = os.getenv('SCRAPER_OPENVERSE_API_KEY', '')
-SCRAPER_PIXABAY_API_KEY = os.getenv('SCRAPER_PIXABAY_API_KEY', '')
-SCRAPER_PODCAST_INDEX_API_KEY = os.getenv('SCRAPER_PODCAST_INDEX_API_KEY', '')
-SCRAPER_PODCAST_INDEX_API_SECRET = os.getenv('SCRAPER_PODCAST_INDEX_API_SECRET', '')
-SCRAPER_PODCAST_RSS_DEFAULT = os.getenv('SCRAPER_PODCAST_RSS_DEFAULT', '')
-
 # DECISION: 300s default (5 min). EchoFlow is short-form audio.
-# SCRAPER_DEFAULT_CLIP_SECONDS=300 is the equivalent for scraped imports;
-# user uploads get the same cap for consistency. Group C item 23 fix.
 MAX_DURATION_SECONDS = int(os.getenv('MAX_DURATION_SECONDS', '300'))
 
 # Password validation
@@ -613,11 +854,79 @@ HLS_URL_STYLE = os.getenv("HLS_URL_STYLE") or (
 #   for media.echoflow.in) — see the note above.
 MEDIA_TOKEN_SECRET = os.getenv("MEDIA_TOKEN_SECRET", "")
 MEDIA_TOKEN_TTL_SECONDS = int(os.getenv("MEDIA_TOKEN_TTL_SECONDS", "600"))
+# A4 (2026-09-29) — share tokens. A shared link must survive being passed
+# around, so it lives for days; MEDIA_TOKEN_TTL_SECONDS (600s) is sized for
+# a stream currently playing and is deliberately NOT reused here.
+#
+# 30 days is a deliberate middle ground, not "forever". `exp` is the only
+# automatic revocation mechanism this design has: when a clip is un-approved
+# (an ISSUE-04 takedown) or a share is regretted, nothing else invalidates a
+# token already in someone's hand. At 600s that self-heals in minutes; at
+# forever it never does. 30 days keeps a shared link useful while bounding
+# the exposure window, at no extra implementation cost.
+SHARE_TOKEN_TTL_SECONDS = int(os.getenv("SHARE_TOKEN_TTL_SECONDS", str(30 * 24 * 3600)))
+# PUBLIC_APP_BASE_URL: the origin that shared clip links point at. Kept
+# separate from PUBLIC_HLS_ENDPOINT_URL because that one is the *media*
+# origin and is deliberately bucket-less/edge-shaped; prepending an API or
+# media base to a share link is a bug the AGENTS.md notes have already been
+# made in two frontends.
+#
+# If unset, the share-link endpoint returns a relative path plus the raw
+# token rather than inventing an absolute URL. Emitting a plausible-looking
+# but wrong absolute link is worse than emitting an obviously incomplete one,
+# because the client would not check.
+PUBLIC_APP_BASE_URL = (os.getenv("PUBLIC_APP_BASE_URL") or "").rstrip("/")
 MEDIA_TOKEN_COOKIE_DOMAIN = os.getenv("MEDIA_TOKEN_COOKIE_DOMAIN", "")
 AUTH_USER_MODEL = 'app.User' # for Custom user model
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 REST_FRAMEWORK = {
+    # SECURITY (identity, not rate): how many proxies sit in front of Django.
+    #
+    # Unset (None) makes `BaseThrottle.get_ident` fall through to
+    # `''.join(xff.split()) if xff else remote_addr` — the *whole*
+    # client-supplied X-Forwarded-For header as the throttle identity. nginx
+    # APPENDS to that header (`$proxy_add_x_forwarded_for`), so a client
+    # sending `X-Forwarded-For: 9.9.9.9` reaches DRF as `9.9.9.9,<real-ip>`
+    # and every distinct value is a brand-new, never-before-seen bucket. One
+    # header defeated every IP-keyed limit here (login 10/min, anon
+    # 100/hour, register 200/hour, clip_public 120/min) with no volume and no
+    # infrastructure pressure. Measured, not theorised: the pre-fix key for
+    # the login endpoint was literally `throttle_login_9.9.9.9,203.0.113.7`.
+    #
+    # 1 is correct: there is exactly one nginx in front
+    # (docs/EXPLAIN/docker/05-https-tls-termination.md), and with
+    # `num_proxies == 1` DRF takes the `addrs[-min(1, len(addrs))]` branch,
+    # i.e. the LAST hop — the one nginx appended from `$remote_addr`. The
+    # earlier entries are whatever the client sent and are never consulted.
+    #
+    # This is the *backstop*, not the complete fix. It only reads
+    # X-Forwarded-For, it validates nothing, and it silently re-breaks if a
+    # second proxy is ever placed in front. `backend.app.throttling.
+    # TrustedProxyRateThrottle` resolves the identity through
+    # `EchoFlow.client_ip.get_client_ip` instead (X-Real-IP first, which nginx
+    # overwrites and which therefore cannot be spoofed through the
+    # terminator, each candidate validated as a real IP). Prefer it for any
+    # new throttle.
+    #
+    # If a second proxy is added, this must become 2. Nothing errors if it
+    # does not — the bypass just quietly returns.
+    'NUM_PROXIES': 1,
+    # SECURITY: a dead cache must not be a 500.
+    #
+    # `django_redis` raises `ConnectionInterrupted`, which subclasses bare
+    # `Exception` and not `APIException`, so DRF's default handler returns
+    # None, the exception is re-raised, and every throttled endpoint (and
+    # anything else that reads the cache) answers 500 — a full traceback page
+    # when DJANGO_DEBUG=True. 503 is honest and retryable; 500 tells the
+    # client the request is broken, and fail-*open* (allow) would delete the
+    # rate limit for exactly as long as the outage lasts. The handler
+    # delegates every non-Redis exception to DRF's own, unchanged.
+    #
+    # `backend.app.throttling.TrustedProxyRateThrottle.allow_request` raises
+    # the same 503 independently, so the two custom throttles do not depend on
+    # this key being present.
+    'EXCEPTION_HANDLER': 'backend.EchoFlow.exception_handlers.cache_unavailable_handler',
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ],
@@ -641,8 +950,36 @@ REST_FRAMEWORK = {
         'user': '1000/hour',
         'telemetry': '60/min',      # log_telemetry: 1/second max sustained
         'upload': '20/hour',        # AudioUploadViewSet.create: prevent storage abuse
-        'register': '5/hour',       # RegisterView: prevent account-creation spam
+        # Registration is anonymous, so the key has to be the caller's IP.
+        # Raised 5 -> 200 on 2026-09-28: 5/hour/IP caps new-user signup
+        # behind a single mobile carrier NAT gateway rather than capping an
+        # attacker. The per-IP cap on actual spam is now carried by
+        # 'register_username' below, which is per-account and therefore
+        # cannot be shared by unrelated users behind one NAT.
+        'register': '200/hour',
+        # Per-username, applied alongside 'register' by RegisterView. Catches
+        # what the IP key cannot express: one host cycling through many
+        # usernames, and the repeated re-registration used to squat or
+        # reclaim a handle. 3/hour leaves room for a genuine user who typos a
+        # name twice and then succeeds on the third attempt.
+        'register_username': '3/hour',
         'login': '10/min',          # TokenObtainPairView: prevent credential stuffing
+        # Per-username, applied alongside 'login' by ThrottledTokenObtainPairView.
+        # 'login' has to stay IP-keyed — it is the credential-stuffing gate and
+        # login is anonymous, so unlike token refresh there is no verified
+        # subject to key on — but one IP is a carrier NAT gateway on a mobile
+        # network, so 10/min is one budget for everyone behind that address.
+        # This is the half of the gate that is not NAT-bound: one account, one
+        # bucket. 10/hour is far above a human's real behaviour (a handful of
+        # typos, then success) and 60x below what a credential-stuffing run
+        # needs against a single account.
+        'login_username': '10/hour',
+        # Per VERIFIED refresh-token subject, not per IP — see
+        # backend/app/throttling.py. Sized for a 15-minute access token: ~4
+        # refreshes/hour is the steady state, so 120/hour is ~30x headroom
+        # for clock skew, retries and multi-device sign-in, while still
+        # bounding a single abusive token.
+        'token_refresh': '120/hour',
         'comment': '60/hour',       # CommentViewSet.create
         'share_send': '100/hour',   # ShareViewSet.send_share (anti-spam)
         'share_poll': '1000/hour',  # ShareViewSet inbox/unread/mark-read (client polling)
@@ -651,6 +988,68 @@ REST_FRAMEWORK = {
         'grievance': '10/hour',   # GrievanceCreateView (issue-03)
         'data_subject': '5/hour', # DataSubjectAccessView / Erasure (issue-06)
         'subscription_sync': '10/hour',  # manual RevenueCat sync trigger
+        # A3 (2026-09-29): PlaybackTokenView previously declared no
+        # throttle_scope, so ScopedRateThrottle silently allowed everything
+        # and the endpoint fell through to the shared `user` (1000/hour)
+        # bucket — which a scrolling feed burns at ~1 token per clip.
+        # 300/min is sized for a fast scroll (a clip every ~200ms is far
+        # beyond human play rate) while leaving headroom for a user
+        # flipping through a long feed plus retries. Scoped rather than
+        # IP-keyed: the caller is authenticated here, so keying on the
+        # verified principal is both stricter and NAT-safe.
+        'playback_token':      '300/min',
+        # A4 (2026-09-29). These five actions previously inherited 'upload'
+        # (20/hour) because the viewset declared one scope for everything.
+        # A shared link's landing page 429ing after 20 views is a share
+        # feature that appears to work and then silently stops.
+        #
+        # 'clip_public' is generous and IP-keyed: it is unauthenticated, and
+        # a chat client re-fetches a preview. 'clip_play' is 60/min because a
+        # legitimate recipient presses play once; the cap exists to stop a
+        # harvested share link being used as a token-minting oracle.
+        # 'clip_approve' is tight — it triggers HLS encoding, i.e. compute.
+        'clip_public':         '120/min',
+        'clip_play':           '60/min',
+        'share_link':          '60/hour',
+        'clip_report':         '20/hour',
+        'clip_approve':        '20/hour',
+        # FIX (2026-09-29): reads on a clip. Before this, `GET /clips/{id}/` and
+        # `GET /clips/` resolved to the 'upload' scope (20/hour) because the
+        # per-action map in views/content.py was keyed on url_path while DRF
+        # sets self.action to the method name, so no custom action ever matched
+        # and every read fell through to the upload cap. A client polling clip
+        # status during an HLS encode (mobile Phase 5 upload pipeline) 429s
+        # after 20 polls. Reads are cheap and not storage-abuse vectors, so
+        # they get their own bucket rather than sharing the upload cap.
+        'clip_read':           '120/min',
+        # TagsViewSet (2026-09-30). The viewset declared NO throttle_scope at
+        # all, and ScopedRateThrottle.allow_request returns True — no counter,
+        # no accounting — when the view it is asked about has no scope. Both of
+        # its actions ran on the shared `user` (1000/hour) bucket alone.
+        #
+        # 'tags_initialize' is the one that matters: it OR's one JSONB
+        # containment clause per selected tag (up to _MAX_SELECTED_TAGS = 20)
+        # across app_audioclip — which has no GIN index on `tags`, so every
+        # clause is a sequential-scan containment check — and publishes a
+        # refill_user_feed task on each success. A free account could therefore
+        # loop the one-shot cold-start endpoint as a read amplifier and as a
+        # Celery task-fan-out amplifier. 10/hour: the product flow is one
+        # submit per account for the whole of onboarding, so 10 leaves room for
+        # a double-tap, a retry after a dropped response, and a user
+        # deliberately re-running it, while bounding the fan-out to something
+        # that cannot saturate a worker queue. Analogous existing rates:
+        # register_username 3/hour (per-account spam), clip_approve 20/hour
+        # (triggers a compute-heavy encode).
+        #
+        # 'tags_available' is a read, but not a cheap or a free one: it
+        # aggregates the whole eligible corpus (jsonb_array_elements + GROUP BY)
+        # and it is the only endpoint that discloses the corpus's tag
+        # vocabulary, so it is bounded well below the generic 1000/hour and
+        # well below 'clip_read' (120/min — a single-row lookup). 60/hour is
+        # ~6x what a user needs at one call per modal open, which is the only
+        # thing the frontend does with it.
+        'tags_initialize':     '10/hour',
+        'tags_available':      '60/hour',
     },
 }
 # lets set lifetimes for tokens
@@ -721,7 +1120,30 @@ LOGGING = {
 # Wrapped in `if not DEBUG:` so the dev server (HTTP) keeps working.
 # In any environment that terminates TLS (Traefik / nginx / CloudFront),
 # SECURE_PROXY_SSL_HEADER is required or SECURE_SSL_REDIRECT will loop.
-if not DEBUG:
+#
+# ECHOFLOW_TESTING is a THIRD, independent reason to skip this block, and it
+# exists because relying on `DJANGO_DEBUG=True` here stopped being reliable.
+# `docker-compose.local.yml` used to hardcode `DJANGO_DEBUG=True` as a
+# literal, and `conftest.py` sets it with `os.environ.setdefault` — which is a
+# no-op the moment the container already exports a value. So the suite's
+# ability to run depended on an unoverridable literal in a compose file. That
+# literal is now `${DJANGO_DEBUG:-False}`, and once the container is recreated
+# the suite would come up with DEBUG=False and `SECURE_SSL_REDIRECT=True`,
+# 301-ing every request Django's test client makes to `http://testserver/`
+# (the client sends no `X-Forwarded-Proto`).
+#
+# Gating on an explicit flag rather than on DEBUG also stops the suite from
+# lying about the environment: DEBUG now reflects the real container value, so
+# the settings in this block are exercised where they are meant to be.
+#
+# The test detection is `EchoFlow.secrets.testing_enabled`, not a bare env-var
+# read here, for a timing reason that is easy to get wrong: pytest-django calls
+# django.setup() while loading initial conftests, which is BEFORE the rootdir
+# conftest.py module body runs. So an env var that conftest.py sets is not yet
+# in os.environ at the moment this line executes. `testing_enabled()` also
+# recognises pytest itself, which is imported strictly earlier.
+_ECHOfLOW_TESTING = testing_enabled()
+if not DEBUG and not _ECHOfLOW_TESTING:
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
     SESSION_COOKIE_SAMESITE = 'Lax'
@@ -735,7 +1157,23 @@ if not DEBUG:
 
 
 # DECISION: Regulatory settings (TERMS_VERSIONS, compliance/grievance/nodal contacts) live in settings.py rather than a DB table so they are env-driven and change without migration. Tradeoff: no audit trail of officer changes (operational, not regulatory requirement); DB table would require migration per change. See models.py Grievance/AuditLog for DB-level audit of grievances and identity.
-TERMS_VERSIONS = os.environ.get('TERMS_VERSIONS', 'v1.0').split(',')
+TERMS_VERSIONS = [
+    v.strip() for v in os.environ.get('TERMS_VERSIONS', 'v1.0').split(',') if v.strip()
+]
+# DECISION: A1 (2026-09-29) — these are now published on
+# GET /legal/compliance/ so clients do not have to hardcode them. The
+# mobile app was previously forced to send "v1.0" and would 400 the moment
+# a version was appended to TERMS_VERSIONS, because
+# RegisterSerializer.validate_terms_version rejects anything not in this
+# list. Publishing the list is what makes the registration contract
+# discoverable instead of tribal knowledge.
+#
+# Strips whitespace and drops empties, because a trailing comma or a stray
+# space in a .env line would otherwise register as a valid version string
+# that no client would ever send. `.strip()` above is the fix; previously
+# "v1.0,v1.1" produced ['v1.0', 'v1.1'] but "v1.0, v1.1" produced
+# ['v1.0', ' v1.1'] — the second silently unusable, so the mismatch was
+# invisible until a user hit an inexplicable 400.
 COMPLIANCE_OFFICER_NAME = os.environ.get('COMPLIANCE_OFFICER_NAME', 'EchoFlow Compliance Officer')
 COMPLIANCE_OFFICER_EMAIL = os.environ.get('COMPLIANCE_OFFICER_EMAIL', 'compliance@echoflow.in')
 GRIEVANCE_OFFICER_NAME = os.environ.get('GRIEVANCE_OFFICER_NAME', 'EchoFlow Grievance Officer')
@@ -743,6 +1181,11 @@ GRIEVANCE_OFFICER_EMAIL = os.environ.get('GRIEVANCE_OFFICER_EMAIL', 'grievance@e
 NODAL_CONTACT_NAME = os.environ.get('NODAL_CONTACT_NAME', 'EchoFlow Nodal Contact')
 NODAL_CONTACT_EMAIL = os.environ.get('NODAL_CONTACT_EMAIL', 'nodal@echoflow.in')
 PHYSICAL_ADDRESS = os.environ.get('PHYSICAL_ADDRESS', '')
+# Which policy/terms text is currently in force. Distinct from the list of
+# everything ever published: a client must show the current one at
+# registration, while the full list is needed to interpret historical
+# ConsentAudit rows.
+PRIVACY_VERSION = os.environ.get('PRIVACY_VERSION', 'v1.0')
 
 # --- RevenueCat (Pro subscription management) ---
 # SECURE: REVENUECAT_SECRET_KEY is backend-only. Never expose this to the

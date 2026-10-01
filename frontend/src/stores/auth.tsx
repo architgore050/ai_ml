@@ -8,7 +8,13 @@ interface AuthContextType {
   isAuthenticated: boolean;
   isLoading: boolean;
   login: (username: string, password: string) => Promise<void>;
-  register: (email: string, username: string, password: string) => Promise<void>;
+  register: (params: {
+    email: string;
+    username: string;
+    password: string;
+    dob: string;
+    parentEmail?: string;
+  }) => Promise<void>;
   logout: () => Promise<void>;
   refreshProfile: () => Promise<void>;
 }
@@ -61,8 +67,36 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   // Spec FR-AUTH-1: register then immediately login to obtain tokens
-  const register = async (email: string, username: string, password: string) => {
-    await authAPI.register(username, email, password);
+  const register = async ({
+    email,
+    username,
+    password,
+    dob,
+    parentEmail,
+  }: {
+    email: string;
+    username: string;
+    password: string;
+    dob: string;
+    parentEmail?: string;
+  }) => {
+    // A1 / ISSUE-16: the accepted terms versions are a server contract, so
+    // read them from /legal/compliance/ rather than hardcoding. Falls back to
+    // the documented default if that fetch fails, because registration
+    // cannot proceed without some version and a stale-but-valid one beats a
+    // 400 with no cause. If the server does reject it, its error lists the
+    // allowed values, so the failure is self-explaining.
+    let termsVersion = "v1.0";
+    try {
+      const compliance = await authAPI.getCompliance();
+      if (compliance.current_terms_version) {
+        termsVersion = compliance.current_terms_version;
+      }
+    } catch {
+      // Leave the default. A metadata fetch must not block registration.
+    }
+
+    await authAPI.register(username, email, password, termsVersion, dob, parentEmail);
     await authAPI.login(username, password);
     sessionStorage.setItem("ef_new_user", "1");
     await refreshProfile();

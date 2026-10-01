@@ -1,0 +1,17 @@
+# Cloudflare Pages SPA fallback.
+#
+# Every client-side route in this app (/feed, /profile/me, /explore, ...) is
+# handled by the React router, not by a file on disk. Without this rule a hard
+# refresh or a shared deep link such as
+#   https://app.echoflow.in/?clip=42
+# asks Pages for a path that does not exist and gets a 404 before React ever
+# boots. The trailing `200` makes Pages serve index.html for any unmatched
+# path while leaving the URL intact, so the router can read the query string.
+#
+# `/*` (not `/*  /index.html  200` with spaces) — Pages copies this file
+# verbatim from public/ into the build output; it is not processed.
+#
+# Real files (assets under /assets/, /index.html, /_headers, icons) are
+# matched BEFORE this rule, so hashed JS/CSS bundles are still served with
+# their long cache headers and are not swallowed by the fallback.
+/*    /index.html   200

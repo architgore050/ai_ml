@@ -123,7 +123,7 @@ services:
       - REDIS_BROKER_URL=redis://redis_broker:6379/0
       - REDIS_CACHE_URL=redis://redis_cache:6379/0
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY:-test-secret-key-not-for-prod}
-      - DJANGO_DEBUG=True
+      - DJANGO_DEBUG=${DJANGO_DEBUG:-False}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
       - AWS_STORAGE_BUCKET_NAME=${AWS_STORAGE_BUCKET_NAME:-test-bucket}

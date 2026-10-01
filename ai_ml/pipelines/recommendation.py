@@ -38,7 +38,7 @@ import math
 from typing import Optional
 
 import numpy as np
-from django.db.models import F, FloatField, ExpressionWrapper
+from django.db.models import F, FloatField, ExpressionWrapper, OuterRef, Subquery
 from django.utils import timezone
 from datetime import timedelta
 from pgvector.django import CosineDistance
@@ -64,6 +64,41 @@ _VELOCITY_WEIGHT = 0.25
 # (per-user pool + followed-creator network + cold fallback). The
 # architecture audit considers 80/20 the production ratio.
 _EXPLOIT_RATIO = 0.8
+
+
+def _recovery_candidates(user, count: int) -> list[str]:
+    """Return eligible clips to re-serve after unseen candidates are exhausted.
+
+    This is deliberately a last-resort path: normal candidate construction
+    keeps its 30-day interaction exclusion. Without recovery, a user who has
+    interacted with every clip in a small catalogue receives an empty refill
+    forever and `/feed/` remains at ``202 Preparing your feed...``.
+
+    ``UserInteraction`` has one row per interaction type, so a clip may have
+    several rows for the same user. The correlated subquery chooses the most
+    recent one, then orders oldest-first. Ties retain the catalogue's normal
+    engagement/newness ordering. ``last_interaction_at`` is normally never
+    NULL here, but NULLS FIRST makes a concurrently-added eligible clip safe.
+    """
+    from backend.app.models import AudioClip, UserInteraction
+
+    last_interaction = (
+        UserInteraction.objects
+        .filter(user=user, clip_id=OuterRef('pk'))
+        .order_by('-created_at')
+        .values('created_at')[:1]
+    )
+    recovery = (
+        AudioClip.objects
+        .filter(status='ready')
+        .annotate(last_interaction_at=Subquery(last_interaction))
+        .order_by(
+            F('last_interaction_at').asc(nulls_first=True),
+            '-engagement_velocity',
+            '-created_at',
+        )[:count]
+    )
+    return [str(clip.id) for clip in recovery]
 
 
 def _composite_score(vector_similarity, avg_completion_rate, engagement_velocity):
@@ -222,7 +257,7 @@ def build_feed_candidates(user_id, count: int = 50, *, pool_first: bool = True) 
                 )[: count - len(clip_ids_to_push)]
                 for c in backfill:
                     clip_ids_to_push.append(str(c.id))
-            return clip_ids_to_push
+            return clip_ids_to_push or _recovery_candidates(user, count)
 
     # SQL composite fallback (also the path used when pool_first=False
     # or the pool returned None meaning "neither pool is populated").
@@ -275,7 +310,7 @@ def build_feed_candidates(user_id, count: int = 50, *, pool_first: bool = True) 
                     seen_clip_ids.add(cid)
                     deduped.append(cid)
 
-        return deduped
+        return deduped or _recovery_candidates(user, count)
 
     # Cold start: no user vectors yet.
     cold_clips = (
@@ -290,7 +325,7 @@ def build_feed_candidates(user_id, count: int = 50, *, pool_first: bool = True) 
         if cid not in seen_clip_ids:
             seen_clip_ids.add(cid)
             clip_ids_to_push.append(cid)
-    return clip_ids_to_push
+    return clip_ids_to_push or _recovery_candidates(user, count)
 
 
 # ---------------------------------------------------------------------------

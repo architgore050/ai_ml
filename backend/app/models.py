@@ -2,7 +2,7 @@ import os
 import uuid
 import logging
 from django.db import models, transaction
-from django.db.models import F
+from django.db.models import F, Q
 from django.conf import settings
 from django.contrib.auth.models import AbstractUser
 from pgvector.django import VectorField
@@ -57,7 +57,20 @@ class User(AbstractUser):
     # RevenueCat Pro entitlement state.
     # DECISION: App User ID is a UUID (defaults to uuid4 on creation) rather
     # than derived from username/email, so it survives identity changes.
-    revenuecat_app_user_id = models.UUIDField(default=uuid.uuid4, null=True, blank=True)
+    #
+    # NOT NULL (migration 0009). It was nullable, and that was the whole defect:
+    # `get_customer_portal_url()` had a `else str(user.uuid)` branch on the null
+    # path, but `User` extends `AbstractUser` and has no `uuid` attribute — so
+    # the branch raised `AttributeError` and returned HTTP 500. The `uuid4()`
+    # default masked it on every newly created user, leaving only pre-0002 rows
+    # able to reach it. 0008 backfills those; 0009 makes the database refuse to
+    # create the state again.
+    #
+    # A nullable identifier is not a defensible contract for a billing identity.
+    # `services.revenuecat._app_user_id()` still tolerates null as
+    # defence-in-depth for objects that are not this model, but nothing in the
+    # database can be null any more.
+    revenuecat_app_user_id = models.UUIDField(default=uuid.uuid4)
     has_pro_entitlement = models.BooleanField(default=False)
     pro_expires_at = models.DateTimeField(null=True, blank=True)
     pro_grace_until = models.DateTimeField(null=True, blank=True)
@@ -87,7 +100,13 @@ class ConsentAudit(models.Model):
     # audit logs — queryable by user, withdrawable, and retainable
     # per regulatory timeline. Tradeoff: extra table + index vs.
     # tamper-resistant DB record.
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='consent_audits', null=True, blank=True)
+    # B3 (2026-09-29): was on_delete=CASCADE. Erasing a user therefore
+    # destroyed the very record that proves consent was collected — the
+    # opposite of what a consent audit trail is for. DPDP §5(2) / §11
+    # require the record to outlive the processing it justified.
+    # SET_NULL + services/erasure.py::execute_erasure keeps the evidence and
+    # severs the pointer to the person.
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='consent_audits')
     consent_issued_at = models.DateTimeField(auto_now_add=True)
     terms_version_id = models.CharField(max_length=50, default='v1.0')
     privacy_version_id = models.CharField(max_length=50, default='v1.0')
@@ -108,7 +127,7 @@ class AudioClip(models.Model):
     original_file = models.FileField(upload_to='uploads/%Y/%m/%d/', null=True)
     cover_image = models.ImageField(upload_to='covers/%Y/%m/%d/', blank=True, null=True)
     hls_playlist_url = models.CharField(max_length=500, blank=True, null=True)
-    # Provenance and licensing metadata for scraper imports
+    # Provenance and licensing metadata retained for legacy imported rows.
     source_name = models.CharField(max_length=100, blank=True, null=True)
     source_url = models.CharField(max_length=500, blank=True, null=True)
     license = models.CharField(max_length=100, blank=True, null=True)
@@ -116,10 +135,9 @@ class AudioClip(models.Model):
     imported_via_scraper = models.BooleanField(default=False)
     original_source_id = models.CharField(max_length=255, blank=True, null=True)
     # DECISION: Two boolean fields instead of a license-policy table so feed
-    # queries can filter NC + SA with index-friendly predicates. Populated by
-    # uploader.save_clip() via ai_ml.scrapers.base.license_features().
-    # SECURITY: is_noncommercial=True clips are excluded from feed/suggestions
-    # queries until SCRAPER_ALLOW_NC=True (operator opt-in).
+    # queries can filter NC + SA with index-friendly predicates. User uploads
+    # derive these flags from their declared license type at creation time.
+    # SECURITY: restricted clips are excluded from feed/suggestions queries.
     is_noncommercial = models.BooleanField(default=False)
     requires_share_alike = models.BooleanField(default=False)
     license_family = models.CharField(max_length=32, blank=True, default='')
@@ -144,6 +162,18 @@ class AudioClip(models.Model):
     acoustic_vector = VectorField(dimensions=128, null=True, blank=True)
 
     moderation_approved = models.BooleanField(default=False)
+    # Moderation evidence is persisted so a rejection is explainable and the
+    # automated decision is not trapped in a Celery log/local variable.
+    transcript_text = models.TextField(blank=True, default='')
+    moderation_reason = models.TextField(blank=True, default='')
+    moderated_at = models.DateTimeField(null=True, blank=True)
+    moderated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='moderated_clips',
+    )
     copyright_acknowledgement = models.BooleanField(default=False)
     copyright_owner_name = models.CharField(max_length=255, blank=True, null=True)
 
@@ -371,7 +401,11 @@ class DataSubjectRequest(models.Model):
     request_type = models.CharField(max_length=20, choices=[
         ('access', 'Access'), ('erasure', 'Erasure'),
     ])
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='data_subject_requests')
+    # B3 (2026-09-29): was on_delete=CASCADE, so the erasure request deleted
+    # itself — erasing the evidence that erasure was ever requested, and
+    # losing completed_at. SET_NULL; services/erasure.py stamps
+    # status='completed' and completed_at before the cascade runs.
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='data_subject_requests')
     status = models.CharField(max_length=20, default='pending')
     token_hash = models.CharField(max_length=128, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -395,7 +429,60 @@ class Report(models.Model):
     # General regulatory reporting / audit artifact
     title = models.CharField(max_length=200)
     content = models.TextField()
+
+    # B4 (2026-09-29): the report endpoint has always existed, but it created
+    # rows with no link to any clip — so a report was unactionable. An
+    # operator queue cannot triage "content: this is bad" against nothing.
+    #
+    # nullable=True because the model is a general-purpose reporting artifact
+    # (a user can report an account, not just a clip), and because existing
+    # rows predate this column. Not null because for a *clip* report the link
+    # is the point; the view requires it.
+    clip = models.ForeignKey(
+        AudioClip,
+        on_delete=models.CASCADE,
+        related_name='reports',
+        null=True,
+        blank=True,
+    )
+
+    # B4: IT Rules 2021 R3(1)(b) requires categorised handling of complaints,
+    # and a free-text body cannot be triaged. The enum is deliberately aligned
+    # with the IT Rules categories so a report can be routed without reading
+    # the prose. `other` is the escape hatch and REQUIRES content, since an
+    # unlabelled report is unactionable.
+    REPORT_REASONS = [
+        ('obscene', 'Obscene or sexually explicit'),
+        ('hate_speech', 'Hate speech'),
+        ('violence', 'Promotes violence'),
+        ('csam', 'Child sexual abuse material'),
+        ('terrorism', 'Terrorism or extremism'),
+        ('copyright', 'Copyright infringement'),
+        ('impersonation', 'Impersonation'),
+        ('privacy', 'Invasion of privacy'),
+        ('spam', 'Spam or misleading'),
+        ('other', 'Other'),
+    ]
+    report_reason = models.CharField(
+        max_length=20,
+        choices=REPORT_REASONS,
+        default='other',
+    )
+
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='reports')
     status = models.CharField(max_length=20, default='open')
     created_at = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        # An operator queue lists by clip, most-recent first.
+        indexes = [models.Index(fields=['clip', '-created_at'])]
+        # One report per user per clip. Prevents a single user burying a clip
+        # in duplicate rows, and makes "reported by N users" countable without
+        # deduplicating at read time.
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user', 'clip'],
+                condition=Q(clip__isnull=False),
+                name='unique_report_per_user_per_clip',
+            ),
+        ]

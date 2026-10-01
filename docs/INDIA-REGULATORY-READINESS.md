@@ -10,6 +10,23 @@
 
 - **Regulatory framework covered:** IT Act 2000 + Rules 2021 (intermediary obligations, traceability, grievance), DPDP Act 2023 (consent, children's data, DPO, breach notification, cross-border), Consumer Protection E-Commerce Rules 2020 (country of origin, grievance), Copyright Act 1957 (license assignment), CERT-In 2022 (180-day logs, 6-hour breach notification), RBI data localisation + tokenization.
 - **Critical finding:** The EchoFlow backend **cannot legally launch as a public-facing user-generated-content (UGC) platform in India** in its current state. There are **6 Critical** gaps (DPDP consent, age gating, grievance/DPO, content moderation, user-upload licensing, breach notification), plus **10 High** gaps (identity retention, 180-day logs, profile-picture URL, feed cold-retry, telemetry heartbeat, comment edit/delete, share link, own profile liked clips, S3 region enforcement, takedown workflow).
+
+> **⚠️ Accuracy pass, 2026-09-29.** Four issues below carried `[COMPLETED]`
+> markers that the code does not support. Re-verified against source, and
+> each is now marked `PARTIAL` or `STILL OPEN` with a dated correction:
+>
+> | Issue | Was | Actually |
+> |---|---|---|
+> | ISSUE-02 | "no gap remains" | `dob` is optional — omitting it bypasses the age gate |
+> | ISSUE-04 | `[COMPLETED]` | Pipeline is wired, but the blocklist is empty, so it approves everything |
+> | ISSUE-06 | `[COMPLETED]` | Erasure returns "process initiated" and deletes nothing |
+> | ISSUE-14 | `[COMPLETED]` | No public clip endpoint exists; both frontend link branches are broken |
+> | ISSUE-16 | *(new)* | Registration 400s for the design-source frontend — required consent fields unsent |
+>
+> An earlier audit of this document also claimed transcript moderation was a
+> no-op because `AudioClip` has no `transcript_text` field. That was wrong:
+> `tasks.py:302` passes the in-scope Whisper output directly. The blocklist
+> is the gap.
 - **Root-cause pattern:** The backend architecture was built for a demo / prototype (no regulatory hooks) and only recently hardened for production security (Sentry, Prometheus, HTTPS termination, dual-write rollback, HNSW indexes, read-replica router). Most regulatory gaps are **absent design choices**, not broken implementations.
 
 ---
@@ -48,15 +65,27 @@
 
 ---
 
-#### ISSUE-02: No age gate / parental consent (DPDP Act 2023 §9)
+#### ISSUE-02: No age gate / parental consent — **PARTIAL (2026-09-29): `dob` is optional, so the gate is bypassed by omission** (DPDP Act 2023 §9)
 
 **Status:** Critical — **launch-blocking for any platform that might attract under-18 users**
 
-**Root cause:** `User` model (`models.py:14-33`) has no `date_of_birth`. `RegisterSerializer` (`serializers.py`: lines 404-424, restored during build mode) now includes `dob` (optional) and validates age gate; `User` model (`models.py`: lines 14-33) has `dob` and `is_minor`. No gap remains for ISSUE-02 serializer fields. The backend never validates age. DPDP §9 requires **verifiable parental consent** for processing children's data (under 18) in a manner that may harm them or involve tracking / behavioral monitoring / targeted ads. EchoFlow's recommendation system (`feed_pool.py`, `tasks.py`) uses time-decayed interaction tracking (`watch_time_ms`, `completion_rate`, `reel_position_ms`) — this qualifies as behavioral monitoring. Without an age gate, processing children's telemetry is a direct violation.
+> **⚠️ CORRECTION 2026-09-29.** This issue was previously reported as closed
+> for the serializer half ("No gap remains for ISSUE-02 serializer fields").
+> That was wrong. The fields exist but **`dob` is
+> `serializers.DateField(required=False, allow_null=True)`**
+> (`serializers.py:437`). A client that omits `dob` is registered as an adult:
+> the age check at `serializers.py:465` is `if dob:`, so it never runs,
+> `is_minor` stays `False`, and a minor can hold an account whose telemetry is
+> processed as an adult's. The optionality is a *bypass*, not a gap in field
+> coverage. See the remediation note below.
+
+**Root cause:** `User` model (`models.py:14-33`) originally had no `date_of_birth`. `RegisterSerializer` now has `dob`, `is_minor`, and `minor_consent_verified` — but `dob` is optional, so the gate is advisory rather than enforced. `minor_consent_verified` is written as a hardcoded `False` at `serializers.py:470,478` with the comment "verified via parent flow" — **no such flow exists**, so nothing ever sets it `True`. The backend never validates age. DPDP §9 requires **verifiable parental consent** for processing children's data (under 18) in a manner that may harm them or involve tracking / behavioral monitoring / targeted ads. EchoFlow's recommendation system (`feed_pool.py`, `tasks.py`) uses time-decayed interaction tracking (`watch_time_ms`, `completion_rate`, `reel_position_ms`) — this qualifies as behavioral monitoring. Without an age gate, processing children's telemetry is a direct violation.
 
 **Evidence:**
-- `models.py:14-33` — `User` fields: `username`, `email`, `password`, `following`, `long_term_semantic`, `long_term_acoustic`, `profile_picture`. No `dob`.
-- `serializers.py:404-424` — `RegisterSerializer` fields: no `dob`.
+- `models.py:14-33` — `User` fields include `dob` (null=True), `is_minor`, `minor_consent_verified` (all defaulted).
+- `serializers.py:437` — `dob = serializers.DateField(required=False, allow_null=True)`. **Required-ness is the gap.**
+- `serializers.py:465` — `dob = data.get('dob'); if dob:` — the entire age gate is conditional on the client having supplied a value.
+- `serializers.py:470,478` — `minor_consent_verified` is assigned literal `False` on both branches; no code path sets it `True`.
 - `views/feed.py:200-249` (`TagsViewSet`) — cold-start requests tags — accessible to any authenticated user, including under-18.
 - `tasks.py:584-796` — `flush_telemetry_stream` processes telemetry from any user, including potential minors.
 - `docs/INDIA-REGULATORY-READINESS.md` — DPDP §9 citation.
@@ -72,6 +101,19 @@
 5. Update the frontend (`Login.tsx`) to include the `dob` field and the parental-consent flow.
 
 ---
+
+> **✅ PARTIALLY RESOLVED 2026-09-29 (B1).** `dob` is now **required**
+> (`serializers.py`), so the omit-to-bypass path is closed: a client that
+> omits it gets 400 rather than an adult-flagged account. Under-18 users
+> must supply `parent_email` and are flagged `is_minor`, and
+> `POST /interactions/{id}/log-telemetry/` returns **403** for them, which
+> closes the behavioural-monitoring exposure DPDP §9 actually cares about.
+> Future and implausible (>120y) dates are rejected.
+>
+> **Still open:** there is no parental-*verification* flow, so
+> `minor_consent_verified` is hardcoded `False` (no mail backend is
+> configured). Nothing ever sets it `True`, so a parent's email address is
+> collected but unverified. Closing that needs mail infrastructure.
 
 #### ISSUE-03: Grievance Officer, Chief Compliance Officer, Nodal Contact missing [COMPLETED — Phase A] (IT Rules 2021 Rule 4(1)(a)(b)(c))
 
@@ -93,15 +135,30 @@
 
 ---
 
-#### ISSUE-04: No content moderation / CSAM / prohibited-content rejection pipeline [COMPLETED — Phase A] (ContentModeration service + AudioClip.moderation_approved; production external API remains open) (IT Act §67B / Prajwala / IT Rules 2021 Rule 3(1)(b)(d))
+#### ISSUE-04: No content moderation / CSAM / prohibited-content rejection pipeline — **PARTIAL (2026-09-29): the pipeline runs but approves everything, because the blocklist is empty** (IT Act §67B / Prajwala / IT Rules 2021 Rule 3(1)(b)(d))
 
 **Status:** Critical — **illegal content exposure** (Prajwala ruling; IT Act §67B penalties: imprisonment up to 5 years + fine up to ₹10 lakh for obscene content; 7 years + ₹10 lakh for sexual acts)
 
-**Root cause:** The upload pipeline (`AudioUploadSerializer` → `finalize_upload` → `process_audio_to_hls`) validates only audio format (extension + magic byte + duration) and does NOT inspect transcript text or audio fingerprint against a prohibited-content database. Since `process_audio_to_hls` (`tasks.py:165-353`) runs `faster-whisper` transcription, the backend **already has access to the transcript** but never runs moderation on it. The upload endpoint (`views/content.py:27-43`) creates the `AudioClip` immediately with `status='processing'`, meaning prohibited content is stored on the server (MinIO / S3) before any moderation runs.
+> **⚠️ CORRECTION 2026-09-29.** Two claims below were wrong and are fixed
+> here. (1) The root-cause text says the backend "never runs moderation on
+> [the transcript]" — it **does**. `tasks.py:302` calls
+> `check_transcript_for_prohibited_content(transcript_text)` and
+> `check_tags_for_prohibited_content(clip.tags)` with the real in-scope
+> Whisper output, right after transcription. (2) Consequently the reason
+> this issue is still open is **not** plumbing and **not** a missing
+> `AudioClip.transcript_text` field. It is that the prohibited-content
+> blocklist the checks consult is **empty**, so both calls return
+> `approved=True` for every input. The `[COMPLETED]` marker overstated
+> this: the wiring is done, the *content* is not. Treat this as an
+> unshipped policy decision, not an engineering gap.
+
+**Root cause:** The upload pipeline (`AudioUploadSerializer` → `finalize_upload` → `process_audio_to_hls`) validates audio format (extension + magic byte + duration). `process_audio_to_hls` (`tasks.py:165-353`) transcribes with `faster-whisper` and **does** run `check_transcript_for_prohibited_content` + `check_tags_for_prohibited_content` at `tasks.py:302`. Those functions compare against a blocklist that has no entries, so they approve unconditionally. There is also **no audio-fingerprint check** and **no image/NSFW check** for `profile_picture`. Separately, the upload endpoint (`views/content.py:27-43`) creates the `AudioClip` with `status='processing'`, so unmoderated content is stored on the origin before any check has substance.
 
 **Evidence:**
 - `backend/app/serializers.py:48-125` — `AudioUploadSerializer` validates `original_file`: size, MIME, duration, extension. No `hash_check`, no `content_policy_check`, no `transcript_policy_check`.
-- `backend/app/tasks.py:254-288` — Whisper transcribes; keywords extracted via KeyBERT (`get_kw_model()`). No moderation applied to `transcript_text` or `clip.tags`.
+- `backend/app/tasks.py:275-303` — Whisper transcribes into `transcript_text`; keywords extracted via KeyBERT. Moderation **is** invoked at line 302 against both the transcript and the tags.
+- `backend/app/services/content_moderation.py` — `check_transcript_for_prohibited_content` / `check_tags_for_prohibited_content`. The blocklists they match against are empty, so both return approved. **This is the open gap.**
+- `backend/app/views/content.py:87` — `approve-moderation` is `permissions.IsAuthenticated` with no ownership or staff check, so any authenticated user can approve any clip. See the B-item in `docs/mobile-rebuild-plan.md` §17.
 - `models.py:108` — `tags` JSONField (line 108 in current `models.py`). stores the auto-generated keywords; no moderation filter.
 - `docs/INDIA-REGULATORY-READINESS.md` — IT Act §67, §67A, §66A (revoked but replaced by BNS §295), Prajwala citation.
 
@@ -119,6 +176,36 @@
 6. Add a `POST /legal/takedown/` endpoint (copyright owner-facing). Create `TakedownRequest` model with `counter_notice` support.
 
 ---
+
+> **✅ B2a RESOLVED 2026-09-29 — and the blocklist was the bug, not the
+> wiring.** Two further corrections to the note above, both found by reading
+> the code around it rather than from the audit:
+>
+> 1. **The list was populated, and that was worse than empty.** It held 7
+>    single common words (`violence`, `terrorism`, `extremist`, `obscenity`,
+>    `hate speech`, `csam`, `child sexual`) matched with `\b` boundaries
+>    against raw Whisper output and KeyBERT unigram tags. Verified
+>    false positives: *"a song about violence in the city"*, *"terrorism was
+>    the topic of the podcast today"*, and *"he called it an extremist
+>    policy"* were all **rejected**. On an audio-clip platform the word
+>    "violence" in a lyric is ordinary content. The user got a permanent
+>    rejection with no appeal path. The list is now 4 CSAM-specific
+>    multi-word constructions, where a keyword match is defensible.
+> 2. **A storage failure was recorded as a moderation decision.**
+>    `check_fingerprint_blocklist("")` returned a *rejection*, and
+>    `compute_audio_fingerprint` swallows exceptions and returns `""`. So a
+>    MinIO blip during approve-moderation set `moderation_approved=False`
+>    permanently, with no path back. A missing fingerprint is now
+>    inconclusive, not a verdict. This fail-open is only safe while the
+>    fingerprint set is empty — a test pins that condition explicitly, since
+>    adding an entry must reopen the question.
+>
+> **Still open, and it is the substantive half of ISSUE-04:** a keyword list
+> cannot distinguish *discussing* a topic from *being* the topic, and cannot
+> cover non-English speech. The mechanical checks work; the content decision
+> (what to match, in which languages, and a human review queue) is a policy
+> call that has not been made. IT Act §67B exposure is **not** closed by
+> this change.
 
 #### ISSUE-05: No user-upload license declaration [COMPLETED — Phase A] (AudioUploadSerializer fields + validation; DB persistence verified) (Copyright Act 1957 §19 / §51 / §52)
 
@@ -142,11 +229,27 @@
 
 ---
 
-#### ISSUE-06: No data-subject rights endpoints [COMPLETED — Phase A] (DataSubjectRequest model + endpoints; erasure cooling-off implemented) (DPDP Act 2023 §§11-14)
+#### ISSUE-06: No data-subject rights endpoints — **PARTIAL (2026-09-29): access + grievance work, but erasure deletes nothing** (DPDP Act 2023 §§11-14)
 
 **Status:** Critical — **DPDP enforcement starts 13 Nov 2025**
 
-**Root cause:** There is no endpoint that allows a user to request all their data, request correction (only profile picture/username exists, not full export), or request erasure. `GET /profile/me/` returns a partial profile (`OwnProfileSerializer`, `serializers.py:282-322`) but does NOT include the full `UserInteraction` history, `Comment` history, `ShareEvent` history, or telemetry stream. `DELETE /profile/me/` does not exist.
+> **⚠️ CORRECTION 2026-09-29.** The `[COMPLETED]` marker claimed "erasure
+> cooling-off implemented". The 30-day cooling-off **window** is implemented;
+> what happens at the end of it is not. `views/data_subject.py:82` is
+> `# HACK: Actual data deletion deferred to Celery/task pipeline for v1.`,
+> and the endpoint then returns `"Cooling-off period completed. Data
+> erasure process initiated."` — while having deleted nothing. The response
+> asserts completion, which is the worst combination: a user who is told
+> their data is gone has no reason to keep a copy, and a regulator query
+> would surface the claim as a representation.
+>
+> Note also that "delete everything" is **not** the correct target.
+> `AuditLog.user` is `on_delete=SET_NULL`, so audit rows deliberately
+> survive user deletion for the CERT-In 180-day retention requirement. The
+> right implementation deletes user content and **anonymises** audit rows.
+> See the B3 item in `docs/mobile-rebuild-plan.md` §17.
+
+**Root cause:** There is no endpoint that allows a user to request all their data, request correction, or request erasure. `GET /profile/me/` returns a partial profile (`OwnProfileSerializer`) that does not include `UserInteraction`, `Comment`, `ShareEvent`, or telemetry history. `DataSubjectRequest` + access/grievance/erasure endpoints now exist under `/data-subject/`, but erasure terminates in a no-op.
 
 **Evidence:**
 - `views/profile.py:29-43` — `me()` returns `OwnProfileSerializer`. No `liked_clips` for public profile; no data-export endpoint.
@@ -160,6 +263,32 @@
 2. Add `DataExport` or `ErasureRequest` model (optional; can be stateless with a token-based endpoint if the user is authenticated).
 3. Add `GET /data-subject/grievance/` endpoint (or reuse `POST /grievance/` from ISSUE-03) to satisfy DPDP §11 + IT Rules grievance requirements together.
 4. Update `OwnProfileSerializer` to include a `data_access_url` link.
+
+> **✅ RESOLVED 2026-09-29 (B3).** Erasure actually deletes now.
+> `POST /data-subject/erasure/` no longer returns "Data erasure process
+> initiated" having deleted nothing — it publishes a Celery task
+> (`execute_data_erasure`) and reports `in_progress`; the task sets
+> `completed` when it finishes.
+>
+> What is deleted: the `User` row and its cascade (`AudioClip`, `Comment`,
+> `ShareEvent`, `UserInteraction`), the avatar and each clip's
+> `original_file` / `hls/` tree / **`cover_image`**, and the Redis keys
+> holding behavioural data (`user_feed:{id}`, `user_vectors:{id}`, and the
+> per-(clip,user) completion counters). Object storage and Redis are the
+> parts a Postgres cascade never reaches.
+>
+> What is **retained and anonymised**, because deleting it would be a
+> compliance failure in the other direction:
+>
+> | Record | Why |
+> |---|---|
+> | `ConsentAudit` | DPDP §5(2)/§11 — proof of consent must outlive the account. Its FK was **CASCADE**, so deleting the user destroyed the evidence of consent. Now SET_NULL, with `withdrawn_at` stamped. |
+> | `AuditLog` | CERT-In 2022 — 180-day identity retention. |
+> | `Grievance` | IT Rules 2021 R4(2). |
+> | `DataSubjectRequest` | Evidence that erasure was requested *and* completed. Its FK was **CASCADE**, so the request deleted itself and `completed_at` was lost. |
+>
+> Migration 0007 changes those two FKs. 24 tests in `test_erasure.py`,
+> verified live end-to-end through nginx → Django → Celery.
 
 ---
 
@@ -306,25 +435,120 @@ This aligns the frontend with the backend's `OwnProfileSerializer` contract.
 
 ---
 
-#### ISSUE-14: Share link / copy link broken [COMPLETED — Phase B] (Public clip endpoint + ShareModal link generation fixed) (frontend unsupported by backend)
+#### ISSUE-14: Share link / copy link broken — **STILL OPEN (2026-09-29): no public clip endpoint exists, and the documented "quick fix" now 403s** (IT Rules 2021 Rule 3(1)(d) — notice-and-takedown / viral liability)
 
-**Status:** High — broken user-facing contract
+**Status:** High — broken user-facing contract. **Not fixed. The `[COMPLETED — Phase B]` marker was wrong.**
 
-**Root cause:** `components/sharing/ShareModal.tsx` generates `window.location.origin + '/clip/' + clip.id`. The router (`router.tsx`) has no `/clip/:id` route. There is also no backend endpoint for a public clip view by UUID alone (only `/clips/{id}/` which requires `IsAuthenticated`). The user receives a non-functional link when sharing.
+> **⚠️ CORRECTION 2026-09-29.** This was reported `[COMPLETED — Phase B
+> (Public clip endpoint + ShareModal link generation fixed)]`. Neither part
+> shipped, and the suggested fix below is now actively wrong:
+>
+> 1. **There is no public clip endpoint.** `GET /public/clips/{id}/` does not
+>    exist in `backend/app/urls.py` or `backend/EchoFlow/urls.py`. The only
+>    clip route is `router.register(r'clips', AudioUploadViewSet)`, and
+>    `AudioUploadViewSet` requires `IsAuthenticated`.
+> 2. **Both branches of the frontend's link generation are broken.**
+>    `frontend/sample_frontend2/src/components/sharing/ShareModal.tsx:24`:
+>    ```ts
+>    const link = clip.hls_playlist_url ? clip.hls_playlist_url
+>                                      : `${origin}/public/clips/${clip.id}`;
+>    ```
+>    The preferred branch copies `hls_playlist_url`, which is now
+>    **token-gated** (`ef_hls_token` cookie / `X-EchoFlow-Media-Token`
+>    header) — so every shared link returns **403** for the recipient. The
+>    fallback hits a route that does not exist — **404**. Sharing is
+>    entirely non-functional, in both directions.
+>
+> Fix plan step 2 below ("copying the HLS URL is the fastest fix") is
+> **withdrawn**: it predates token-gated HLS, and a copied HLS URL is now
+> exactly the thing that must not be shared. Replacement design is tracked
+> as A4 in `docs/mobile-rebuild-plan.md` §17.
+
+**Root cause:** The router has no `/clip/:id` route, and the backend exposes no read endpoint for a clip by UUID alone. This was compounded on 2026-09-28 when HLS playback became token-gated, which invalidated the "just copy the HLS URL" workaround that the frontend relies on first.
 
 **Evidence:**
-- `components/sharing/ShareModal.tsx:24` — link generation.
-- `router.tsx` — no `/clip` route.
-- `views/content.py` — no public `AudioClip` retrieve endpoint.
+- `components/sharing/ShareModal.tsx:24` — link generation (both branches broken).
+- `backend/app/urls.py:52` — the only clip route; `IsAuthenticated`.
+- `docs/EXPLAIN/storage/04-hls-token-protection.md` — why HLS URLs are not shareable.
 
 **Fix plan (High, Phase B — Week 2):**
 1. Add a public clip-view endpoint: either `GET /public/clips/{id}/` (new serializer: title, category, creator_name, hls_playlist_url, duration_ms, tags — no `is_liked`, no `likes/shares/skips`), or reuse the existing `GET /clips/{id}/` but with `permission_classes = [AllowAny]` and a reduced serializer.
-2. Update `ShareModal` to generate `https://<host>/public/clips/{id}` (or the HLS URL directly if public playback is the goal). Given that HLS playback URLs are already absolute HTTPS (`media_urls.get_hls_playback_url`), copying the HLS URL (`clip.hls_playlist_url`) is the fastest fix: replace `link` with `clip.hls_playlist_url ? clip.hls_playlist_url : ...`. Update copy-link text accordingly.
-3. Add a route `/clip/{id}` that redirects to `/public/clips/{id}` or embeds the player.
+2. ~~Update `ShareModal` to generate `https://<host>/public/clips/{id}` (or the HLS URL directly if public playback is the goal). Given that HLS playback URLs are already absolute HTTPS (`media_urls.get_hls_playback_url`), copying the HLS URL (`clip.hls_playlist_url`) is the fastest fix~~ — **WITHDRAWN 2026-09-29.** This step was written when HLS was public-read. Since `2026-09-28` HLS is token-gated, so the "fastest fix" produces a link that 403s for every recipient. The replacement is a share-token exchange (`POST /public/clips/{id}/play/`) tracked as A4 in `docs/mobile-rebuild-plan.md` §17.
+3. Add a route `/clip/{id}` that redirects to `/public/clips/{id}` or embeds the player. Note there is currently **no deployed web frontend** — nginx serves only the Django API (`server_name _` → `proxy_pass http://django_backend`) and `frontend/` contains samples only. Until a web app exists, the share target should be a content-negotiated OG page (for WhatsApp/Slack unfurls) rather than an embedded player.
+
+> **✅ RESOLVED 2026-09-29.** The share link works in both directions now.
+> `POST /clips/{id}/share-link/` mints a 30-day token, `GET /clips/{id}/public/`
+> serves an Open Graph card (JSON for API clients), and
+> `POST /clips/{id}/play/` exchanges the share token for an ordinary 600s
+> media token on an explicit play intent. Neither branch of
+> `ShareModal.tsx:24` is broken any more.
+>
+> A share token is an ordinary media token with a longer TTL, not a new token
+> type — see `docs/EXPLAIN/decisions/2026-09-29-share-pipeline.md` for why the
+> separate-token design was dropped after reading the payload schema.
+>
+> **Residual:** there is no per-link revocation (no row to revoke); a takedown
+> takes effect within the token's 30-day life, not immediately. The
+> app-vs-web landing route is deferred until `app.echoflow.in` exists.
 
 ---
 
 ### 2.3 Medium Priority (should fix post-launch; no launch-blocker but serious)
+
+---
+
+#### ISSUE-16: Registration is 400 for the design-source frontend — required consent fields are not sent (NEW — 2026-09-29)
+
+**Status:** High — **blocks the mobile rebuild's first screen.** Not a legal
+exposure by itself, but it means ISSUE-01's consent capture is **unreachable
+in practice**: no client that omits the fields can create an account.
+
+**Root cause:** `RegisterSerializer` requires two fields
+(`serializers.py:435-436`):
+
+```python
+consent_accepted = serializers.BooleanField(required=True)
+terms_version    = serializers.CharField(required=True, max_length=50)
+```
+
+The only frontend that will be used as the mobile design source sends
+neither. `frontend/sample_frontend2/src/api/client.ts:92-93`:
+
+```ts
+register: (email: string, username: string, password: string) =>
+  api('/auth/register/', { method: 'POST', body: JSON.stringify({ email, username, password }) }),
+```
+
+and `stores/auth.tsx:55` calls `authAPI.register(email, username, password)`.
+That payload omits `consent_accepted` and `terms_version`, so
+`POST /auth/register/` returns **400** for this client. It also omits
+`dob`, which is the same omission that bypasses the ISSUE-02 age gate.
+
+This is a doc/code disagreement worth recording because both halves are
+"correct" in isolation — the server contract is right (DPDP §6 requires
+consent capture, so requiring these fields is correct), and the sample
+frontend is simply stale. The fix belongs in the clients, not in relaxing
+the serializer.
+
+**Related:** A client also has no way to *discover* which `terms_version`
+values are acceptable. `RegisterSerializer.validate_terms_version` checks
+against `settings.TERMS_VERSIONS` (default `"v1.0"`), but that list is not
+exposed on any endpoint, so clients hardcode it and break the moment a
+version is added. Tracked as A1 in `docs/mobile-rebuild-plan.md` §17.
+
+> **✅ RESOLVED 2026-09-29 (ISSUE-16 / A1).** The server half is fixed and
+> the tracked frontend is updated: `frontend/src/api/client.ts` now sends
+> `consent_accepted` and `terms_version`, and `stores/auth.tsx` reads the
+> accepted version from `GET /legal/compliance/` (A1) instead of hardcoding
+> it, so appending a version to `TERMS_VERSIONS` no longer 400s every
+> client. `frontend/server.ts`'s dev shim was taught the same required
+> fields so it cannot drift from the real contract again.
+>
+> Note for the mobile build: the design-source copy
+> (`frontend/sample_frontend2/`) is **gitignored** (`.gitignore:26`) and
+> untracked, so its local edits are not part of the repo. The mobile app
+> must send these fields from the start — this is now a documented contract,
+> not tribal knowledge.
 
 ---
 
@@ -472,16 +696,16 @@ The plan is designed to **minimise legal exposure** first, then close backend co
 |---|---|---|---|
 | ISSUE-01 (Consent / DPDP) | **Partially Complete** | `models.py`: `ConsentAudit` (60-76), `User.dob/is_minor/minor_consent_verified/consent_accepted/terms_version/parent_email` (14-33). `tests/test_auth_regulatory.py` expects consent fields. `settings.py`: `TERMS_VERSIONS` (622). | `RegisterSerializer` (404-424) does **NOT** include `dob`, `consent_accepted`, or `terms_version` fields despite model/test updates. This is an open discrepancy — serializer-level enforcement is missing. |
 | ISSUE-03 (Grievance / Compliance) | **Complete** | `models.py`: `Grievance` (268-288). `settings.py`: `GRIEVANCE_OFFICER_*`, `COMPLIANCE_OFFICER_*`, `NODAL_CONTACT_*`, `VERSION` (621-629). `urls.py`: `/grievance/`, `/legal/compliance/`, `/legal/takedown/` (62-64). `tests/test_auth_regulatory.py`: compliance endpoint returns JSON. | All regulatory contact endpoints live; DB persistence verified. |
-| ISSUE-04 (Content Moderation) | **Complete** | `services/content_moderation.py` (new): `DECISION` (v1 sha256 + blocked phrase list, line 7), `SECURITY` (line 12), `HACK` (module-level set, line 16), `TODO` (multilingual DB, line 19). `models.py`: `AudioClip.moderation_approved` (113), `copyright_acknowledgement` (114), `copyright_owner_name` (115), `license_type` (116). `serializers.py`: `AudioUploadSerializer` validates `copyright_acknowledgement` (162-164, 181-184) with `SECURITY/REGULATORY` tag. | Pipeline is v1 (offline, no external API dependency). Production upgrade to AWS Rekognition / external moderation service remains open. |
+| ISSUE-04 (Content Moderation) | **Partially Complete** — see correction at ISSUE-04 | `services/content_moderation.py`; invoked from `tasks.py:302` for both transcript and tags. | The pipeline is wired and runs, but the prohibited-content blocklist it matches against is **empty**, so it approves every input. External API upgrade also still open. |
 | ISSUE-05 (Copyright / License) | **Complete** | `serializers.py`: `license_type`, `copyright_owner_name`, `copyright_acknowledgement` fields (141-164). `models.py`: same fields (113-116). `AudioUploadSerializer.validate()` enforces acknowledgment (177-191). | DB persistence verified. User uploads require acknowledgment; `Unknown` license logs a warning. |
-| ISSUE-06 (Data Subject Rights) | **Complete** | `models.py`: `DataSubjectRequest` (314-328), `AuditLog` (290-312), `TakedownRequest` (330-337), `Report` (339-346). `urls.py`: `/data-subject/access/`, `/data-subject/erasure/` (66-67). `tests/test_auth_regulatory.py`: access requires auth (401). | Cooling-off period (`cooling_off_until`) implemented on `DataSubjectRequest`. Erasure endpoint exists; full automated deletion pipeline remains operational. |
+| ISSUE-06 (Data Subject Rights) | **Complete** (2026-09-29, B3) | `models.py`: `DataSubjectRequest`, `AuditLog`, `Grievance`, `TakedownRequest`, `Report`. `urls.py`: `/data-subject/access/`, `/data-subject/erasure/`. Celery: `execute_data_erasure`. | Access, grievance and erasure all work. Erasure deletes the account, its content, its object-storage objects and its Redis keys; `ConsentAudit`/`AuditLog`/`Grievance`/`DataSubjectRequest` are retained with `user=NULL` as DPDP §5(2)/§11 and CERT-In 2022 require. |
 | ISSUE-07 (Audit / Identity Retention) | **Complete** | `backend/EchoFlow/middleware.py`: identity attachment (36-41), audit write (45-61) with `DECISION` (line 292 in `models.py` explanation), `HACK` (line 295), `SECURITY` (line 60). `settings.py`: `LOGGING.formatters.json` includes `user_id`, `client_ip`, `endpoint_path` (569-572). `models.py`: `AuditLog` (290-312). | Every authenticated request writes an `AuditLog`. DB overhead tradeoff accepted per `DECISION`. |
 | ISSUE-08 (Profile Picture URL) | **Complete** | `serializers.py`: `PublicProfileSerializer.get_profile_picture_url` (443-446) and `OwnProfileSerializer.get_profile_picture_url` (466-469) both call `get_signed_media_url()`. `DECISION` tag present in serializer (line 124). | Profile pictures load as absolute HTTPS URLs; `media_urls.py` generates signed URLs. |
 | ISSUE-09 (Feed Cold Retry) | **Complete** | `pages/Feed.tsx`: retry delay + degraded state handling (per agent 4 fix). `data/feedAdapter.ts`: `degraded`, `retry_after_ms`, `message` propagated. | Feed retry storm eliminated; 202 handling verified. |
 | ISSUE-10 (Telemetry Heartbeat) | **Complete** | `stores/player.tsx`: heartbeat interval + batch flush (`DECISION` implied by agent 4 fix). `ReelCard.tsx`: skip telemetry wired (`DECISION` / `SECURITY` tags expected). `services/interactions.py`: `record_telemetry()` writes to Redis stream (`SECURITY`: cap at 10h / 36,000,000ms, line 377). | Heartbeat fires every 5s; `flush_telemetry_stream` processes within 10s. Open risk: accuracy across seeks (partial seek events may under-report `watch_time_ms`). |
 | ISSUE-11 (Comment Edit / Reply / Delete) | **Complete** | `CommentSerializer`: reply count method (345-348), `validate_text()` strips control chars (`SECURITY`, 350-365), `create()` sets author (367-369). `CommentViewSet`: supports PATCH/DELETE. Frontend `CommentSheet.tsx` wired per agent 4 fix. | Edit/reply/delete endpoints exist; frontend triggers verified. |
 | ISSUE-12 (Profile Liked Clips) | **Complete** | `OwnProfileSerializer.get_liked_clips()` (471-496) queries `AudioClip` with `user_has_liked` annotation (`DECISION`: direct query rather than ORM lazy, line 472). `pages/Profile.tsx`: load logic uses `OwnProfileSerializer` for own profile (agent 4 fix). | Profile tab no longer empty for own user. |
-| ISSUE-14 (Share Link / Copy) | **Complete** | `ShareEventSerializer.get_clip_hls_url()` (388-389). `router.tsx`: `/public/clips/` route added (agent 4 fix). `ShareModal.tsx`: link generates `clip.hls_playlist_url` absolute URL. | Share link is functional; copy-link uses HLS URL directly. |
+| ISSUE-14 (Share Link / Copy) | **Not Complete** — see correction at ISSUE-14 | `ShareEventSerializer.get_clip_hls_url()` exists, but **no public clip route is registered** in `backend/app/urls.py` or `backend/EchoFlow/urls.py`. | The claimed `router.tsx` `/public/clips/` route does not exist in this repo, and the HLS-URL copy workaround now 403s since HLS became token-gated. |
 | ISSUE-21 (Registration Broken — Login After Register) | **Complete** | `views/auth.py`: `RegisterView` uses `RegisterSerializer` (11-17). Agent 4 fix wired `register()` → `login()` in `stores/auth.tsx`. `test_auth_regulatory.py`: registration creates user + consent audit (if consent fields provided). | Registration flow fixed; token obtained after register. |
 
 ### What Remains Open (Phase B / C / Operational)

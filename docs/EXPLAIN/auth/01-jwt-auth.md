@@ -89,7 +89,8 @@ SIMPLE_JWT = {
 2. Client POST /auth/token/refresh/ {refresh}
        │
        ▼
-3. TokenRefreshView validates:
+3. `ThrottledTokenRefreshView` validates (throttled on the **verified** `user_id`
+   inside the token, not the client IP — see `04-rate-limiting.md`):
    ├── Signature valid
    ├── Not expired (7 days)
    ├── Not blacklisted (NOT IMPLEMENTED)
@@ -122,7 +123,7 @@ if (res.status === 401) {
 |--------|----------|------|------|
 | POST | `/auth/login/` | `TokenObtainPairView` | Public |
 | POST | `/auth/register/` | `RegisterView` | Public |
-| POST | `/auth/token/refresh/` | `TokenRefreshView` | Public |
+| POST | `/auth/token/refresh/` | `ThrottledTokenRefreshView` | Public |
 
 ---
 

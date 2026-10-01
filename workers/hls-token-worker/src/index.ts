@@ -32,6 +32,16 @@ const ALLOWED_ORIGINS = new Set([
   "http://127.0.0.1:5173",
   "http://localhost:3000",
   "http://127.0.0.1:3000",
+  // The Vite dev server is served over TLS (frontend/vite.config.ts server.https).
+  // It MUST be: Chrome compares SameSite on SCHEME + site, so an `http://` page
+  // is not same-site with the `https://` media edge and the SameSite=Lax
+  // ef_hls_token cookie is withheld from the hls.js XHR -> every /hls/* 403s
+  // with "Missing playback token". The http:// variants above are kept for the
+  // Metro/dev-client diagnostics above; they cannot play HLS in a browser.
+  "https://localhost:5173",
+  "https://127.0.0.1:5173",
+  "https://localhost:3000",
+  "https://127.0.0.1:3000",
   // Expo's development bundle is served by Metro on :8081. Native playback
   // normally has no Origin header and is authenticated by its media-token
   // header, but allowing Metro's loopback origins keeps browser/dev-client

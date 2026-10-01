@@ -951,6 +951,27 @@ docker compose exec -e PYTHONPATH=/app -e TEST_DB_NAME=echoflow_test_<unique> \
 
 ---
 
+### 2026-10-01 — mobile dev-client reconnect: code path vs data path
+**Learned:**
+- **The Expo dev client is not a one-shot consumer of Metro.** Every foreground return calls `BridgelessDevSupportManager.handleReloadJS()` and re-fetches the bundle, so a lost JS context is unrecoverable until Metro answers again — and the app cannot render its own error because rendering the error *is* the missing bundle. Symptom is the bare `DevLauncher` launcher, which reads as "can't detect the deployment server". Measured: `reactInstance is null` → `onWindowFocusChange(hasFocus=true)` → `Unable to load script`, present since 04:34 across four app PIDs.
+- **Code path and data path used different networks, which is why it looked half-alive.** API/HLS are the host LAN IP (`172.25.186.111`) and logged 282+118 requests from the phone (`172.25.186.229`) while Metro logged **zero** bundles — Metro was bound to loopback and a LAN dial to `:8081` was refused. Fix is `--host lan` + the LAN deep link, so the bundle never needs the tunnel.
+- **`adb reverse` rules are scoped to the ADB transport, not the device.** All three vanished while `adb devices` still said `device` and the adb server had been up for hours — a USB re-enumeration, logged by neither end.
+- **A bound port is not a healthy service.** A killed `workerd` sat `LISTEN`ing, completed the TCP handshake, and timed out `/healthz` after 6s with 0 bytes. Conflating the two states is what made my first supervisor worse than none: it reported green on broken audio, and when it did act it duplicated the service into `Address already in use` once per tick.
+- **Killing the top ancestor does not free the port.** `SIGKILL` on `npm exec wrangler` left `node`/`workerd` children re-parented to init, one still holding 8787, so every replacement lost the bind. `wrangler` respawns its own child; signal the **process group** and sweep descendants, then escalate to `SIGKILL`.
+- **`PUBLIC_HLS_ENDPOINT_URL` must stay `https://127.0.0.1:19443`.** It is not a "use LAN everywhere" setting: the web page (`https://127.0.0.1:5173`) and media must share a host for the `SameSite=Lax` `ef_hls_token` cookie. Moving it to the LAN address re-breaks web playback. Native clients are unaffected because they send `X-EchoFlow-Media-Token`.
+
+**Changed:** `scripts/mobile-dev-supervisor.sh` (new — supervises Metro + Worker + the three forwards, distinguishes bound/healthy/hung, process-group kill, per-service start cooldown, `--status`/`--once`), `docs/mobile/05-device-control-and-troubleshooting.md`.
+
+**Verified:** backgrounded the app 35s and returned to it — 0 load failures, Metro served the bundle over LAN, then live `GET /feed/` `200`s and playback to `0:53 / 2:29`. Killed Metro + Worker + all forwards at once; all three recovered within one 30s tick.
+
+**Open:**
+- **The supervisor is not supervised.** It dies with the shell unless launched `setsid nohup` — the exact failure class it fixes. A `systemd --user` unit is the obvious next step, not written.
+- Every start redirects to `/tmp/metro.log` and `/tmp/hls-worker.log` with `>`, so a restart **truncates** the previous log. Use `>>` if post-mortem continuity matters.
+- **Web playback is still unverified by me** (no browser here). `https://127.0.0.1:5173` serves correctly; the user has not confirmed audio.
+- `.env.local` / `frontend/.env` are gitignored, so the origins do not travel: a fresh clone needs `PUBLIC_HLS_ENDPOINT_URL`, `VITE_API_BASE_URL`, and the loopback CORS origins set by hand.
+
+---
+
 ## DOs and DON'Ts
 
 Accumulated from user corrections. Append on your own when corrected.

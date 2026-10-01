@@ -24,56 +24,100 @@ the normal registration UI.
 
 ## Start the local services
 
-From the repository root, start the stack exactly as follows:
+Start the container stack exactly as follows:
 
 ```bash
 docker compose -f docker-compose.local.yml --env-file .env.local up -d
 curl -kI https://localhost:18443/health/
 ```
 
-The Android app calls the HTTPS nginx endpoint on port `18443`. HLS URLs point
-at nginx on port `19443`, which forwards `/hls/*` to the local HLS Worker. The
-Worker is a host process, not a Docker service, so it must be started separately:
+Two more processes are needed and neither is a Docker service: Metro (`:8081`)
+and the HLS Worker (`:8787`). Both are plain host processes, so both die with
+whatever session started them, and neither has a supervisor by default. Use the
+supervisor, which starts, watches, and restarts both:
+
+```bash
+bash scripts/mobile-dev-supervisor.sh          # foreground loop, Ctrl-C to stop
+bash scripts/mobile-dev-supervisor.sh --status # one-shot health report
+```
+
+To run it detached:
+
+```bash
+setsid nohup bash scripts/mobile-dev-supervisor.sh \
+  > /tmp/mobile-dev-supervisor.out 2>&1 < /dev/null &
+```
+
+It logs to `/tmp/mobile-dev-supervisor.log` and only writes a line when it acts,
+so a stable stack is quiet.
+
+The individual commands remain valid for one-off runs. The Worker needs
+`scripts/run-hls-worker-local.sh`, which generates the ignored `.dev.vars` from
+`.env.local` so the token secret and MinIO credentials cannot drift from
+Django's:
 
 ```bash
 bash scripts/run-hls-worker-local.sh
 curl -fsS http://127.0.0.1:8787/healthz
 ```
 
-Keep this terminal open. The script generates the ignored Worker `.dev.vars`
-from `.env.local`, keeping its token secret and MinIO credentials aligned with
-Django. If it is absent, nginx returns `502` for every HLS manifest because its
+If the Worker is absent, nginx returns `502` for every HLS manifest because its
 upstream at `host.docker.internal:8787` refuses the connection.
 
 ## Connect Metro to Android
 
-Run Metro in the `mobile/` directory. The development client normally reaches
-it through ADB reverse, so it does not need the host LAN address.
+Run Metro in the `mobile/` directory with `--host lan`, which binds every
+interface rather than loopback only:
 
 ```bash
 cd mobile
-npx expo start --dev-client --localhost
+npx expo start --dev-client --host lan
 ```
+
+This matters more than it looks. The app's **data** path (API on `18443`, HLS on
+`19443`) already travels over the LAN, because `EXPO_PUBLIC_API_BASE_URL` is the
+host's LAN address. Its **code** path is Metro, and the dev client re-fetches the
+bundle on *every* return to the foreground, not just at launch. Binding Metro to
+loopback therefore made the one fragile dependency also the one that decides
+whether the app works at all. See "Why returning to the app broke it" below.
 
 In another terminal:
 
 ```bash
 adb devices
+curl -fsS http://127.0.0.1:8081/status      # packager-status:running
+curl -fsS http://172.25.186.111:8081/status # same host, LAN address
+```
+
+Open the development client with the LAN deep link:
+
+```bash
+adb shell am start -a android.intent.action.VIEW \
+  -d 'exp+echoflow-mobile://expo-development-client/?url=http%3A%2F%2F172.25.186.111%3A8081'
+```
+
+Replace `172.25.186.111` with the host's current LAN address. The supervisor logs
+the correct deep link whenever that address changes. **Use the LAN URL, not
+`127.0.0.1`** — over the LAN the bundle does not depend on an `adb reverse`
+rule surviving at all.
+
+Still install the forwards, both as a fallback for the LAN URL and because the
+HLS origin genuinely requires them:
+
+```bash
 adb reverse tcp:8081 tcp:8081
 # The local development HLS URL is https://127.0.0.1:19443. These forwards
 # make localhost on the physical phone reach nginx on this machine.
 adb reverse tcp:18443 tcp:18443
 adb reverse tcp:19443 tcp:19443
-curl -fsS http://127.0.0.1:8081/status
 ```
 
-The last command must return `packager-status:running`. Open the development
-client with its deep link:
-
-```bash
-adb shell am start -a android.intent.action.VIEW \
-  -d 'exp+echoflow-mobile://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A8081'
-```
+Do not collapse `PUBLIC_HLS_ENDPOINT_URL` to the LAN address to avoid the
+`19443` forward. It is `https://127.0.0.1:19443` so that the **web** frontend's
+page origin (`https://127.0.0.1:5173`) and its media origin share a host, which
+is what lets the `SameSite=Lax` `ef_hls_token` cookie be sent. Moving media to
+the LAN address re-breaks web playback. Native clients do not care, because they
+send `X-EchoFlow-Media-Token` instead of relying on a cookie.
 
 The application scheme is declared in `mobile/app.config.ts`. If the client
 shows its **Tools** launcher rather than the app, repeat the deep-link command
@@ -144,7 +188,47 @@ A `206` for a segment is expected for a range request.
 | First feed reel accepted no Play tap and nginx logged no token or HLS request | The first reel remained labelled Play at `0:00`; after a tap there was no `POST /media/playback-token/` | On this Android tab scene, FlatList did not send its initial viewability callback, so `activeClipId` remained null and the overlay correctly refused to toggle an unloaded player | The screen now selects the first loaded clip when no viewability callback arrives. It does not report a skip because initial selection is not a departure. A render test covers this exact missing-callback path. |
 | ExoPlayer failed with `ConnectException` to port `19443` | Android logcat named `HttpDataSource` and `ECONNREFUSED`; the API and token mint still succeeded | Only Metro had an ADB reverse. The phone’s `127.0.0.1:19443` is its own loopback interface, not nginx on the laptop | Install forwards for `18443` and `19443` as well as `8081`, then reload the development client. The manifest and segments should appear in nginx as `200`. |
 | HLS requests were all `200`, but the transport remained at `0:00` and the player repeatedly fetched the whole VOD | nginx showed manifest, playlist, and all segments repeatedly, about once per second | Every native status tick re-rendered the feed. `usePlaybackToken` returned a fresh wrapper object, and the load effect depended on that wrapper, so it called `replace()` for the same clip on every tick | The load effect is keyed to the token’s status, clip ID, and ready token value. A render regression test now feeds a fresh wrapper on each render and verifies that a status update does not call `loadClip` twice. On the device the transport advanced from `0:00` to `0:37` after the fix. |
-| Local dev client opened Tools or a stale LAN error | Development-client launcher appeared, or `ECONNREFUSED` named the host LAN address | Metro only listened on loopback while the client had a cached LAN project URL | Run Metro, restore `adb reverse tcp:8081 tcp:8081`, and open the explicit loopback deep link |
+| Local dev client opened Tools or a stale LAN error | Development-client launcher appeared, or `ECONNREFUSED` named the host LAN address | Metro only listened on loopback while the client had a cached LAN project URL | Run Metro in `--host lan` mode and open the LAN deep link |
+| App died only after being left in the background, then showed the launcher | `logcat` showed `reactInstance is null`, then `onWindowFocusChange(hasFocus = "true")`, then `Reload: ReactInstance task faulted … Unable to load script. Reload reason: BridgelessDevSupportManager.handleReloadJS()` | Metro was not running. The dev client re-fetches the bundle on every foreground return, and a lost JS context cannot render its own error | Run Metro and reload. `--host lan` plus the supervisor removes the dependency; see "Why returning to the app broke it" |
+| `adb reverse --list` empty while the device was still `device` and the adb server had not restarted | Rules are scoped to the ADB **transport**, so a USB re-enumeration drops them silently | Neither the host nor the device logs the loss; the only symptom is a device-side error | `scripts/mobile-dev-supervisor.sh` re-asserts them every tick |
+| HLS `502` on every manifest, `okhttp` hitting nginx, `/health/` fine | `connect() failed (111)` to `host.docker.internal:8787`; a `wrangler`/`workerd` tree was alive but `/healthz` timed out with 0 bytes | The Worker was **hung**, not dead: it held port 8787 and completed the TCP handshake without answering | Supervisor kills the whole process group and restarts. "Bound" is not "healthy" — see the gotcha below |
+
+## Why returning to the app broke it
+
+An Expo development client is **not** a one-shot consumer of Metro. Every time
+the app returns to the foreground it re-fetches the JS bundle. The sequence on
+the test phone, from `logcat`, was unambiguous:
+
+```text
+05:55:23  reactInstance is null. Dropping work.
+05:55:24  onWindowFocusChange(hasFocus = "true"): context is not ready
+05:55:24  Reload: ReactInstance task faulted. Stage: 5: Restarting surfaces.
+          Fault reason: Unable to load script.
+          Reload reason: BridgelessDevSupportManager.handleReloadJS()
+```
+
+Three consequences follow, and together they explain the reported symptom
+("the app can't detect the deployment server"):
+
+1. **Metro is a continuous dependency.** While the app sits in the foreground
+   with a warm JS context it only needs its data path, so it works
+   indefinitely. Background it, lose the context, and the next foreground forces
+   a bundle fetch. That is why it looked like "it worked, then stopped".
+2. **A dead JS context cannot report itself.** Rendering the error *is* the
+   bundle the app no longer has, so the failure surfaces as the bare
+   `DevLauncher` launcher screen rather than a message.
+3. **The code path and the data path used different networks.** The API and HLS
+   URLs are the host's LAN address, so they survived independently — nginx logged
+   282 API and 118 HLS requests from `172.25.186.229` while Metro served zero
+   bundles. Data up, code down, is the worst possible combination to diagnose
+   from the phone alone.
+
+The diagnosis is only trustworthy because both halves were measured rather than
+inferred from the launcher text: Metro answered `packager-status:running` on the
+host while logging no bundle requests, and a LAN dial to Metro
+(`http://172.25.186.111:8081/status`) was refused because Metro was bound to
+loopback only. A healthy bundle server that has never been asked for a bundle
+plus a client that cannot reach it is the whole failure.
 
 ## Feed cold start
 
@@ -327,6 +411,39 @@ development-client URL can also refer to a LAN address even though Metro is
 bound to loopback. `ECONNREFUSED` naming the host LAN address is therefore a
 transport setup problem, not a JavaScript bundle problem.
 
+Rules are scoped to the ADB **transport**, not the device. On 2026-10-01 all
+three rules vanished while `adb devices` still reported `device` and the adb
+server had been up for hours — the transport had simply re-enumerated, and
+neither end logged it. Re-assert them whenever the phone behaves as though it
+were offline.
+
+### A bound port is not a healthy service
+
+Check the protocol, not the socket. A killed `workerd` was observed in state
+`bound but silent`: port 8787 was `LISTEN`, the TCP handshake completed, and
+`curl /healthz` timed out after 6s with zero bytes. Two wrong conclusions
+follow from trusting the socket, and both were hit before they were fixed:
+
+- Treating *bound* as *healthy* reports a green light on a broken audio path.
+- Treating *not answering* as *not running* starts a replacement, which loses
+  the bind to the original — `wrangler` respawns its own `workerd` child, so the
+  port comes straight back and every replacement dies with `Address already in
+  use`, once per tick.
+
+Killing the top ancestor is also insufficient. After `SIGKILL` on
+`npm exec wrangler`, its `node` and `workerd` children were re-parented to init
+and survived, one still holding 8787. `scripts/mobile-dev-supervisor.sh`
+therefore signals the whole **process group** and sweeps descendants explicitly,
+then escalates to `SIGKILL` if the port is still held. It also rate-limits start
+attempts per service so an unstartable dependency cannot spam.
+
+`--status` distinguishes all three states, which is the fastest way to tell a
+hung service from a missing one:
+
+```bash
+bash scripts/mobile-dev-supervisor.sh --status
+```
+
 ### Test Store RevenueCat
 
 The development build uses the RevenueCat Test Store key through an environment
@@ -366,12 +483,29 @@ that identifies the owner:
 - `200` manifest but no segments: playlist object paths, Range handling, or
   native player request headers.
 
+## Verified on 2026-10-01 after the supervisor work
+
+- Backgrounded the app with `KEYCODE_HOME` for 35s, then returned to it with the
+  launcher intent. Zero `Unable to load script` events, and Metro served the
+  bundle over the LAN path.
+- The app then made live `GET /feed/` requests (`200`, plus one expected `202`
+  cold-start refill) and played a clip to `0:53 / 2:29` with the waveform
+  animating, confirming the whole chain — bundle, API, token, media.
+- Killed Metro, the Worker, and all `adb reverse` rules simultaneously. The
+  supervisor restored the rules and Metro, detected the Worker as *bound but
+  hung*, killed its process group and restarted it. All three recovered within
+  one 30s tick.
+
 ## Open work after this pass
 
 The next device session should verify the new feed-height fallback on a clean
 restart, then press the central play button and capture the native playback
 status. Discover should be checked at the device's actual font/display scale,
 including a long title and a loading state.
+
+The supervisor is not a system service. It dies with the shell that started it
+unless launched detached, which is the same failure class it exists to fix. A
+`systemd --user` unit is the obvious next step and has not been written.
 
 After local verification, the release path still needs a staging HTTPS backend,
 a deployed HLS Worker, a preview EAS build, and Maestro coverage for
